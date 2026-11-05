@@ -42,3 +42,20 @@ foreach _test : opencl_tests
     is_parallel: gegl_test_parallel,
     )
 endforeach
+
+# Exercise the actual kernel with deterministic sample tables. This isolates
+# projection math from c2g's stochastic CPU/GPU sampling sequences.
+if host_machine.system() == 'darwin'
+  c2g_opencl = dependency('appleframeworks', modules: ['OpenCL'], required: false)
+else
+  c2g_opencl = dependency('OpenCL', required: false)
+endif
+if c2g_opencl.found()
+  test('c2g-kernel',
+    executable('test-c2g-kernel', 'test-c2g-kernel.c',
+      dependencies: [c2g_opencl, meson.get_compiler('c').find_library('m', required: false)]),
+    args: [meson.project_source_root() / 'operations/opencl/c2g.cl'],
+    suite: 'opencl',
+    timeout: 60,
+  )
+endif

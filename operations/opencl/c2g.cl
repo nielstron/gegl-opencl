@@ -122,7 +122,8 @@ __kernel void c2g(const __global float4 *src_buf,
                         __global float2 *dst_buf,
                                  int     radius,
                                  int     samples,
-                                 int     iterations)
+                                 int     iterations,
+                                 int     enhance_shadows)
 {
     int gidx = get_global_id(0);
     int gidy = get_global_id(1);
@@ -141,7 +142,10 @@ __kernel void c2g(const __global float4 *src_buf,
     float4 pixel = *(src_buf + src_offset);
 
     float nominator=0, denominator=0;
-    float4 t1 = (pixel - min) * (pixel - min);
+    /* Match the CPU default: without shadow enhancement the black point
+     * is zero, rather than the sampled minimum envelope. */
+    float4 relative = enhance_shadows ? pixel - min : pixel;
+    float4 t1 = relative * relative;
     float4 t2 = (pixel - max) * (pixel - max);
 
     nominator   = t1.x + t1.y + t1.z;
