@@ -142,6 +142,128 @@ mean_curvature_flow (gfloat *src_buf,
 
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+
+#include "opencl/mean-curvature-blur.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_mean_curvature_blur (cl_mem               in_tex,
+                        cl_mem               tmp_tex[2],
+                        cl_mem               out_tex,
+                        const GeglRectangle *roi,
+                        gint                 iterations)
+{
+  cl_int  cl_err = 0;
+  cl_int  src_stride;
+  cl_mem  src_tex;
+  gint    iteration;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "mean_curvature_blur", NULL };
+      cl_data = gegl_cl_compile_and_build (mean_curvature_blur_cl_source,
+                                           kernel_name);
+    }
+
+  if (!cl_data)
+    return TRUE;
+
+  /* all intermediate buffers share the stride of the padded input */
+  src_stride = roi->width + iterations * 2;
+  src_tex    = in_tex;
+
+  for (iteration = 0; iteration < iterations; iteration++)
+    {
+      gboolean last = (iteration == iterations - 1);
+      cl_mem   dst_tex;
+      cl_int   dst_stride;
+      size_t   global_ws[2];
+
+      global_ws[0] = roi->width  + (iterations - 1 - iteration) * 2;
+      global_ws[1] = roi->height + (iterations - 1 - iteration) * 2;
+
+      if (last)
+        {
+          dst_tex    = out_tex;
+          dst_stride = roi->width;
+        }
+      else
+        {
+          dst_tex    = tmp_tex[iteration % 2];
+          dst_stride = src_stride;
+        }
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem), (void *) &src_tex,
+                                        sizeof (cl_int), (void *) &src_stride,
+                                        sizeof (cl_mem), (void *) &dst_tex,
+                                        sizeof (cl_int), (void *) &dst_stride,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2,
+                                            NULL, global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+
+      src_tex = dst_tex;
+    }
+
+  return FALSE;
+
+error:
+  return TRUE;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi)
+{
+  const Babl     *format = gegl_operation_get_format (operation, "output");
+  GeglProperties *o      = GEGL_PROPERTIES (operation);
+  gint            n      = o->iterations;
+
+  GeglBufferClIterator *i;
+  gint                  read;
+  gint                  tmp[2] = { 0, 0 };
+  gint                  err    = 0;
+
+  i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, roi, format,
+                                        GEGL_CL_BUFFER_READ,
+                                        n, n, n, n,
+                                        GEGL_ABYSS_CLAMP);
+
+  if (n > 1)
+    {
+      tmp[0] = gegl_buffer_cl_iterator_add_aux (i, roi, format, n, n, n, n);
+      tmp[1] = gegl_buffer_cl_iterator_add_aux (i, roi, format, n, n, n, n);
+    }
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && ! err)
+    {
+      cl_mem tmp_tex[2] = { i->tex[tmp[0]], i->tex[tmp[1]] };
+
+      err = cl_mean_curvature_blur (i->tex[read], tmp_tex, i->tex[0],
+                                    &i->roi[0], n);
+
+      if (err)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          break;
+        }
+    }
+
+  return ! err;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -157,6 +279,10 @@ process (GeglOperation       *operation,
   gfloat *src_buf;
   gfloat *dst_buf;
   GeglRectangle rect;
+
+  if (gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, roi))
+      return TRUE;
 
   rect = *roi;
 
@@ -238,7 +364,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->process          = operation_process;
   operation_class->prepare          = prepare;
   operation_class->get_bounding_box = get_bounding_box;
-  operation_class->opencl_support   = FALSE;
+  operation_class->opencl_support   = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",           "gegl:mean-curvature-blur",
