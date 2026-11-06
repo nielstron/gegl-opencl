@@ -253,9 +253,60 @@ get_pixel_color (gfloat              *in_buf,
 
 static GeglClRunData *cl_data = NULL;
 
+/* The number of samples of pixel (x, y), as computed by process () */
+static gint
+get_num_samples (gdouble angle,
+                 gdouble xr,
+                 gdouble yr)
+{
+  gdouble radius     = sqrt (SQR (xr) + SQR (yr));
+  gdouble arc_length = radius * angle * SQRT_2;
+  gint    n          = MAX (ceil (arc_length), 3);
+
+  if (n > NOMINAL_NUM_IT)
+    n = NOMINAL_NUM_IT + (gint) sqrt (n - NOMINAL_NUM_IT);
+
+  return n;
+}
+
+/* Computes sin (theta) and cos (theta) - 1 of every sample, for all
+ * numbers of samples from 3 to @max_n, in double precision like
+ * process () does, as hi + lo float pairs.  The samples for n start at
+ * index n * (n - 1) / 2 - 3.
+ */
+static cl_float4 *
+make_trig_table (gdouble angle,
+                 gint    max_n,
+                 gsize  *size)
+{
+  cl_float4 *table;
+  gint       n, i, k = 0;
+
+  *size = (max_n * (max_n + 1) / 2 - 3) * sizeof (cl_float4);
+  table = g_malloc (*size);
+
+  for (n = 3; n <= max_n; n++)
+    for (i = 0; i < n; i++, k++)
+      {
+        gdouble theta = angle * (n - 2 * i) / (2.0 * n);
+        gdouble s_val = sin (theta);
+        gdouble h_val = sin (theta / 2.0);
+        gdouble c_m1  = -2.0 * h_val * h_val; /* cos (theta) - 1 */
+
+        table[k].s[0] = (cl_float) s_val;
+        table[k].s[1] = (cl_float) (s_val - table[k].s[0]);
+        table[k].s[2] = (cl_float) c_m1;
+        table[k].s[3] = (cl_float) (c_m1 - table[k].s[2]);
+      }
+
+  return table;
+}
+
 static gboolean
 cl_motion_blur_circular (cl_mem               in,
                          cl_mem               out,
+                         cl_mem               trig,
+                         gint                 max_n,
                          const GeglRectangle *src_rect,
                          const GeglRectangle *dst_rect,
                          const GeglRectangle *whole_region,
@@ -265,22 +316,10 @@ cl_motion_blur_circular (cl_mem               in,
 {
   cl_int    cl_err = 0;
   size_t    global_ws[2];
-  cl_float  a;
   cl_float2 arc_factor_sq, cx, cy;
   gdouble   arc_factor = angle * SQRT_2;
 
-  if (!cl_data)
-    {
-      const char *kernel_name[] = { "cl_motion_blur_circular", NULL };
-      cl_data = gegl_cl_compile_and_build (motion_blur_circular_cl_source,
-                                           kernel_name);
-    }
-
-  if (!cl_data)
-    return TRUE;
-
   /* pass doubles that need full precision as hi + lo pairs */
-  a = (cl_float) angle;
   arc_factor_sq.s[0] = (cl_float) (arc_factor * arc_factor);
   arc_factor_sq.s[1] = (cl_float) (arc_factor * arc_factor - arc_factor_sq.s[0]);
   cx.s[0] = (cl_float) center_x;
@@ -300,7 +339,8 @@ cl_motion_blur_circular (cl_mem               in,
                                     sizeof(cl_int),   &whole_region->height,
                                     sizeof(cl_int),   &whole_region->x,
                                     sizeof(cl_int),   &whole_region->y,
-                                    sizeof(cl_float),  &a,
+                                    sizeof(cl_mem),    &trig,
+                                    sizeof(cl_int),    &max_n,
                                     sizeof(cl_float2), &arc_factor_sq,
                                     sizeof(cl_float2), &cx,
                                     sizeof(cl_float2), &cy,
@@ -337,6 +377,44 @@ cl_process (GeglOperation       *operation,
   gint        err;
   gint        read;
   gint        left, right, top, bottom;
+  gint        max_n = 0;
+  gint        c;
+  gsize       trig_size;
+  cl_float4  *trig_table;
+  cl_mem      trig;
+  cl_int      cl_err = 0;
+  gboolean    ok = TRUE;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "cl_motion_blur_circular", NULL };
+      cl_data = gegl_cl_compile_and_build (motion_blur_circular_cl_source,
+                                           kernel_name);
+    }
+
+  if (!cl_data)
+    return FALSE;
+
+  /* the number of samples grows with the distance from the center, so it
+   * is largest in a corner of the result; add one in case the kernel
+   * rounds it differently
+   */
+  for (c = 0; c < 4; c++)
+    {
+      gint x = result->x + (c & 1 ? result->width  - 1 : 0);
+      gint y = result->y + (c & 2 ? result->height - 1 : 0);
+
+      max_n = MAX (max_n, get_num_samples (angle, x - center_x, y - center_y));
+    }
+  max_n++;
+
+  trig_table = make_trig_table (angle, max_n, &trig_size);
+  trig = gegl_clCreateBuffer (gegl_cl_get_context (),
+                              CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                              trig_size, trig_table, &cl_err);
+  g_free (trig_table);
+  if (cl_err != CL_SUCCESS)
+    return FALSE;
 
   get_sample_area (operation, result, &left, &right, &top, &bottom);
 
@@ -356,10 +434,15 @@ cl_process (GeglOperation       *operation,
   while (gegl_buffer_cl_iterator_next (i, &err))
     {
       if (err)
-        return FALSE;
+        {
+          ok = FALSE;
+          break;
+        }
 
       err = cl_motion_blur_circular (i->tex[read],
                                      i->tex[0],
+                                     trig,
+                                     max_n,
                                      &i->roi[read],
                                      &i->roi[0],
                                      whole_region,
@@ -368,10 +451,16 @@ cl_process (GeglOperation       *operation,
                                      center_y);
 
       if (err)
-        return FALSE;
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          ok = FALSE;
+          break;
+        }
     }
 
-  return TRUE;
+  gegl_clReleaseMemObject (trig);
+
+  return ok;
 }
 
 static gboolean
