@@ -108,6 +108,95 @@ get_abyss_policy (GeglOperation *operation,
   return o->tileable ? GEGL_ABYSS_LOOP : GEGL_ABYSS_CLAMP;
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+#include "opencl/normal-map.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi,
+            gfloat               scale,
+            gfloat               x_scale,
+            gfloat               y_scale,
+            gfloat               z_scale,
+            gfloat               z_base,
+            gint                 x_component,
+            gint                 y_component,
+            gint                 z_component)
+{
+  const Babl           *in_format  = gegl_operation_get_format (operation, "input");
+  const Babl           *out_format = gegl_operation_get_format (operation, "output");
+  GeglBufferClIterator *i;
+  cl_int                cl_err     = 0;
+  gboolean              err        = FALSE;
+  cl_int                to_gamma   = FALSE;
+  gint                  read;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "normal_map", NULL };
+      cl_data = gegl_cl_compile_and_build (normal_map_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return FALSE;
+
+  /* For sRGB, read linear Y, which OpenCL can convert to, and apply the
+   * sRGB TRC in the kernel; otherwise let babl produce Y'.
+   */
+  if (babl_format_get_space (in_format) == babl_space ("sRGB"))
+    {
+      in_format = babl_format ("YA float");
+      to_gamma  = TRUE;
+    }
+
+  i = gegl_buffer_cl_iterator_new (output, roi, out_format,
+                                   GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, roi, in_format,
+                                        GEGL_CL_BUFFER_READ,
+                                        KERNEL_SIZE, KERNEL_SIZE,
+                                        KERNEL_SIZE, KERNEL_SIZE,
+                                        get_abyss_policy (operation, NULL));
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && !err)
+    {
+      size_t global_ws[2] = { i->roi[0].width, i->roi[0].height };
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem),   &i->tex[read],
+                                        sizeof (cl_mem),   &i->tex[0],
+                                        sizeof (cl_float), &scale,
+                                        sizeof (cl_float), &x_scale,
+                                        sizeof (cl_float), &y_scale,
+                                        sizeof (cl_float), &z_scale,
+                                        sizeof (cl_float), &z_base,
+                                        sizeof (cl_int),   &x_component,
+                                        sizeof (cl_int),   &y_component,
+                                        sizeof (cl_int),   &z_component,
+                                        sizeof (cl_int),   &to_gamma,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2,
+                                            NULL, global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  return !err;
+
+error:
+  gegl_buffer_cl_iterator_stop (i);
+
+  return FALSE;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -141,6 +230,12 @@ process (GeglOperation       *operation,
 
   while (z_component == x_component || z_component == y_component)
     z_component = (z_component + 1) % 3;
+
+  if (gegl_operation_use_opencl (operation) &&
+      cl_process (operation, input, output, roi,
+                  scale, x_scale, y_scale, z_scale, z_base,
+                  x_component, y_component, z_component))
+    return TRUE;
 
   GeglBufferIterator *iter = gegl_buffer_iterator_new (
       output, roi, 0, out_format, GEGL_ACCESS_WRITE, GEGL_ABYSS_NONE, 2);
@@ -197,6 +292,7 @@ gegl_op_class_init (GeglOpClass *klass)
   filter_class->process             = process;
   operation_class->prepare          = prepare;
   operation_class->get_bounding_box = get_bounding_box;
+  operation_class->opencl_support   = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",           "gegl:normal-map",

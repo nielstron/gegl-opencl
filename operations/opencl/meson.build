@@ -46,6 +46,7 @@ gegl_operations_opencl_sources = [
   'noise-slur.cl',
   'noise-simplex.cl',
   'noise-spread.cl',
+  'normal-map.cl',
   'oilify.cl',
   'opacity.cl',
   'pixelize.cl',
