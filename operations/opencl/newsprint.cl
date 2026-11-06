@@ -17,11 +17,14 @@
 /* Halftoning thresholds every anti-aliasing sample, so a one ulp
  * difference in the sample phase can flip a sample and change the output
  * by up to a quarter of the range. The arithmetic below therefore mirrors
- * the CPU code operation by operation: contractions are disabled, the
- * multiply-adds that the C compiler contracts (-ffp-contract=on) are
- * written as explicit fma (), divisions are corrected to be correctly
- * rounded, and cos/sin of the pattern angles are computed by the host
- * (so angle boost, which makes them vary per pixel, is not supported).
+ * the CPU code (which is compiled without contraction) operation by
+ * operation, with every operation separately rounded: divisions and
+ * hypot are corrected to be correctly rounded, gegl_fmodf () with its
+ * truncating floor is reproduced exactly, including for zero and
+ * huge quotients, and cos/sin of the pattern angles are computed by the
+ * host (so angle boost, which makes them vary per pixel, is not
+ * supported). The error-free products use fma () only where the device
+ * says it is fast, and Dekker's product otherwise.
  */
 #pragma OPENCL FP_CONTRACT OFF
 
@@ -30,33 +33,93 @@
 #define MODEL_RGB            2
 #define MODEL_CMYK           3
 
+/* (p, e) with p = a * b rounded and p + e == a * b exactly */
+static float2
+two_prod (float a,
+          float b)
+{
+  float p = a * b;
+#ifdef FP_FAST_FMAF
+  return (float2) (p, fma (a, b, -p));
+#else
+  float ca = 4097.0f * a;
+  float cb = 4097.0f * b;
+  float ah = ca - (ca - a);
+  float bh = cb - (cb - b);
+  float al = a - ah;
+  float bl = b - bh;
+
+  return (float2) (p, ((ah * bh - p) + ah * bl + al * bh) + al * bl);
+#endif
+}
+
 /* a / b, correctly rounded (OpenCL only guarantees 2.5 ulp) */
 static float
 div_rn (float a,
         float b)
 {
-  float q = a / b;
-  float r = fma (-q, b, a);
+  float  q = a / b;
+  float2 p;
 
-  return fma (r, 1.0f / b, q);
+  if (b == 0.0f)
+    return (a == 0.0f || isnan (a)) ? NAN
+                                    : copysign (INFINITY, a) *
+                                      copysign (1.0f, b);
+
+  if (q == 0.0f || ! isfinite (q))
+    return q;
+
+  p = two_prod (q, b);
+
+  return q + ((a - p.x) - p.y) * (1.0f / b);
 }
 
-/* hypot (a, b), correctly rounded in practice (OpenCL allows 4 ulp) */
+/* gegl_floorf (): truncation through (int), which saturates (and gives
+ * 0 for NaN) on ARM, then a wrapping int subtraction
+ */
+static float
+gegl_floor (float x)
+{
+  int i = convert_int_sat (x);
+
+  return (float) as_int (as_uint (i) - (((float) i > x) ? 1u : 0u));
+}
+
+/* gegl_fmodf (): x - y * gegl_floorf (x / y) */
+static float
+gegl_fmod (float x,
+           float y)
+{
+  return x - y * gegl_floor (div_rn (x, y));
+}
+
+/* hypot (a, b), correctly rounded in practice like the CPU's */
 static float
 hypot_rn (float a,
           float b)
 {
-  float s  = a * a;
-  float t  = b * b;
-  float hi = s + t;
-  float bb = hi - s;
-  float lo = ((s - (hi - bb)) + (t - bb)) + fma (a, a, -s) + fma (b, b, -t);
-  float r  = sqrt (hi);
+  float2 s, t;
+  float2 rr;
+  float  hi, bb, lo, r;
+
+  if (isinf (a) || isinf (b))
+    return INFINITY;
+  if (isnan (a) || isnan (b))
+    return NAN;
+
+  s  = two_prod (a, a);
+  t  = two_prod (b, b);
+  hi = s.x + t.x;
+  bb = hi - s.x;
+  lo = ((s.x - (hi - bb)) + (t.x - bb)) + (s.y + t.y);
+  r  = sqrt (hi);
 
   if (r == 0.0f)
     return 0.0f;
 
-  return fma (fma (-r, r, hi) + lo, 0.5f / r, r);
+  rr = two_prod (r, r);
+
+  return r + (((hi - rr.x) - rr.y) + lo) * (0.5f / r);
 }
 
 static float
@@ -74,20 +137,20 @@ spachrotyze (float x,
 {
   float acc     = 0.0f;
   float old_acc = 0.0f;
-  float width   = fma (period, 1.0f - turbulence,
-                       (offset * period) * turbulence);
+  float width   = period * (1.0f - turbulence) +
+                  (period * offset) * turbulence;
   float bwidth  = blocksize * width;
   float xi      = 0.5f;
   float yi      = 0.2f;
   int   count   = 0;
   int   in      = 0;
 
-  x = fma (period, 2.0f, x);
-  y = fma (period, 2.0f, y);
+  x = x + period * 2.0f;
+  y = y + period * 2.0f;
 
   for (int i = 0; i < max_aa_samples; i++)
     {
-      float a, u, v, w, q, wphase, qphase;
+      float u, v, w, q, wphase, qphase;
 
       xi += 0x1.3c6ef4p-1f;
       xi -= floor (xi);
@@ -96,19 +159,17 @@ spachrotyze (float x,
 
       old_acc = acc;
 
-      a = fma (width, -0.5f, x + xi);
-      u = fma (-bwidth, floor (div_rn (a, bwidth)), a);
-      a = fma (width, -0.5f, y + yi);
-      v = fma (-bwidth, floor (div_rn (a, bwidth)), a);
+      u = gegl_fmod ((x + xi) - 0.5f * width, bwidth);
+      v = gegl_fmod ((y + yi) - 0.5f * width, bwidth);
 
-      w = fma (vec0, u, vec1 * v);
-      q = fma (vec1, u, vec0 * -v);
+      w = vec0 * u + vec1 * v;
+      q = vec1 * u - vec0 * v;
 
-      w = fma (-width, floor (div_rn (w, width)), w);
-      q = fma (-width, floor (div_rn (q, width)), q);
+      w = gegl_fmod (w, width);
+      q = gegl_fmod (q, width);
 
-      wphase = fma (div_rn (w, width), 2.0f, -1.0f);
-      qphase = fma (div_rn (q, width), 2.0f, -1.0f);
+      wphase = div_rn (w, width) * 2.0f - 1.0f;
+      qphase = div_rn (q, width) * 2.0f - 1.0f;
 
       if (pattern == 0) /* line */
         {
@@ -117,7 +178,7 @@ spachrotyze (float x,
         }
       else if (pattern == 1) /* dot */
         {
-          if (fma (qphase, qphase, wphase * wphase) <
+          if (qphase * qphase + wphase * wphase <
               (part_white * part_white) * 2.0f)
             in++;
         }
@@ -164,28 +225,43 @@ static float
 div_one_minus (float a,
                float k)
 {
-  float bh = 1.0f - k;
-  float bl = (1.0f - bh) - k;
-  float q  = div_rn (a, bh);
-  float r  = fma (-q, bh, a) - q * bl;
+  float  bh = 1.0f - k;
+  float  bl = (1.0f - bh) - k;
+  float  q  = div_rn (a, bh);
+  float2 p;
 
-  return fma (r, 1.0f / bh, q);
+  if (q == 0.0f || ! isfinite (q))
+    return q;
+
+  p = two_prod (q, bh);
+
+  return q + (((a - p.x) - p.y) - q * bl) * (1.0f / bh);
 }
 
-/* (float) fma ((double) c, 1.0 - (double) k, (double) k) */
+/* (float) ((double) k * pullout), pullout == hi + lo */
+static float
+mul_pullout (float k,
+             float hi,
+             float lo)
+{
+  float2 p = two_prod (k, hi);
+
+  return p.x + (p.y + k * lo);
+}
+
+/* (float) ((double) c * (1.0 - (double) k) + (double) k) */
 static float
 mix_one_minus (float c,
                float k)
 {
-  float bh = 1.0f - k;
-  float bl = (1.0f - bh) - k;
-  float p  = c * bh;
-  float pe = fma (c, bh, -p);
-  float s  = p + k;
-  float sb = s - p;
-  float se = (p - (s - sb)) + (k - sb);
+  float  bh = 1.0f - k;
+  float  bl = (1.0f - bh) - k;
+  float2 p  = two_prod (c, bh);
+  float  s  = p.x + k;
+  float  sb = s - p.x;
+  float  se = (p.x - (s - sb)) + (k - sb);
 
-  return s + (se + pe + c * bl);
+  return s + (se + p.y + c * bl);
 }
 
 static float
@@ -256,7 +332,7 @@ newsprint (__global const float4 *in,
       if (m < k) k = m;
       if (y < k) k = y;
 
-      k = fma (k, pullout_hi, k * pullout_lo);
+      k = mul_pullout (k, pullout_hi, pullout_lo);
 
       if (k < 1.0f)
         {
