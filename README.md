@@ -99,7 +99,6 @@ be re-measured.
 | `fix/opencl-threading-gate` | GEGL turned off CPU threading for every OpenCL-capable op once OpenCL was initialised, even on nodes with `use-opencl=false` | pass | CPU path of bilateral-filter with 8 threads: 3.4–5.1 s → 0.85 s. Matters for any app that enables OpenCL per graph. |
 | `fix/sampler-context-rect` | Sampler cache could miss the NoHalo context, so CPU output depended on thread count | pass | **Changes CPU output** (only where it was undefined). |
 | `fix/cl-iterator-abyss-alpha` | Area filters on sources without alpha got opaque black instead of transparent at edges on the GPU (up to 150/255) | under review | Upstream's existing guard checked the wrong rectangle. |
-| `fix/macos-dlopen-flags` | `dlopen(..., RTLD_LAZY / RTLD_LOCAL)`: a division instead of `\|` | pass | |
 | `fix/cl-color-babl-parity` | GPU colour conversions differ from babl in the last bits, flipping threshold/table ops | under review | |
 | `perf/opencl-transfer` | Speed up GEGL's shared OpenCL transfer/conversion path | in progress | Simple point ops are transfer-bound today. |
 
