@@ -203,17 +203,34 @@ cl_process (GeglOperation       *op,
   gfloat value;
   const Babl *fmt;
 
-  if (!cl_data)
-    {
-      const char *kernel_name[] = {"gegl_opacity_RaGaBaA_float", "gegl_opacity_RGBA_float", NULL};
-      cl_data = gegl_cl_compile_and_build (opacity_cl_source, kernel_name);
-    }
-  if (!cl_data) return TRUE;
-
   fmt = gegl_operation_get_format(op, "input");
   value = GEGL_PROPERTIES (op)->value;
 
-  kernel = ((babl_get_model_flags(fmt) & BABL_MODEL_FLAG_ASSOCIATED) == 0)? 1 : 0;
+  /* The kernels only handle 2 (gray + alpha) and 4 (color + alpha)
+   * component float formats; anything else (e.g. cmykA) uses the CPU.
+   * The format is fixed for the whole process call, so this bails out
+   * on the first chunk, before any output has been written.
+   */
+  switch (babl_format_get_n_components (fmt))
+    {
+      case 4: kernel = 0; break;
+      case 2: kernel = 2; break;
+      default: return TRUE;
+    }
+
+  if ((babl_get_model_flags (fmt) & BABL_MODEL_FLAG_ASSOCIATED) == 0)
+    kernel += 1;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"gegl_opacity_RaGaBaA_float",
+                                   "gegl_opacity_RGBA_float",
+                                   "gegl_opacity_YaA_float",
+                                   "gegl_opacity_YA_float",
+                                   NULL};
+      cl_data = gegl_cl_compile_and_build (opacity_cl_source, kernel_name);
+    }
+  if (!cl_data) return TRUE;
 
   cl_err = gegl_clSetKernelArg(cl_data->kernel[kernel], 0, sizeof(cl_mem),   (void*)&in_tex);
   CL_CHECK;
