@@ -21,6 +21,7 @@ gegl_operations_opencl_sources = [
   'edge-sobel.cl',
   'gaussian-blur-selective.cl',
   'gblur-1d.cl',
+  'gblur-mem.cl',
   'hue-chroma.cl',
   'invert-linear.cl',
   'levels.cl',
