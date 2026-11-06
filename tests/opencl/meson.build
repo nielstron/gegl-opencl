@@ -37,6 +37,7 @@ opencl_tests = [
   'red-eye-removal',
   'ripple',
   'snn-mean',
+  'stretch-contrast-hsv',
   'svg-src-over',
   'texturize-canvas',
   'threshold',

@@ -57,6 +57,7 @@ gegl_operations_opencl_sources = [
   'ripple.cl',
   'shadows-highlights-correction.cl',
   'snn-mean.cl',
+  'stretch-contrast-hsv.cl',
   'stretch-contrast.cl',
   'svg-src-over.cl',
   'texturize-canvas.cl',
