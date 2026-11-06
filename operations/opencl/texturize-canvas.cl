@@ -1,6 +1,6 @@
 __kernel void cl_texturize_canvas(__global const float * in,
                                   __global       float * out,
-                                  __global       float * sdata,
+                                  __global const float * sdata,
                                            const int     x,
                                            const int     y,
                                            const int     xm,
