@@ -34,6 +34,7 @@ gegl_operations_opencl_sources = [
   'oilify.cl',
   'opacity.cl',
   'pixelize.cl',
+  'polar-coordinates.cl',
   'posterize.cl',
   'random.cl',
   'red-eye-removal.cl',

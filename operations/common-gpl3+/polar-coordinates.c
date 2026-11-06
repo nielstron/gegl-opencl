@@ -307,6 +307,181 @@ get_effective_area (GeglOperation *operation)
   return result;
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+
+#include "opencl/polar-coordinates.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+/* Copies @rect of @buffer, converted to @format, into a new OpenCL buffer. */
+static cl_mem
+cl_upload_rect (GeglBuffer          *buffer,
+                const GeglRectangle *rect,
+                const Babl          *format)
+{
+  cl_int   cl_err = 0;
+  cl_mem   tex    = NULL;
+  size_t   size   = (size_t) rect->width * rect->height *
+                    babl_format_get_bytes_per_pixel (format);
+  gpointer data;
+
+  tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                             CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
+                             size, NULL, &cl_err);
+  CL_CHECK;
+
+  data = gegl_clEnqueueMapBuffer (gegl_cl_get_command_queue (), tex, CL_TRUE,
+                                  CL_MAP_WRITE, 0, size,
+                                  0, NULL, NULL, &cl_err);
+  CL_CHECK;
+
+  gegl_buffer_get (buffer, rect, 1.0, format, data,
+                   GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
+
+  cl_err = gegl_clEnqueueUnmapMemObject (gegl_cl_get_command_queue (), tex,
+                                         data, 0, NULL, NULL);
+  CL_CHECK;
+
+  return tex;
+
+error:
+  if (tex)
+    gegl_clReleaseMemObject (tex);
+
+  return NULL;
+}
+
+/* Implements process () with the NoHalo sampler on the GPU.  Samples are
+ * only taken at positions that round to a pixel inside the input's bounding
+ * box, so only the part of the abyss rectangle that NoHalo's stencil can
+ * reach from there needs to be uploaded; GEGL_ABYSS_NONE handles the rest.
+ */
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi,
+            const GeglRectangle *boundary,
+            gdouble              cen_x,
+            gdouble              cen_y)
+{
+  GeglProperties       *o      = GEGL_PROPERTIES (operation);
+  const Babl           *format = gegl_operation_get_format (operation, "output");
+  const Babl           *space  = babl_format_get_space (format);
+  const Babl           *interpolate_format;
+  const GeglRectangle  *abyss  = gegl_buffer_get_abyss (input);
+  GeglRectangle         src_rect;
+  GeglBufferClIterator *i;
+  cl_mem                in_tex = NULL;
+  cl_int                cl_err = 0;
+  gboolean              err;
+  cl_int4               srect;
+  cl_int4               abyss4;
+  cl_int                policy  = GEGL_ABYSS_NONE;
+  cl_float              f_cen_x = cen_x;
+  cl_float              f_cen_y = cen_y;
+  cl_int                width   = boundary->width;
+  cl_int                height  = boundary->height;
+  cl_float              circle  = o->depth;
+  cl_float              angl    = o->angle / 180.0 * G_PI;
+  cl_int                bw      = o->bw;
+  cl_int                top     = o->top;
+  cl_int                polar   = o->polar;
+  cl_int                unpremultiply;
+
+  interpolate_format = babl_format_with_space ("RaGaBaA float", space);
+
+  if (format == interpolate_format)
+    unpremultiply = 0;
+  else if (format == babl_format_with_space ("RGBA float", space))
+    unpremultiply = 1;
+  else
+    return FALSE;
+
+  /* NoHalo reads up to two pixels around the sampled one */
+  src_rect = *GEGL_RECTANGLE (-3, -3, width + 6, height + 6);
+  if (! gegl_rectangle_intersect (&src_rect, &src_rect, abyss))
+    return FALSE;
+
+  if ((gdouble) src_rect.width * src_rect.height > (1 << 26))
+    return FALSE;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"polar_coordinates", NULL};
+      cl_data = gegl_cl_compile_and_build (polar_coordinates_cl_source,
+                                           kernel_name);
+    }
+
+  if (!cl_data)
+    return FALSE;
+
+  srect.s[0]  = src_rect.x;
+  srect.s[1]  = src_rect.y;
+  srect.s[2]  = src_rect.width;
+  srect.s[3]  = src_rect.height;
+  abyss4.s[0] = abyss->x;
+  abyss4.s[1] = abyss->y;
+  abyss4.s[2] = abyss->width;
+  abyss4.s[3] = abyss->height;
+
+  in_tex = cl_upload_rect (input, &src_rect, interpolate_format);
+  if (!in_tex)
+    return FALSE;
+
+  i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err))
+    {
+      size_t global_ws[2];
+
+      if (err)
+        goto error_iter;
+
+      global_ws[0] = i->roi[0].width;
+      global_ws[1] = i->roi[0].height;
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem),   &in_tex,
+                                        sizeof (cl_int4),  &srect,
+                                        sizeof (cl_int4),  &abyss4,
+                                        sizeof (cl_int),   &policy,
+                                        sizeof (cl_mem),   &i->tex[0],
+                                        sizeof (cl_int),   &i->roi[0].x,
+                                        sizeof (cl_int),   &i->roi[0].y,
+                                        sizeof (cl_float), &f_cen_x,
+                                        sizeof (cl_float), &f_cen_y,
+                                        sizeof (cl_int),   &width,
+                                        sizeof (cl_int),   &height,
+                                        sizeof (cl_float), &circle,
+                                        sizeof (cl_float), &angl,
+                                        sizeof (cl_int),   &bw,
+                                        sizeof (cl_int),   &top,
+                                        sizeof (cl_int),   &polar,
+                                        sizeof (cl_int),   &unpremultiply,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2,
+                                            NULL, global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  gegl_clReleaseMemObject (in_tex);
+
+  return TRUE;
+
+error:
+  gegl_buffer_cl_iterator_stop (i);
+error_iter:
+  gegl_clReleaseMemObject (in_tex);
+
+  return FALSE;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -333,11 +508,6 @@ process (GeglOperation       *operation,
                                 current center pixel.
                              */
 
-  src_buf = g_new0 (gfloat, result->width * result->height * 4);
-  dst_buf = g_new0 (gfloat, result->width * result->height * 4);
-
-  gegl_buffer_get (input, result, 1.0, format, src_buf, GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
-
   if (o->middle)
     {
       cen_x = boundary.width / 2;
@@ -348,6 +518,18 @@ process (GeglOperation       *operation,
       cen_x = o->pole_x;
       cen_y = o->pole_y;
     }
+
+  if (level == 0 && gegl_operation_use_opencl (operation) &&
+      cl_process (operation, input, output, result, &boundary, cen_x, cen_y))
+    {
+      g_object_unref (sampler);
+      return TRUE;
+    }
+
+  src_buf = g_new0 (gfloat, result->width * result->height * 4);
+  dst_buf = g_new0 (gfloat, result->width * result->height * 4);
+
+  gegl_buffer_get (input, result, 1.0, format, src_buf, GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
 
   for (y = result->y; y < result->y + result->height; y++)
     for (x = result->x; x < result->x + result->width; x++)
@@ -440,6 +622,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->process                 = operation_process;
 
   filter_class->process                    = process;
+  operation_class->opencl_support          = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",               "gegl:polar-coordinates",

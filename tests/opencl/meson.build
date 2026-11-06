@@ -15,6 +15,7 @@ opencl_tests = [
   'oilify',
   'opacity',
   'pixelize',
+  'polar-coordinates',
   'snn-mean',
   'svg-src-over',
   'threshold',
