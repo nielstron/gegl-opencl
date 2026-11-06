@@ -7,6 +7,7 @@ opencl_tests = [
   'edge-sobel',
   'focus-blur',
   'gaussian-blur',
+  'gaussian-blur-iir',
   'invert-linear',
   'levels',
   'mono-mixer',
