@@ -35,6 +35,7 @@ opencl_tests = [
   'pixelize',
   'polar-coordinates',
   'red-eye-removal',
+  'ripple',
   'snn-mean',
   'svg-src-over',
   'texturize-canvas',
