@@ -3,8 +3,9 @@
   <node operation='gegl:ripple'>
     <params>
       <param name='amplitude'>10</param>
-      <param name='period'>50</param>
+      <param name='period'>33.3</param>
       <param name='angle'>30</param>
+      <param name='abyss-policy'>clamp</param>
     </params>
   </node>
   <node operation='gegl:load'>
