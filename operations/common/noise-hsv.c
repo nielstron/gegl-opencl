@@ -96,21 +96,40 @@ randomize_value (gfloat      now,
   return new_val;
 }
 
+static gboolean
+use_rgb_format (GeglOperation *operation,
+                const Babl    *space)
+{
+  /* babl's HSV model is computed on sRGB-TRC encoded values, which equal
+   * R'G'B' only for spaces with the sRGB TRC.  In that case the OpenCL
+   * path works on R'G'B'A float, which GEGL can convert on the GPU, and
+   * converts to and from HSV in the kernel.
+   */
+  return gegl_operation_use_opencl (operation) &&
+         (space == NULL || space == babl_space ("sRGB"));
+}
+
 static void
 prepare (GeglOperation *operation)
 {
   const Babl *space = gegl_operation_get_source_space (operation, "input");
-  gegl_operation_set_format (operation, "input", babl_format_with_space ("HSVA float", space));
-  gegl_operation_set_format (operation, "output", babl_format_with_space ("HSVA float", space));
+  const Babl *format;
+
+  if (use_rgb_format (operation, space))
+    format = babl_format ("R'G'B'A float");
+  else
+    format = babl_format_with_space ("HSVA float", space);
+
+  gegl_operation_set_format (operation, "input", format);
+  gegl_operation_set_format (operation, "output", format);
 }
 
-static gboolean
-process (GeglOperation       *operation,
-         void                *in_buf,
-         void                *out_buf,
-         glong                n_pixels,
-         const GeglRectangle *roi,
-         gint                 level)
+static void
+process_hsva (GeglOperation       *operation,
+              gfloat              *in_buf,
+              gfloat              *out_buf,
+              glong                n_pixels,
+              const GeglRectangle *roi)
 {
   GeglProperties *o  = GEGL_PROPERTIES (operation);
   GeglRectangle whole_region;
@@ -175,6 +194,35 @@ process (GeglOperation       *operation,
         y++;
       }
   }
+}
+
+static gboolean
+process (GeglOperation       *operation,
+         void                *in_buf,
+         void                *out_buf,
+         glong                n_pixels,
+         const GeglRectangle *roi,
+         gint                 level)
+{
+  const Babl *format = gegl_operation_get_format (operation, "input");
+  const Babl *hsva   = babl_format_with_space ("HSVA float",
+                                               babl_format_get_space (format));
+
+  if (format == hsva)
+    {
+      process_hsva (operation, in_buf, out_buf, n_pixels, roi);
+    }
+  else
+    {
+      /* R'G'B'A float, chosen for the OpenCL path; fall back to HSVA */
+      gfloat *tmp = gegl_malloc (sizeof (gfloat) * 4 * n_pixels);
+
+      babl_process (babl_fish (format, hsva), in_buf, tmp, n_pixels);
+      process_hsva (operation, tmp, tmp, n_pixels, roi);
+      babl_process (babl_fish (hsva, format), tmp, out_buf, n_pixels);
+
+      gegl_free (tmp);
+    }
 
   return TRUE;
 }
@@ -206,12 +254,13 @@ cl_process (GeglOperation       *operation,
   cl_float    hue_distance;
   cl_float    saturation_distance;
   cl_float    value_distance;
+  cl_kernel   kernel;
 
   gegl_cl_random_get_ushort4 (o->rand, &rand);
 
   if (!cl_data)
     {
-      const char *kernel_name[] = { "cl_noise_hsv", NULL };
+      const char *kernel_name[] = { "cl_noise_hsv", "cl_noise_hsv_rgb", NULL };
       cl_data = gegl_cl_compile_and_build (noise_hsv_cl_source, kernel_name);
     }
 
@@ -226,7 +275,12 @@ cl_process (GeglOperation       *operation,
   saturation_distance = o->saturation_distance;
   value_distance = o->value_distance;
 
-  gegl_cl_set_kernel_args (cl_data->kernel[0],
+  if (gegl_operation_get_format (operation, "input") == babl_format ("R'G'B'A float"))
+    kernel = cl_data->kernel[1];
+  else
+    kernel = cl_data->kernel[0];
+
+  gegl_cl_set_kernel_args (kernel,
                            sizeof(cl_mem),     &in,
                            sizeof(cl_mem),     &out,
                            sizeof(cl_mem),     &cl_random_data,
@@ -243,7 +297,7 @@ cl_process (GeglOperation       *operation,
 
   CL_CHECK;
   cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                        cl_data->kernel[0], 1,
+                                        kernel, 1,
                                         NULL, &global_worksize, NULL,
                                         0, NULL, NULL);
   CL_CHECK;

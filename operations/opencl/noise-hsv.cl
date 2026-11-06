@@ -60,29 +60,123 @@ randomize_value (__global const int        *random_data,
   return new_val;
 }
 
-__kernel void cl_noise_hsv(__global const float4    *in,
-                           __global       float4    *out,
-                           __global const int       *random_data,
-                                    const GeglRandom rand,
-                                          int        x_offset,
-                                          int        y_offset,
-                                          int        roi_width,
-                                          int        whole_region_width,
-                                          int        holdness,
-                                          float      hue_distance,
-                                          float      saturation_distance,
-                                          float      value_distance)
+/* Same as babl's rgba_to_hsv_step (extensions/HSV.c), applied to
+ * R'G'B' values (babl's HSV is defined on sRGB-TRC encoded values).
+ */
+float4
+rgb_to_hsv (float4 rgba)
 {
-  const int gid  = get_global_id(0);
-  const int gidy = gid / roi_width;
-  const int gidx = gid - gidy * roi_width;
+  const float epsilon = 1.0e-10f;
+  float red   = rgba.x;
+  float green = rgba.y;
+  float blue  = rgba.z;
+  float hue, saturation, value, minv, chroma;
 
-  const int x = gidx + x_offset;
-  const int y = gidy + y_offset;
+  if (red > green)
+    {
+      value = (red < blue) ? blue : red;
+      minv  = (green > blue) ? blue : green;
+    }
+  else
+    {
+      value = (green < blue) ? blue : green;
+      minv  = (red > blue) ? blue : red;
+    }
 
+  chroma = value - minv;
+
+  if (value < epsilon)
+    saturation = 0.0f;
+  else
+    saturation = chroma / value;
+
+  if (saturation < epsilon)
+    {
+      hue = 0.0f;
+    }
+  else
+    {
+      if (fabs (red - value) < epsilon)
+        {
+          hue = (green - blue) / chroma;
+
+          if (hue < 0.0f)
+            hue += 6.0f;
+        }
+      else if (fabs (green - value) < epsilon)
+        hue = 2.0f + (blue - red) / chroma;
+      else
+        hue = 4.0f + (red - green) / chroma;
+
+      hue /= 6.0f;
+    }
+
+  return (float4)(hue, saturation, value, rgba.w);
+}
+
+/* Same as babl's hsv_to_rgba_step, producing R'G'B' values. */
+float4
+hsv_to_rgb (float4 hsva)
+{
+  const float chroma = hsva.y * hsva.z;
+  float red = 0.0f, green = 0.0f, blue = 0.0f;
+  float h_tmp, x, minv;
+
+  h_tmp  = fmod (hsva.x, 1.0f);
+  h_tmp += (h_tmp < 0.0f) ? 1.0f : 0.0f;
+  h_tmp *= 6.0f;
+
+  x = chroma * (1.0f - fabs (fmod (h_tmp, 2.0f) - 1.0f));
+
+  if (h_tmp < 1.0f)
+    {
+      red   = chroma;
+      green = x;
+    }
+  else if (h_tmp < 2.0f)
+    {
+      red   = x;
+      green = chroma;
+    }
+  else if (h_tmp < 3.0f)
+    {
+      green = chroma;
+      blue  = x;
+    }
+  else if (h_tmp < 4.0f)
+    {
+      green = x;
+      blue  = chroma;
+    }
+  else if (h_tmp < 5.0f)
+    {
+      red  = x;
+      blue = chroma;
+    }
+  else if (h_tmp < 6.0f)
+    {
+      red  = chroma;
+      blue = x;
+    }
+
+  minv = hsva.z - chroma;
+
+  return (float4)(red + minv, green + minv, blue + minv, hsva.w);
+}
+
+float4
+noise_hsv (float4                    in_v,
+           __global const int       *random_data,
+           const GeglRandom          rand,
+           int                       x,
+           int                       y,
+           int                       whole_region_width,
+           int                       holdness,
+           float                     hue_distance,
+           float                     saturation_distance,
+           float                     value_distance)
+{
   int n = (3 * holdness + 4) * (x + whole_region_width * y);
-
-  const float4 in_v = in[gid];
 
   float hue        = in_v.s0;
   float saturation = in_v.s1;
@@ -116,5 +210,58 @@ __kernel void cl_noise_hsv(__global const float4    *in,
                              value_distance, holdness,
                              x, y, n);
 
-  out[gid] = (float4)(hue, saturation, value, alpha);
+  return (float4)(hue, saturation, value, alpha);
+}
+
+/* HSVA float in and out */
+__kernel void cl_noise_hsv(__global const float4    *in,
+                           __global       float4    *out,
+                           __global const int       *random_data,
+                                    const GeglRandom rand,
+                                          int        x_offset,
+                                          int        y_offset,
+                                          int        roi_width,
+                                          int        whole_region_width,
+                                          int        holdness,
+                                          float      hue_distance,
+                                          float      saturation_distance,
+                                          float      value_distance)
+{
+  const int gid  = get_global_id(0);
+  const int gidy = gid / roi_width;
+  const int gidx = gid - gidy * roi_width;
+
+  out[gid] = noise_hsv (in[gid], random_data, rand,
+                        gidx + x_offset, gidy + y_offset,
+                        whole_region_width, holdness,
+                        hue_distance, saturation_distance, value_distance);
+}
+
+/* R'G'B'A float in and out, converting to and from HSV in the kernel, so
+ * that the buffer conversions can stay on the GPU.
+ */
+__kernel void cl_noise_hsv_rgb(__global const float4    *in,
+                               __global       float4    *out,
+                               __global const int       *random_data,
+                                        const GeglRandom rand,
+                                              int        x_offset,
+                                              int        y_offset,
+                                              int        roi_width,
+                                              int        whole_region_width,
+                                              int        holdness,
+                                              float      hue_distance,
+                                              float      saturation_distance,
+                                              float      value_distance)
+{
+  const int gid  = get_global_id(0);
+  const int gidy = gid / roi_width;
+  const int gidx = gid - gidy * roi_width;
+
+  const float4 hsva = noise_hsv (rgb_to_hsv (in[gid]), random_data, rand,
+                                 gidx + x_offset, gidy + y_offset,
+                                 whole_region_width, holdness,
+                                 hue_distance, saturation_distance,
+                                 value_distance);
+
+  out[gid] = hsv_to_rgb (hsva);
 }
