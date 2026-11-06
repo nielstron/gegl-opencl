@@ -156,7 +156,8 @@ operation_process (GeglOperation        *operation,
 
 #include "opencl/lens-blur.cl.h"
 
-#define CL_SCAN_SIZE 256
+/* the largest scan (local work) size used by lens_blur_prefix */
+#define CL_MAX_SCAN_SIZE 256
 
 static GeglClRunData *cl_data = NULL;
 
@@ -174,12 +175,15 @@ cl_lens_blur (cl_mem               in_tex,
               cl_float             highlight_max,
               cl_int               iradius)
 {
-  cl_int cl_err      = 0;
-  cl_mem prefix_tex  = NULL;
-  cl_mem prefix_w    = NULL;
-  size_t n           = (size_t) (src_rect->width + 1) * src_rect->height;
-  size_t global_ws[2];
-  size_t local_ws[2];
+  cl_int   cl_err     = 0;
+  cl_mem   prefix_tex = NULL;
+  cl_mem   prefix_w   = NULL;
+  size_t   n          = (size_t) (src_rect->width + 1) * src_rect->height;
+  size_t   scan_size;
+  size_t   max_size;
+  cl_ulong local_mem;
+  size_t   global_ws[2];
+  size_t   local_ws[2];
 
   if (!cl_data)
     {
@@ -191,27 +195,50 @@ cl_lens_blur (cl_mem               in_tex,
   if (!cl_data)
     return TRUE;
 
+  /* the scan size is a power of two within the kernel's work group size
+   * and local memory limits
+   */
+  cl_err = gegl_clGetKernelWorkGroupInfo (cl_data->kernel[0],
+                                          gegl_cl_get_device (),
+                                          CL_KERNEL_WORK_GROUP_SIZE,
+                                          sizeof (size_t), &max_size,
+                                          NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clGetDeviceInfo (gegl_cl_get_device (),
+                                 CL_DEVICE_LOCAL_MEM_SIZE,
+                                 sizeof (cl_ulong), &local_mem,
+                                 NULL);
+  CL_CHECK;
+
+  for (scan_size = CL_MAX_SCAN_SIZE;
+       scan_size > 1 &&
+       (scan_size > max_size ||
+        scan_size * (2 * sizeof (cl_float4) + sizeof (cl_float2)) >
+        local_mem / 2);
+       scan_size /= 2);
+
   prefix_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
                                     CL_MEM_READ_WRITE,
-                                    n * sizeof (cl_float4), NULL, &cl_err);
+                                    2 * n * sizeof (cl_float4), NULL, &cl_err);
   CL_CHECK;
 
   prefix_w = gegl_clCreateBuffer (gegl_cl_get_context (),
                                   CL_MEM_READ_WRITE,
-                                  n * sizeof (cl_float), NULL, &cl_err);
+                                  n * sizeof (cl_float2), NULL, &cl_err);
   CL_CHECK;
 
-  global_ws[0] = CL_SCAN_SIZE;
+  global_ws[0] = scan_size;
   global_ws[1] = src_rect->height;
-  local_ws[0]  = CL_SCAN_SIZE;
+  local_ws[0]  = scan_size;
   local_ws[1]  = 1;
 
   cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
                                     sizeof (cl_mem),    &in_tex,
                                     sizeof (cl_mem),    &prefix_tex,
                                     sizeof (cl_mem),    &prefix_w,
-                                    CL_SCAN_SIZE * sizeof (cl_float4), NULL,
-                                    CL_SCAN_SIZE * sizeof (cl_float),  NULL,
+                                    2 * scan_size * sizeof (cl_float4), NULL,
+                                    scan_size * sizeof (cl_float2),     NULL,
                                     sizeof (cl_int),    &src_rect->width,
                                     sizeof (cl_int4),   clip,
                                     sizeof (cl_float4), luminance,

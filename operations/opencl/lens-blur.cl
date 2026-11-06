@@ -25,9 +25,19 @@
  *
  *  2. lens_blur_disc: every output pixel sums one span per disc row,
  *     using two prefix sum lookups per row.
+ *
+ * The prefix sums of a whole row can be many orders of magnitude larger
+ * than the sum of a single span (highlight weights reach 1024), so a span
+ * computed as the difference of two float prefix sums would lose most of
+ * its precision.  The prefix sums are therefore kept as unevaluated sums
+ * of two floats (hi + lo, using error-free additions), which makes the
+ * span sums about as accurate as the CPU sliding window.  This relies on
+ * the additions not being reassociated, which GEGL ensures by building
+ * the kernels with -cl-opt-disable; no fma or fp64 is needed.
+ *
+ * The scan size is the local work size, a power of two chosen by the
+ * host from the kernel's work group size limit.
  */
-
-#define SCAN_SIZE 256
 
 static float
 highlight_weight (float4 pixel,
@@ -49,12 +59,45 @@ highlight_weight (float4 pixel,
   return exp (v * factor);
 }
 
+/* (a_hi + a_lo) + (b_hi + b_lo), renormalized; Knuth's two-sum */
+static void
+dd_add4 (float4 *a_hi, float4 *a_lo, float4 b_hi, float4 b_lo)
+{
+  float4 s  = *a_hi + b_hi;
+  float4 bb = s - *a_hi;
+  float4 e  = (*a_hi - (s - bb)) + (b_hi - bb);
+  float4 h;
+
+  e += *a_lo + b_lo;
+
+  h  = s + e;
+  bb = h - s;
+  *a_lo = (s - (h - bb)) + (e - bb);
+  *a_hi = h;
+}
+
+static void
+dd_add (float *a_hi, float *a_lo, float b_hi, float b_lo)
+{
+  float s  = *a_hi + b_hi;
+  float bb = s - *a_hi;
+  float e  = (*a_hi - (s - bb)) + (b_hi - bb);
+  float h;
+
+  e += *a_lo + b_lo;
+
+  h  = s + e;
+  bb = h - s;
+  *a_lo = (s - (h - bb)) + (e - bb);
+  *a_hi = h;
+}
+
 __kernel void
 lens_blur_prefix (__global const float4 *src,
-                  __global       float4 *prefix,
-                  __global       float  *prefix_w,
-                  __local        float4 *scan,
-                  __local        float  *scan_w,
+                  __global       float4 *prefix,     /* hi, lo pairs */
+                  __global       float2 *prefix_w,   /* hi, lo */
+                  __local        float4 *scan,       /* 2 * local size */
+                  __local        float2 *scan_w,     /* local size */
                   int                    width,
                   int4                   clip,       /* x0, y0, x1, y1 */
                   float4                 luminance,
@@ -63,24 +106,30 @@ lens_blur_prefix (__global const float4 *src,
                   float                  factor,
                   float                  highlight_max)
 {
-  int    lid     = get_local_id (0);
-  int    y       = get_group_id (1);
-  int    stride  = width + 1;
-  float4 carry   = (float4) (0.0f);
-  float  carry_w = 0.0f;
+  int    lid       = get_local_id (0);
+  int    scan_size = get_local_size (0);
+  int    y         = get_group_id (1);
+  int    stride    = width + 1;
+  float4 carry     = (float4) (0.0f);
+  float4 carry_lo  = (float4) (0.0f);
+  float  carry_w   = 0.0f;
+  float  carry_wlo = 0.0f;
   int    base;
 
   if (lid == 0)
     {
-      prefix[y * stride]   = (float4) (0.0f);
-      prefix_w[y * stride] = 0.0f;
+      prefix[2 * y * stride]     = (float4) (0.0f);
+      prefix[2 * y * stride + 1] = (float4) (0.0f);
+      prefix_w[y * stride]       = (float2) (0.0f);
     }
 
-  for (base = 0; base < width; base += SCAN_SIZE)
+  for (base = 0; base < width; base += scan_size)
     {
       int    x = base + lid;
       float4 v = (float4) (0.0f);
       float  w = 0.0f;
+      float4 hi, lo;
+      float  w_hi, w_lo;
       int    offset;
 
       if (x < width && x >= clip.s0 && x < clip.s2 && y >= clip.s1 && y < clip.s3)
@@ -97,47 +146,66 @@ lens_blur_prefix (__global const float4 *src,
           v.xyz = p.xyz * v.w;
         }
 
-      scan[lid]   = v;
-      scan_w[lid] = w;
+      scan[2 * lid]     = v;
+      scan[2 * lid + 1] = (float4) (0.0f);
+      scan_w[lid]       = (float2) (w, 0.0f);
 
       barrier (CLK_LOCAL_MEM_FENCE);
 
       /* Hillis-Steele inclusive scan */
-      for (offset = 1; offset < SCAN_SIZE; offset *= 2)
+      for (offset = 1; offset < scan_size; offset *= 2)
         {
-          float4 t   = (float4) (0.0f);
-          float  t_w = 0.0f;
+          hi   = scan[2 * lid];
+          lo   = scan[2 * lid + 1];
+          w_hi = scan_w[lid].x;
+          w_lo = scan_w[lid].y;
 
           if (lid >= offset)
             {
-              t   = scan[lid - offset];
-              t_w = scan_w[lid - offset];
+              float2 t_w = scan_w[lid - offset];
+
+              dd_add4 (&hi, &lo,
+                       scan[2 * (lid - offset)],
+                       scan[2 * (lid - offset) + 1]);
+              dd_add (&w_hi, &w_lo, t_w.x, t_w.y);
             }
 
           barrier (CLK_LOCAL_MEM_FENCE);
 
-          scan[lid]   += t;
-          scan_w[lid] += t_w;
+          scan[2 * lid]     = hi;
+          scan[2 * lid + 1] = lo;
+          scan_w[lid]       = (float2) (w_hi, w_lo);
 
           barrier (CLK_LOCAL_MEM_FENCE);
         }
 
+      hi   = carry;
+      lo   = carry_lo;
+      w_hi = carry_w;
+      w_lo = carry_wlo;
+
+      dd_add4 (&hi, &lo, scan[2 * lid], scan[2 * lid + 1]);
+      dd_add (&w_hi, &w_lo, scan_w[lid].x, scan_w[lid].y);
+
       if (x < width)
         {
-          prefix[y * stride + x + 1]   = carry   + scan[lid];
-          prefix_w[y * stride + x + 1] = carry_w + scan_w[lid];
+          prefix[2 * (y * stride + x + 1)]     = hi;
+          prefix[2 * (y * stride + x + 1) + 1] = lo;
+          prefix_w[y * stride + x + 1]         = (float2) (w_hi, w_lo);
         }
 
-      carry   += scan[SCAN_SIZE - 1];
-      carry_w += scan_w[SCAN_SIZE - 1];
+      dd_add4 (&carry, &carry_lo,
+               scan[2 * (scan_size - 1)], scan[2 * (scan_size - 1) + 1]);
+      dd_add (&carry_w, &carry_wlo,
+              scan_w[scan_size - 1].x, scan_w[scan_size - 1].y);
 
       barrier (CLK_LOCAL_MEM_FENCE);
     }
 }
 
 __kernel void
-lens_blur_disc (__global const float4 *prefix,
-                __global const float  *prefix_w,
+lens_blur_disc (__global const float4 *prefix,      /* hi, lo pairs */
+                __global const float2 *prefix_w,    /* hi, lo */
                 __global       float4 *dst,
                 __constant     int    *spans,
                 int                    src_width,
@@ -153,13 +221,19 @@ lens_blur_disc (__global const float4 *prefix,
 
   for (r = -iradius; r <= iradius; r++)
     {
-      int s   = spans[abs (r)];
-      int row = (y + iradius + r) * stride;
-      int xl  = row + x + iradius - s;
-      int xr  = row + x + iradius + s + 1;
+      int    s   = spans[abs (r)];
+      int    row = (y + iradius + r) * stride;
+      int    xl  = row + x + iradius - s;
+      int    xr  = row + x + iradius + s + 1;
+      float2 wl  = prefix_w[xl];
+      float2 wr  = prefix_w[xr];
 
-      sum   += prefix[xr]   - prefix[xl];
-      sum_w += prefix_w[xr] - prefix_w[xl];
+      /* the difference of the high parts is close to the span sum, so it
+       * is rounded relative to the span sum, not to the prefix sums
+       */
+      sum   += (prefix[2 * xr]     - prefix[2 * xl]) +
+               (prefix[2 * xr + 1] - prefix[2 * xl + 1]);
+      sum_w += (wr.x - wl.x) + (wr.y - wl.y);
     }
 
   result.xyz = sum.xyz / sum.w;
