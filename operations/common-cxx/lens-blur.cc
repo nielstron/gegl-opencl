@@ -151,6 +151,210 @@ operation_process (GeglOperation        *operation,
     operation, context, output_prop, roi, level);
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+
+#include "opencl/lens-blur.cl.h"
+
+#define CL_SCAN_SIZE 256
+
+static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_lens_blur (cl_mem               in_tex,
+              cl_mem               out_tex,
+              cl_mem               spans_tex,
+              const GeglRectangle *roi,
+              const GeglRectangle *src_rect,
+              const cl_int4       *clip,
+              const cl_float4     *luminance,
+              cl_float             threshold_low,
+              cl_float             threshold_high,
+              cl_float             factor,
+              cl_float             highlight_max,
+              cl_int               iradius)
+{
+  cl_int cl_err      = 0;
+  cl_mem prefix_tex  = NULL;
+  cl_mem prefix_w    = NULL;
+  size_t n           = (size_t) (src_rect->width + 1) * src_rect->height;
+  size_t global_ws[2];
+  size_t local_ws[2];
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "lens_blur_prefix", "lens_blur_disc",
+                                    NULL };
+      cl_data = gegl_cl_compile_and_build (lens_blur_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return TRUE;
+
+  prefix_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                    CL_MEM_READ_WRITE,
+                                    n * sizeof (cl_float4), NULL, &cl_err);
+  CL_CHECK;
+
+  prefix_w = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                  CL_MEM_READ_WRITE,
+                                  n * sizeof (cl_float), NULL, &cl_err);
+  CL_CHECK;
+
+  global_ws[0] = CL_SCAN_SIZE;
+  global_ws[1] = src_rect->height;
+  local_ws[0]  = CL_SCAN_SIZE;
+  local_ws[1]  = 1;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem),    &in_tex,
+                                    sizeof (cl_mem),    &prefix_tex,
+                                    sizeof (cl_mem),    &prefix_w,
+                                    CL_SCAN_SIZE * sizeof (cl_float4), NULL,
+                                    CL_SCAN_SIZE * sizeof (cl_float),  NULL,
+                                    sizeof (cl_int),    &src_rect->width,
+                                    sizeof (cl_int4),   clip,
+                                    sizeof (cl_float4), luminance,
+                                    sizeof (cl_float),  &threshold_low,
+                                    sizeof (cl_float),  &threshold_high,
+                                    sizeof (cl_float),  &factor,
+                                    sizeof (cl_float),  &highlight_max,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 2,
+                                        NULL, global_ws, local_ws,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  global_ws[0] = roi->width;
+  global_ws[1] = roi->height;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[1],
+                                    sizeof (cl_mem), &prefix_tex,
+                                    sizeof (cl_mem), &prefix_w,
+                                    sizeof (cl_mem), &out_tex,
+                                    sizeof (cl_mem), &spans_tex,
+                                    sizeof (cl_int), &src_rect->width,
+                                    sizeof (cl_int), &iradius,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[1], 2,
+                                        NULL, global_ws, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  gegl_clReleaseMemObject (prefix_w);
+  gegl_clReleaseMemObject (prefix_tex);
+
+  return FALSE;
+
+error:
+  if (prefix_w)
+    gegl_clReleaseMemObject (prefix_w);
+  if (prefix_tex)
+    gegl_clReleaseMemObject (prefix_tex);
+
+  return TRUE;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi)
+{
+  GeglProperties      *o       = GEGL_PROPERTIES (operation);
+  const Babl          *format  = gegl_operation_get_format (operation, "input");
+  const GeglRectangle *bbox    = gegl_operation_source_get_bounding_box (operation,
+                                                                         "input");
+  gfloat               radius  = o->radius;
+  gint                 iradius = floorf (radius + 0.5f);
+  gfloat               highlight_factor;
+  gdouble              lum[3];
+  cl_float4            luminance;
+  cl_int              *spans;
+  cl_mem               spans_tex;
+  cl_int               cl_err  = 0;
+  gint                 read;
+  gint                 err     = 0;
+  gint                 r;
+  GeglBufferClIterator *i;
+
+  highlight_factor = 10.0 * o->highlight_factor * G_LN2;
+
+  babl_space_get_rgb_luminance (babl_format_get_space (format),
+                                &lum[0], &lum[1], &lum[2]);
+  luminance.s[0] = lum[0];
+  luminance.s[1] = lum[1];
+  luminance.s[2] = lum[2];
+  luminance.s[3] = 0.0f;
+
+  /* the half widths of the disc rows, computed like in process () */
+  spans = g_new (cl_int, iradius + 1);
+
+  for (r = 0; r <= iradius; r++)
+    spans[r] = sqrtf ((radius + 0.5f) * (radius + 0.5f) - r * r);
+
+  spans_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                   CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   (iradius + 1) * sizeof (cl_int),
+                                   spans, &cl_err);
+  g_free (spans);
+
+  if (cl_err != CL_SUCCESS)
+    return FALSE;
+
+  i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, roi, format,
+                                        GEGL_CL_BUFFER_READ,
+                                        iradius, iradius, iradius, iradius,
+                                        GEGL_ABYSS_NONE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && ! err)
+    {
+      const GeglRectangle *src_rect = &i->roi[read];
+      cl_int4              clip;
+
+      if (o->clip && bbox)
+        {
+          clip.s[0] = bbox->x                - src_rect->x;
+          clip.s[1] = bbox->y                - src_rect->y;
+          clip.s[2] = bbox->x + bbox->width  - src_rect->x;
+          clip.s[3] = bbox->y + bbox->height - src_rect->y;
+        }
+      else
+        {
+          clip.s[0] = 0;
+          clip.s[1] = 0;
+          clip.s[2] = src_rect->width;
+          clip.s[3] = src_rect->height;
+        }
+
+      err = cl_lens_blur (i->tex[read], i->tex[0], spans_tex,
+                          &i->roi[0], src_rect, &clip, &luminance,
+                          o->highlight_threshold_low,
+                          o->highlight_threshold_high,
+                          highlight_factor,
+                          expf (highlight_factor),
+                          iradius);
+
+      if (err)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          break;
+        }
+    }
+
+  gegl_clReleaseMemObject (spans_tex);
+
+  return ! err;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -177,6 +381,11 @@ process (GeglOperation       *operation,
   gint            iradius     = floorf (radius + 0.5f);
   gint            size        = 2 * iradius + 1;
   gint            y;
+
+  /* the OpenCL implementation does not support masks */
+  if (! aux && gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, roi))
+      return TRUE;
 
   highlight_threshold_low  = o->highlight_threshold_low;
   highlight_threshold_high = o->highlight_threshold_high;
@@ -500,6 +709,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->get_required_for_output   = get_required_for_output;
   operation_class->get_invalidated_by_change = get_required_for_output;
   operation_class->process                   = operation_process;
+  operation_class->opencl_support            = TRUE;
 
   composer_class->process                    = process;
 

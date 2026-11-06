@@ -1,0 +1,14 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<gegl>
+  <node operation='gegl:lens-blur'>
+    <params>
+      <param name='radius'>12</param>
+      <param name='highlight-factor'>0.3</param>
+    </params>
+  </node>
+  <node operation='gegl:load'>
+    <params>
+      <param name='path'>../compositions/data/car-stack.png</param>
+    </params>
+  </node>
+</gegl>
