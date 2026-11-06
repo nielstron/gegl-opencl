@@ -32,7 +32,7 @@
  * abyss policy, everything else is read from the uploaded source
  * rectangle 'srect' (x, y, width, height).
  */
-inline float4
+static inline float4
 fetch (__global const float4 *src,
        int4                   srect,
        int4                   abyss,
@@ -74,7 +74,7 @@ fetch (__global const float4 *src,
 #define NOHALO_MAX(x,y)  select (y, x, (x) >= (y))
 #define NOHALO_ABS(x)    fabs (x)
 #define NOHALO_SIGN(x)   select ((float4) -1.0f, (float4) 1.0f, (x) >= 0.0f)
-inline void
+static inline void
 nohalo_subdivision (const float4 uno_two,
                     const float4 uno_thr,
                     const float4 uno_fou,
@@ -324,7 +324,7 @@ nohalo_subdivision (const float4 uno_two,
   *qua_thr_1 = newval_qua_thr;
   *qua_fou_1 =        qua_fou;
 }
-inline float4
+static inline float4
 lbb (const float  c00,
      const float  c10,
      const float  c01,
@@ -538,9 +538,7 @@ lbb (const float  c00,
   return newval;
 }
 
-#define NOHALO_OFFSET_0 13
-
-inline float
+static inline float
 nohalo_teepee (const float c_major_x,
                const float c_major_y,
                const float c_minor_x,
@@ -556,27 +554,26 @@ nohalo_teepee (const float c_major_x,
 }
 
 /* Port of gegl_sampler_nohalo_get (gegl/buffer/gegl-sampler-nohalo.c),
- * computing all four channels at once.  The 2x2 matrix (a b; c d) is
- * the inverse Jacobian as computed by gegl_sampler_compute_scale.
+ * computing all four channels at once.  The host has done the parts
+ * that depend on the sampling position and the Jacobian only (see
+ * wp_pixel_geometry () in whirl-pinch.c): (ix_0, iy_0) is the anchor
+ * pixel and (x_0, y_0) the position relative to it; if bounds is not
+ * 0, it holds the EWA box (each offset + 64 in one byte) and theta and
+ * c_major/c_minor are the EWA blend factor and axes.
  */
-inline float4
+static inline float4
 nohalo_get (__global const float4 *src,
             int4                   srect,
             int4                   abyss,
             int                    policy,
-            float                  absolute_x,
-            float                  absolute_y,
-            float                  a,
-            float                  b,
-            float                  c,
-            float                  d)
+            const int              ix_0,
+            const int              iy_0,
+            const float            x_0,
+            const float            y_0,
+            const int              bounds,
+            const float            theta,
+            const float4           c_axes)
 {
-  const int ix_0 = (int) floor (absolute_x);
-  const int iy_0 = (int) floor (absolute_y);
-
-  const float x_0 = (absolute_x - 0.5f) - ix_0;
-  const float y_0 = (absolute_y - 0.5f) - iy_0;
-
   const int sx = x_0 >= 0.0f ? 1 : -1;
   const int sy = y_0 >= 0.0f ? 1 : -1;
 
@@ -689,186 +686,71 @@ nohalo_get (__global const float4 *src,
                   qua_one, qua_two, qua_thr, qua_fou);
   }
 
-  {
-    /* EWA downsampling, only when the transformation downsamples */
-    const float aa  = a * a;
-    const float bb  = b * b;
-    const float cc  = c * c;
-    const float dd  = d * d;
-    const float n11 = aa + bb;
-    const float n12 = a * c + b * d;
-    const float n21 = n12;
-    const float n22 = cc + dd;
-    const float det = a * d - b * c;
-    const float twice_det = det + det;
-    const float frobenius_squared = n11 + n22;
-    const float discriminant =
-      (frobenius_squared + twice_det) * (frobenius_squared - twice_det);
-    const float sqrt_discriminant =
-      discriminant > 0.0f ? sqrt (discriminant) : 0.0f;
-    const float twice_s1s1 = frobenius_squared + sqrt_discriminant;
+  if (bounds != 0)
+    {
+      /* EWA downsampling, blended in where the transformation downsamples */
+      const int out_left_0 = ( bounds        & 0xff) - 64;
+      const int out_rite_0 = ((bounds >>  8) & 0xff) - 64;
+      const int out_top_0  = ((bounds >> 16) & 0xff) - 64;
+      const int out_bot_0  = ((bounds >> 24) & 0xff) - 64;
 
-    if (twice_s1s1 > 2.0f)
-      {
-        const float s1s1 = 0.5f * twice_s1s1;
-        const float s2s2 = 0.5f * (frobenius_squared - sqrt_discriminant);
+      float  total_weight = 0.0f;
+      float4 ewa_newval   = (float4) (0.0f);
+      int    i, j;
 
-        const float s1s1minusn11 = s1s1 - n11;
-        const float s1s1minusn22 = s1s1 - n22;
-        const float s1s1minusn11_squared = s1s1minusn11 * s1s1minusn11;
-        const float s1s1minusn22_squared = s1s1minusn22 * s1s1minusn22;
-        const float temp_u11 =
-          s1s1minusn11_squared >= s1s1minusn22_squared ? n12 : s1s1minusn22;
-        const float temp_u21 =
-          s1s1minusn11_squared >= s1s1minusn22_squared ? s1s1minusn11 : n21;
-        const float norm = sqrt (temp_u11 * temp_u11 + temp_u21 * temp_u21);
-        const float u11 = norm > 0.0f ? temp_u11 / norm : 1.0f;
-        const float u21 = norm > 0.0f ? temp_u21 / norm : 0.0f;
-        const float major_mag = s1s1 <= 1.0f ? 1.0f : sqrt (s1s1);
-        const float minor_mag = s2s2 <= 1.0f ? 1.0f : sqrt (s2s2);
-        const float major_unit_x =  u11;
-        const float major_unit_y =  u21;
-        const float minor_unit_x = -u21;
-        const float minor_unit_y =  u11;
-
-        const float c_major_x = major_unit_x / major_mag;
-        const float c_major_y = major_unit_y / major_mag;
-        const float c_minor_x = minor_unit_x / minor_mag;
-        const float c_minor_y = minor_unit_y / minor_mag;
-
-        const float major_x = major_mag * major_unit_x;
-        const float major_y = major_mag * major_unit_y;
-        const float minor_x = minor_mag * minor_unit_x;
-        const float minor_y = minor_mag * minor_unit_y;
-
-        const float ellipse_a = major_y * major_y + minor_y * minor_y;
-        const float folded_ellipse_b = major_x * major_y + minor_x * minor_y;
-        const float ellipse_c = major_x * major_x + minor_x * minor_x;
-        const float ellipse_f = major_mag * minor_mag;
-
-        const float bounding_box_factor =
-          ellipse_f * ellipse_f /
-          (ellipse_c * ellipse_a - folded_ellipse_b * folded_ellipse_b);
-        const float bounding_box_half_width =
-          sqrt (ellipse_c * bounding_box_factor);
-        const float bounding_box_half_height =
-          sqrt (ellipse_a * bounding_box_factor);
-
-        const float theta = 1.0f / ellipse_f;
-
-        const int out_left_0 =
-          max ((int) ceil (x_0 - bounding_box_half_width), -NOHALO_OFFSET_0);
-        const int out_rite_0 =
-          min ((int) floor (x_0 + bounding_box_half_width), NOHALO_OFFSET_0);
-        const int out_top_0 =
-          max ((int) ceil (y_0 - bounding_box_half_height), -NOHALO_OFFSET_0);
-        const int out_bot_0 =
-          min ((int) floor (y_0 + bounding_box_half_height), NOHALO_OFFSET_0);
-
-        float  total_weight = 0.0f;
-        float4 ewa_newval   = (float4) (0.0f);
-        int    i, j;
-
-        for (i = out_top_0; i <= out_bot_0; i++)
-          for (j = out_left_0; j <= out_rite_0; j++)
+      /* do-while like the sampler, which visits at least one pixel */
+      i = out_top_0;
+      do
+        {
+          j = out_left_0;
+          do
             {
-              const float weight = nohalo_teepee (c_major_x, c_major_y,
-                                                  c_minor_x, c_minor_y,
+              const float weight = nohalo_teepee (c_axes.x, c_axes.y,
+                                                  c_axes.z, c_axes.w,
                                                   x_0 - (float) j,
                                                   y_0 - (float) i);
 
               total_weight += weight;
               ewa_newval   += weight * FETCH (ix_0 + j, iy_0 + i);
             }
-
-        {
-          const float beta = (1.0f - theta) / total_weight;
-
-          newval = theta * newval + beta * ewa_newval;
+          while (++j <= out_rite_0);
         }
+      while (++i <= out_bot_0);
+
+      {
+        const float beta = (1.0f - theta) / total_weight;
+
+        newval = theta * newval + beta * ewa_newval;
       }
-  }
+    }
 
   return newval;
 }
-
-/* Port of calc_undistorted_coords () in whirl-pinch.c */
-inline float2
-whirl_pinch_unmap (float wx,
-                   float wy,
-                   float cen_x,
-                   float cen_y,
-                   float scale_x,
-                   float scale_y,
-                   float whirl,
-                   float pinch,
-                   float wpradius)
-{
-  const float radius  = max (cen_x, cen_y);
-  const float radius2 = radius * radius * wpradius;
-
-  float dx = (wx - cen_x) * scale_x;
-  float dy = (wy - cen_y) * scale_y;
-  float d  = dx * dx + dy * dy;
-
-  if (d < radius2 && d > 0.0f)
-    {
-      const float dist = sqrt (d / wpradius) / radius;
-      float factor, ang, sina, cosa;
-
-      factor = pow (sin (M_PI_2_F * dist), -pinch);
-
-      dx *= factor;
-      dy *= factor;
-
-      factor = 1.0f - dist;
-
-      ang = whirl * factor * factor;
-
-      sina = sin (ang);
-      cosa = cos (ang);
-
-      return (float2) ((cosa * dx - sina * dy) / scale_x + cen_x,
-                       (sina * dx + cosa * dy) / scale_y + cen_y);
-    }
-
-  return (float2) (wx, wy);
-}
-
-#define UNMAP(u, v) whirl_pinch_unmap ((u), (v), cen_x, cen_y,     \
-                                       scale_x, scale_y,           \
-                                       whirl, pinch, wpradius)
 
 __kernel void
 whirl_pinch (__global const float4 *src,
              int4                   srect,
              int4                   abyss,
              int                    policy,
+             __global const int    *geo,
              __global       float4 *dst,
-             int                    roi_x,
-             int                    roi_y,
-             float                  cen_x,
-             float                  cen_y,
-             float                  scale_x,
-             float                  scale_y,
-             float                  whirl,
-             float                  pinch,
-             float                  wpradius)
+             int                    dst_offset)
 {
-  const int   gidx = get_global_id (0);
-  const int   gidy = get_global_id (1);
-  const float x    = roi_x + gidx;
-  const float y    = roi_y + gidy;
+  const int idx = get_global_id (1) * get_global_size (0) + get_global_id (0);
+  __global const int *g = geo + idx * 10;
+  const int4 p      = vload4 (0, g);
+  const int  bounds = g[4];
+  float      theta  = 0.0f;
+  float4     c_axes = (float4) (0.0f);
 
-  /* gegl_sampler_compute_scale () */
-  const float2 a  = UNMAP (x + 0.5f, y);
-  const float2 b  = UNMAP (x - 0.5f, y);
-  const float2 c  = UNMAP (x, y + 0.5f);
-  const float2 d  = UNMAP (x, y - 0.5f);
-  const float2 p  = UNMAP (x, y);
+  if (bounds != 0)
+    {
+      theta  = as_float (g[5]);
+      c_axes = as_float4 (vload4 (0, g + 6));
+    }
 
-  dst[gidy * get_global_size (0) + gidx] =
-    nohalo_get (src, srect, abyss, policy, p.x, p.y,
-                a.x - b.x, c.x - d.x,
-                a.y - b.y, c.y - d.y);
+  dst[dst_offset + idx] =
+    nohalo_get (src, srect, abyss, policy,
+                p.x, p.y, as_float (p.z), as_float (p.w),
+                bounds, theta, c_axes);
 }
