@@ -26,6 +26,7 @@ opencl_tests = [
   'noise-cie-lch',
   'noise-pick',
   'noise-reduction',
+  'noise-rgb',
   'oilify',
   'opacity',
   'pixelize',
