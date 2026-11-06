@@ -429,6 +429,10 @@ process (GeglOperation       *operation,
           /* This is not the "real" length, a bit shorter */
           gdouble arc_length = radius * angle * SQRT_2;
 
+          /* far above the rounding noise of the sample positions */
+          gdouble snap = (fabs (x) + fabs (y) + fabs (xr) + fabs (yr)) *
+                         0x1.0p-36;
+
           /* ensure quality with small angles */
           gint n = MAX (ceil (arc_length), 3);
 
@@ -449,8 +453,25 @@ process (GeglOperation       *operation,
               gdouble h_val = sin (theta / 2.0);
               gdouble c_m1  = -2.0 * h_val * h_val; /* cos (theta) - 1 */
 
-              gfloat ix = x + (xr * c_m1 - yr * s_val);
-              gfloat iy = y + (xr * s_val + yr * c_m1);
+              gdouble px    = x + (xr * c_m1 - yr * s_val);
+              gdouble py    = y + (xr * s_val + yr * c_m1);
+              gfloat  ix, iy;
+
+              /* A sample exactly on the left or top edge of an input at
+               * 0 comes out as 0 or a tiny positive or negative value,
+               * depending on the rounding of sin () and cos () and of
+               * the expressions above (e.g. whether the compiler fuses
+               * them into fma), and float keeps it.  Snap it to 0, the
+               * exact result.  Elsewhere the rounding to float hides
+               * such noise.
+               */
+              if (fabs (px) < snap)
+                px = 0.0;
+              if (fabs (py) < snap)
+                py = 0.0;
+
+              ix = px;
+              iy = py;
 
               if (ix >= whole_region->x && ix < whole_region->x + whole_region->width &&
                   iy >= whole_region->y && iy < whole_region->y + whole_region->height)
