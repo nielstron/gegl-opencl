@@ -33,6 +33,7 @@ opencl_tests = [
   'oilify',
   'opacity',
   'pixelize',
+  'polar-coordinates',
   'red-eye-removal',
   'snn-mean',
   'svg-src-over',
