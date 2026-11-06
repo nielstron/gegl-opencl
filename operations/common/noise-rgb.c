@@ -195,6 +195,117 @@ process (GeglOperation       *operation,
   return TRUE;
 }
 
+#include "opencl/gegl-cl.h"
+#include "opencl/noise-rgb.cl.h"
+
+static GeglClRunData *cl_data   = NULL;
+static cl_mem         log_table = NULL;
+
+/* -4.0f * logf (u) for every u gegl_random_float () can return, so that
+ * the kernel takes the same rejection decisions as noise_gauss ()
+ */
+static cl_mem
+get_log_table (cl_int *cl_err)
+{
+  if (! log_table)
+    {
+      gfloat *table = g_new (gfloat, 65536);
+      gint    k;
+
+      table[0] = 0.0f; /* u == 0 is never used */
+
+      for (k = 1; k < 65536; k++)
+        {
+          gfloat u = k * 0.00001525902189669642175;
+
+          table[k] = -4.0f * logf (u);
+        }
+
+      log_table = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                       CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                       65536 * sizeof (gfloat),
+                                       table, cl_err);
+      g_free (table);
+
+      if (*cl_err != CL_SUCCESS)
+        log_table = NULL;
+    }
+  else
+    {
+      *cl_err = CL_SUCCESS;
+    }
+
+  return log_table;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            cl_mem               in,
+            cl_mem               out,
+            size_t               global_worksize,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  GeglProperties *o           = GEGL_PROPERTIES (operation);
+  cl_int          cl_err      = 0;
+  cl_mem          cl_random_data;
+  cl_mem          cl_log_table;
+  cl_ushort4      rand;
+  cl_float4       amount;
+  cl_int          correlated  = o->correlated;
+  cl_int          independent = o->independent;
+  cl_int          gaussian    = o->gaussian;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "cl_noise_rgb", NULL };
+      cl_data = gegl_cl_compile_and_build (noise_rgb_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return TRUE;
+
+  gegl_cl_random_get_ushort4 (o->rand, &rand);
+
+  cl_random_data = gegl_cl_load_random_data (&cl_err);
+  CL_CHECK;
+
+  cl_log_table = get_log_table (&cl_err);
+  CL_CHECK;
+
+  amount.s[0] = o->red;
+  amount.s[1] = o->green;
+  amount.s[2] = o->blue;
+  amount.s[3] = o->alpha;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem),     &in,
+                                    sizeof (cl_mem),     &out,
+                                    sizeof (cl_mem),     &cl_random_data,
+                                    sizeof (cl_mem),     &cl_log_table,
+                                    sizeof (cl_ushort4), &rand,
+                                    sizeof (cl_int),     &roi->x,
+                                    sizeof (cl_int),     &roi->y,
+                                    sizeof (cl_int),     &roi->width,
+                                    sizeof (cl_float4),  &amount,
+                                    sizeof (cl_int),     &correlated,
+                                    sizeof (cl_int),     &independent,
+                                    sizeof (cl_int),     &gaussian,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 1,
+                                        NULL, &global_worksize, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  return FALSE;
+
+error:
+  return TRUE;
+}
+
 static void
 gegl_op_class_init (GeglOpClass *klass)
 {
@@ -204,8 +315,10 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class    = GEGL_OPERATION_CLASS (klass);
   point_filter_class = GEGL_OPERATION_POINT_FILTER_CLASS (klass);
 
-  operation_class->prepare    = prepare;
-  point_filter_class->process = process;
+  operation_class->prepare        = prepare;
+  operation_class->opencl_support = TRUE;
+  point_filter_class->process     = process;
+  point_filter_class->cl_process  = cl_process;
 
   gegl_operation_class_set_keys (operation_class,
     "name",               "gegl:noise-rgb",
