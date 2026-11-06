@@ -269,10 +269,10 @@ cleanup_cl_buffers (GeglBufferClIterators *i)
         g_assert_true (gegl_buffer_cl_cache_release (i->tex_buf[no]));
 
       if (i->tex_buf[no] && !i->tex_buf_from_cache [no])
-        gegl_clReleaseMemObject (i->tex_buf[no]);
+        gegl_cl_mem_pool_put (i->tex_buf[no]);
 
       if (i->tex_op [no])
-        gegl_clReleaseMemObject (i->tex_op [no]);
+        gegl_cl_mem_pool_put (i->tex_op [no]);
 
       i->tex    [no] = NULL;
       i->tex_buf[no] = NULL;
@@ -368,8 +368,8 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
                                                      0, NULL, NULL, &cl_err);
                       CL_CHECK;
 
-                      /* color conversion using BABL */
-                      gegl_buffer_set (i->buffer[no], &i->roi[no], 0, i->format[no], data, GEGL_AUTO_ROWSTRIDE);
+                      /* tex_buf is already in the buffer's format */
+                      gegl_buffer_set (i->buffer[no], &i->roi[no], 0, NULL, data, GEGL_AUTO_ROWSTRIDE);
 
                       cl_err = gegl_clEnqueueUnmapMemObject (gegl_cl_get_command_queue(), i->tex_buf[no], data,
                                                              0, NULL, NULL);
@@ -421,10 +421,9 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
                         gegl_buffer_cl_cache_flush (i->buffer[no], &i->roi[no]);
 
                         g_assert (i->tex_op[no] == NULL);
-                        i->tex_op[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                                CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
+                        i->tex_op[no] = gegl_cl_mem_pool_get (CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
                                                                 i->size[no] * i->op_cl_format_size [no],
-                                                                NULL, &cl_err);
+                                                                &cl_err);
                         CL_CHECK;
 
                         /* pre-pinned memory */
@@ -458,10 +457,9 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
                             gegl_buffer_cl_cache_flush (i->buffer[no], &i->roi[no]);
 
                             g_assert (i->tex_buf[no] == NULL);
-                            i->tex_buf[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                                     CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
+                            i->tex_buf[no] = gegl_cl_mem_pool_get (CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
                                                                      i->size[no] * i->buf_cl_format_size [no],
-                                                                     NULL, &cl_err);
+                                                                     &cl_err);
                             CL_CHECK;
 
                             /* pre-pinned memory */
@@ -496,10 +494,9 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
                             gegl_buffer_cl_cache_flush (i->buffer[no], &i->roi[no]);
 
                             g_assert (i->tex_buf[no] == NULL);
-                            i->tex_buf[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                                     CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
+                            i->tex_buf[no] = gegl_cl_mem_pool_get (CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
                                                                      i->size[no] * i->buf_cl_format_size [no],
-                                                                     NULL, &cl_err);
+                                                                     &cl_err);
                             CL_CHECK;
 
                             /* pre-pinned memory */
@@ -518,10 +515,9 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
                           }
 
                         g_assert (i->tex_op[no] == NULL);
-                        i->tex_op[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                                CL_MEM_READ_WRITE,
+                        i->tex_op[no] = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
                                                                 i->size[no] * i->op_cl_format_size [no],
-                                                                NULL, &cl_err);
+                                                                &cl_err);
                         CL_CHECK;
 
                         /* color conversion in the GPU (input) */
@@ -546,10 +542,9 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
 
                       {
                       g_assert (i->tex_op[no] == NULL);
-                      i->tex_op[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                              CL_MEM_WRITE_ONLY,
+                      i->tex_op[no] = gegl_cl_mem_pool_get (CL_MEM_WRITE_ONLY,
                                                               i->size[no] * i->op_cl_format_size [no],
-                                                              NULL, &cl_err);
+                                                              &cl_err);
                       CL_CHECK;
 
                       i->tex[no] = i->tex_op[no];
@@ -561,10 +556,9 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
 
                       {
                       g_assert (i->tex_buf[no] == NULL);
-                      i->tex_buf[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                               CL_MEM_READ_WRITE, /* cache */
-                                                               i->size[no] * i->buf_cl_format_size [no],
-                                                               NULL, &cl_err);
+                      i->tex_buf[no] = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE, /* cache */
+                                                             i->size[no] * i->buf_cl_format_size [no],
+                                                             &cl_err);
                       CL_CHECK;
 
                       i->tex[no] = i->tex_buf[no];
@@ -576,17 +570,15 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
 
                       {
                       g_assert (i->tex_buf[no] == NULL);
-                      i->tex_buf[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                               CL_MEM_READ_WRITE, /* cache */
-                                                               i->size[no] * i->buf_cl_format_size [no],
-                                                               NULL, &cl_err);
+                      i->tex_buf[no] = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE, /* cache */
+                                                             i->size[no] * i->buf_cl_format_size [no],
+                                                             &cl_err);
                       CL_CHECK;
 
                       g_assert (i->tex_op[no] == NULL);
-                      i->tex_op[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                              CL_MEM_READ_WRITE,
+                      i->tex_op[no] = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
                                                               i->size[no] * i->op_cl_format_size [no],
-                                                              NULL, &cl_err);
+                                                              &cl_err);
                       CL_CHECK;
 
                       i->tex[no] = i->tex_op[no];
@@ -600,10 +592,9 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
             {
                 {
                   g_assert (i->tex_op[no] == NULL);
-                  i->tex_op[no] = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                                          CL_MEM_READ_WRITE,
+                  i->tex_op[no] = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
                                                           i->size[no] * i->op_cl_format_size [no],
-                                                          NULL, &cl_err);
+                                                          &cl_err);
                   CL_CHECK;
 
                   i->tex[no] = i->tex_op[no];

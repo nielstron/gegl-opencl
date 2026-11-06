@@ -251,9 +251,6 @@ cl_process (GeglOperation       *operation,
 
   while (gegl_buffer_cl_iterator_next (i, &err))
     {
-      if (err)
-        return FALSE;
-
       err = cl_motion_blur_circular (i->tex[read],
                                      i->tex[0],
                                      &i->roi[read],
@@ -264,10 +261,14 @@ cl_process (GeglOperation       *operation,
                                      center_y);
 
       if (err)
-        return FALSE;
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          return FALSE;
+        }
     }
 
-  return TRUE;
+  /* the iterator also stops on errors */
+  return ! err;
 }
 
 static gboolean

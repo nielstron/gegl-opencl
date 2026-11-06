@@ -144,8 +144,6 @@ cl_process (GeglOperation       *operation,
 
   while (gegl_buffer_cl_iterator_next (i, &err))
     {
-      if (err) return FALSE;
-
       err = cl_bilateral_filter(i->tex[read],
                                 i->tex[0],
                                 i->size[0],
@@ -153,10 +151,15 @@ cl_process (GeglOperation       *operation,
                                 ceil(o->blur_radius),
                                 o->edge_preservation);
 
-      if (err) return FALSE;
+      if (err)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          return FALSE;
+        }
     }
 
-  return TRUE;
+  /* the iterator also stops on errors */
+  return ! err;
 }
 
 static gboolean

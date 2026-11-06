@@ -67,6 +67,14 @@ void              gegl_cl_set_default_device_type (cl_device_type default_device
 
 gboolean          gegl_cl_has_extension (const char *extension_name);
 
+cl_mem            gegl_cl_mem_pool_get (cl_mem_flags  flags,
+                                        size_t        size,
+                                        cl_int       *errcode_ret);
+
+void              gegl_cl_mem_pool_put (cl_mem        mem);
+
+void              gegl_cl_mem_pool_clear (void);
+
 typedef struct
 {
   cl_program  program;

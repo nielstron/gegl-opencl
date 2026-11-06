@@ -138,23 +138,6 @@ __kernel void ragabaf_to_rgbau8 (__global const float4 * in,
   out[gid] = convert_uchar4_sat_rte(255.0f * out_v);
 }
 
-/* RaGaBaA float -> RGBA_GAMMA_U8 */
-__kernel void ragabaf_to_rgba_gamma_u8 (__global const float4 * in,
-                                        __global       uchar4 * out)
-{
-  int gid = get_global_id(0);
-  float4 in_v  = in[gid];
-  float4 tmp_v;
-  tmp_v = (in_v.w > BABL_ALPHA_THRESHOLD)? in_v / in_v.w : (float4)(0.0f);
-  tmp_v.w = in_v.w;
-  float4 out_v;
-  out_v = (float4)(linear_to_gamma_2_2(tmp_v.x),
-                   linear_to_gamma_2_2(tmp_v.y),
-                   linear_to_gamma_2_2(tmp_v.z),
-                   tmp_v.w);
-  out[gid] = convert_uchar4_sat_rte(255.0f * out_v);
-}
-
 /* RaGaBaA float -> RGB_GAMMA_U8 */
 __kernel void ragabaf_to_rgb_gamma_u8 (__global const float4 * in,
                                        __global       uchar  * out)
@@ -509,22 +492,6 @@ __kernel void yaf_to_rgbau8 (__global const float2 * in,
   out[gid] = convert_uchar4_sat_rte(255.0f * out_v);
 }
 
-/* YA float -> R'G'B'A u8 */
-__kernel void yaf_to_rgba_gamma_u8 (__global const float2 * in,
-                                    __global       uchar4 * out)
-{
-  int gid = get_global_id(0);
-  float2 in_v  = in[gid];
-  float4 tmp_v = (float4) (in_v.x, in_v.x, in_v.x, in_v.y);
-
-  float4 out_v;
-  out_v = (float4)(linear_to_gamma_2_2(tmp_v.x),
-                   linear_to_gamma_2_2(tmp_v.y),
-                   linear_to_gamma_2_2(tmp_v.z),
-                   tmp_v.w);
-  out[gid] = convert_uchar4_sat_rte(255.0f * out_v);
-}
-
 /* YA float -> R'G'B' u8 */
 __kernel void yaf_to_rgb_gamma_u8 (__global const float2 * in,
                                    __global       uchar  * out)
@@ -541,20 +508,6 @@ __kernel void yaf_to_rgb_gamma_u8 (__global const float2 * in,
 }
 
 /* R'G'B'A u8 */
-
-/* rgba float -> r'g'b'a u8 */
-__kernel void rgbaf_to_rgba_gamma_u8 (__global const float4 * in,
-                                      __global       uchar4 * out)
-{
-  int gid = get_global_id(0);
-  float4 in_v  = in[gid];
-  float4 out_v;
-  out_v = (float4)(linear_to_gamma_2_2(in_v.x),
-                   linear_to_gamma_2_2(in_v.y),
-                   linear_to_gamma_2_2(in_v.z),
-                   in_v.w);
-  out[gid] = convert_uchar4_sat_rte(255.0f * out_v);
-}
 
 /* R'G'B' u8 */
 

@@ -43,6 +43,7 @@
 #include "gegl-tile-backend-file-private.h"
 #include "gegl-tile-backend-swap-private.h"
 #include "gegl-tile-backend-ram-private.h"
+#include "gegl-tile-backend-buffer-private.h"
 #include "gegl-buffer-formats.h"
 #include "gegl-algorithms.h"
 
@@ -445,6 +446,134 @@ gegl_buffer_backend (GeglBuffer *buffer)
     buffer->backend = g_object_ref (tmp);
 
   return tmp;
+}
+
+/* The memory a buffer's tiles can live in, as far as it can be told */
+typedef struct
+{
+  GArray   *ranges;   /* of GeglMemoryRange */
+  gboolean  unknown;  /* tiles may live in memory we cannot see */
+} GeglMemoryRanges;
+
+typedef struct
+{
+  const guint8 *start;
+  const guint8 *end;
+} GeglMemoryRange;
+
+static gboolean
+gegl_buffer_add_tile_range (GeglTile *tile,
+                            gpointer  user_data)
+{
+  GeglMemoryRanges *ranges = user_data;
+
+  if (tile->data && tile->size > 0)
+    {
+      GeglMemoryRange range = {tile->data, tile->data + tile->size};
+
+      g_array_append_val (ranges->ranges, range);
+    }
+
+  return FALSE;
+}
+
+static void
+gegl_buffer_collect_memory_ranges (GeglBuffer       *buffer,
+                                   GeglMemoryRanges *ranges,
+                                   gint              depth)
+{
+  GeglTileStorage *storage = buffer->tile_storage;
+  GeglTileSource  *source;
+  GeglBuffer      *wrapped = NULL;
+
+  /* handlers added by the user can hand out tiles from anywhere */
+  if (depth > 16 || ! storage || storage->n_user_handlers > 0)
+    {
+      ranges->unknown = TRUE;
+      return;
+    }
+
+  /* tiles of any backend are only directly accessible while they are in
+   * the cache, this includes the tile wrapping the data of a linear buffer
+   * created from user data, which is never evicted
+   */
+  g_rec_mutex_lock (&storage->mutex);
+
+  if (storage->hot_tile)
+    gegl_buffer_add_tile_range (storage->hot_tile, ranges);
+
+  if (storage->cache)
+    gegl_tile_handler_cache_find_tile (storage->cache,
+                                       gegl_buffer_add_tile_range, ranges);
+
+  for (source = GEGL_TILE_SOURCE (storage);
+       source && ! GEGL_IS_TILE_BACKEND (source);
+       source = GEGL_TILE_HANDLER (source)->source);
+
+  if (source && GEGL_IS_TILE_BACKEND_BUFFER (source))
+    wrapped = g_object_ref (GEGL_TILE_BACKEND_BUFFER (source)->buffer);
+  else if (! source                               ||
+           ! (GEGL_IS_TILE_BACKEND_RAM (source)  ||
+              GEGL_IS_TILE_BACKEND_SWAP (source) ||
+              GEGL_IS_TILE_BACKEND_FILE (source)))
+    ranges->unknown = TRUE;
+
+  g_rec_mutex_unlock (&storage->mutex);
+
+  if (wrapped)
+    {
+      gegl_buffer_collect_memory_ranges (wrapped, ranges, depth + 1);
+      g_object_unref (wrapped);
+    }
+}
+
+/* Whether the pixel data of @buffer and @other may live in the same memory,
+ * for example because they are views of the same storage, or wrap the same
+ * caller-provided data with gegl_buffer_linear_new_from_data().  When this
+ * cannot be told, it returns TRUE.
+ */
+gboolean
+gegl_buffer_may_share_memory (GeglBuffer *buffer,
+                              GeglBuffer *other)
+{
+  GeglMemoryRanges a = {g_array_new (FALSE, FALSE, sizeof (GeglMemoryRange)),
+                        FALSE};
+  GeglMemoryRanges b = {g_array_new (FALSE, FALSE, sizeof (GeglMemoryRange)),
+                        FALSE};
+  gboolean         result = FALSE;
+  guint            i, j;
+
+  g_return_val_if_fail (GEGL_IS_BUFFER (buffer), TRUE);
+  g_return_val_if_fail (GEGL_IS_BUFFER (other), TRUE);
+
+  if (buffer->tile_storage == other->tile_storage)
+    {
+      result = TRUE;
+    }
+  else
+    {
+      gegl_buffer_collect_memory_ranges (buffer, &a, 0);
+      gegl_buffer_collect_memory_ranges (other, &b, 0);
+
+      result = a.unknown || b.unknown;
+
+      for (i = 0; i < a.ranges->len && ! result; i++)
+        {
+          GeglMemoryRange *ra = &g_array_index (a.ranges, GeglMemoryRange, i);
+
+          for (j = 0; j < b.ranges->len && ! result; j++)
+            {
+              GeglMemoryRange *rb = &g_array_index (b.ranges, GeglMemoryRange, j);
+
+              result = ra->start < rb->end && rb->start < ra->end;
+            }
+        }
+    }
+
+  g_array_free (a.ranges, TRUE);
+  g_array_free (b.ranges, TRUE);
+
+  return result;
 }
 
 static GeglTileStorage *
