@@ -14,22 +14,46 @@
  * License along with GEGL; if not, see <https://www.gnu.org/licenses/>.
  */
 
-/* The kernels work on R'G'B'A float and do the HSV conversion inline,
- * following babl's HSV model (which is defined on R'G'B', using the sRGB
- * TRC).  Like babl, pixels whose value is below 1e-10 (including negative
- * ones) get zero saturation and hue, and a channel within 1e-10 of the
- * maximum selects the hue sector.
+/* The kernels work on linear RGBA float and do the HSV conversion inline,
+ * following babl's HSV model, which is defined on the linear RGB of the
+ * space encoded with the sRGB TRC (regardless of the space's own TRC).
+ * Like babl, the linear segment of the TRC also applies to negative values,
+ * pixels whose value is below 1e-10 (including negative ones) get zero
+ * saturation and hue, and a channel within 1e-10 of the maximum selects
+ * the hue sector.
  */
 
 #define HSV_EPSILON 1e-10f
 
-static float2
-rgb_to_sv (float4 in)
+static float3
+linear_to_srgb (float3 v)
 {
-  float max_v  = fmax (in.x, fmax (in.y, in.z));
-  float min_v  = fmin (in.x, fmin (in.y, in.z));
-  float chroma = max_v - min_v;
-  float s      = (max_v < HSV_EPSILON) ? 0.0f : chroma / max_v;
+  return (float3) (
+    v.x > 0.003130804954f ? 1.055f * pow (v.x, 1.0f / 2.4f) - 0.055f
+                          : 12.92f * v.x,
+    v.y > 0.003130804954f ? 1.055f * pow (v.y, 1.0f / 2.4f) - 0.055f
+                          : 12.92f * v.y,
+    v.z > 0.003130804954f ? 1.055f * pow (v.z, 1.0f / 2.4f) - 0.055f
+                          : 12.92f * v.z);
+}
+
+static float3
+srgb_to_linear (float3 v)
+{
+  return (float3) (
+    v.x > 0.04045f ? pow ((v.x + 0.055f) / 1.055f, 2.4f) : v.x / 12.92f,
+    v.y > 0.04045f ? pow ((v.y + 0.055f) / 1.055f, 2.4f) : v.y / 12.92f,
+    v.z > 0.04045f ? pow ((v.z + 0.055f) / 1.055f, 2.4f) : v.z / 12.92f);
+}
+
+static float2
+rgb_to_sv (float4 lin)
+{
+  float3 in     = linear_to_srgb (lin.xyz);
+  float  max_v  = fmax (in.x, fmax (in.y, in.z));
+  float  min_v  = fmin (in.x, fmin (in.y, in.z));
+  float  chroma = max_v - min_v;
+  float  s      = (max_v < HSV_EPSILON) ? 0.0f : chroma / max_v;
 
   return (float2) (s, max_v);
 }
@@ -80,7 +104,7 @@ stretch_contrast_hsv (__global const float4 *in,
                                      float   vdiff)
 {
   int    gid    = get_global_id (0);
-  float4 in_v   = in[gid];
+  float4 in_v   = (float4) (linear_to_srgb (in[gid].xyz), in[gid].w);
   float  max_v  = fmax (in_v.x, fmax (in_v.y, in_v.z));
   float  min_v  = fmin (in_v.x, fmin (in_v.y, in_v.z));
   float  chroma = max_v - min_v;
@@ -127,8 +151,8 @@ stretch_contrast_hsv (__global const float4 *in,
   else
     out_v = (float4) (chroma, 0.0f, x, 0.0f);
 
-  out_v   += (float4) (m, m, m, 0.0f);
-  out_v.w  = in_v.w;
+  out_v.xyz = srgb_to_linear (out_v.xyz + m);
+  out_v.w   = in_v.w;
 
   out[gid] = out_v;
 }
