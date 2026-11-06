@@ -482,7 +482,128 @@ cl_get_source_rect (const GeglRectangle *needed,
       *src_rect = *GEGL_RECTANGLE (abyss->x, abyss->y, 1, 1);
     }
 
-  return (gdouble) src_rect->width * src_rect->height <= (1 << 26);
+  return TRUE;
+}
+
+/* @value as a pair of floats whose sum is @value with about twice the
+ * precision of a float.
+ */
+static cl_float2
+cl_float_float (gdouble value)
+{
+  cl_float2 ff;
+
+  ff.s[0] = value;
+  ff.s[1] = value - (gdouble) ff.s[0];
+
+  return ff;
+}
+
+#define BOUNDS_SEG 256
+
+/* Computes the part of @boundary that the samples of the pixels in
+ * @result read, with the kernel's own source coordinates.  Pixels whose
+ * source pixel lies outside the chunk's area are read with a linear
+ * sampler that averages them with their top-left neighbours, so those
+ * are included.  Returns FALSE on error.
+ */
+static gboolean
+cl_get_needed (const GeglRectangle *result,
+               const GeglRectangle *boundary,
+               const cl_float2     *coord_args,
+               GeglRectangle       *needed)
+{
+  cl_int   cl_err = 0;
+  cl_mem   bounds_tex = NULL;
+  cl_int4 *bounds = NULL;
+  cl_int4  limit;
+  cl_int   seg    = BOUNDS_SEG;
+  size_t   global_ws[2];
+  size_t   n, k;
+  gint     x0 = G_MAXINT, y0 = G_MAXINT, x1 = G_MININT, y1 = G_MININT;
+
+  /* the samples of source position (x, y) are x - 1 ... x + 2 and
+   * y - 1 ... y + 2, so a position outside 'limit' only samples outside
+   * @boundary */
+  limit.s[0] = boundary->x - 3;
+  limit.s[1] = boundary->y - 3;
+  limit.s[2] = boundary->x + boundary->width + 1;
+  limit.s[3] = boundary->y + boundary->height + 1;
+
+  global_ws[0] = (result->width + BOUNDS_SEG - 1) / BOUNDS_SEG;
+  global_ws[1] = result->height;
+  n            = global_ws[0] * global_ws[1];
+
+  bounds_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                    CL_MEM_WRITE_ONLY,
+                                    n * sizeof (cl_int4), NULL, &cl_err);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[1],
+                                    sizeof (cl_mem),    &bounds_tex,
+                                    sizeof (cl_int),    &result->x,
+                                    sizeof (cl_int),    &result->y,
+                                    sizeof (cl_int),    &result->width,
+                                    sizeof (cl_int),    &seg,
+                                    sizeof (cl_int4),   &limit,
+                                    sizeof (cl_float2), &coord_args[0],
+                                    sizeof (cl_float2), &coord_args[1],
+                                    sizeof (cl_float2), &coord_args[2],
+                                    sizeof (cl_float2), &coord_args[3],
+                                    sizeof (cl_float2), &coord_args[4],
+                                    sizeof (cl_float2), &coord_args[5],
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[1], 2,
+                                        NULL, global_ws, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  bounds = g_new (cl_int4, n);
+
+  cl_err = gegl_clEnqueueReadBuffer (gegl_cl_get_command_queue (),
+                                     bounds_tex, CL_TRUE, 0,
+                                     n * sizeof (cl_int4), bounds,
+                                     0, NULL, NULL);
+  CL_CHECK;
+
+  for (k = 0; k < n; k++)
+    {
+      x0 = MIN (x0, bounds[k].s[0]);
+      y0 = MIN (y0, bounds[k].s[1]);
+      x1 = MAX (x1, bounds[k].s[2]);
+      y1 = MAX (y1, bounds[k].s[3]);
+    }
+
+  g_free (bounds);
+  gegl_clReleaseMemObject (bounds_tex);
+
+  /* the samples inside @boundary */
+  x0 = MAX (x0 - 1, boundary->x);
+  y0 = MAX (y0 - 1, boundary->y);
+  x1 = MIN (x1 + 2, boundary->x + boundary->width  - 1);
+  y1 = MIN (y1 + 2, boundary->y + boundary->height - 1);
+
+  if (x0 > x1 || y0 > y1)
+    {
+      /* every sample is background, nothing is read */
+      *needed = *GEGL_RECTANGLE (boundary->x, boundary->y, 1, 1);
+      return TRUE;
+    }
+
+  /* the linear sampler's top-left neighbours, and a pixel of margin */
+  *needed = *GEGL_RECTANGLE (x0 - 2, y0 - 2, x1 - x0 + 4, y1 - y0 + 4);
+
+  return TRUE;
+
+error:
+  g_free (bounds);
+  if (bounds_tex)
+    gegl_clReleaseMemObject (bounds_tex);
+
+  return FALSE;
 }
 
 static gboolean
@@ -498,7 +619,7 @@ cl_process (GeglOperation       *operation,
   const Babl           *format     = babl_format_with_space ("RaGaBaA float",
                                                              out_format);
   const GeglRectangle  *abyss      = gegl_buffer_get_abyss (input);
-  GeglRectangle         needed     = *boundary;
+  GeglRectangle         needed;
   GeglRectangle         src_rect;
   GeglBufferClIterator *i;
   cl_mem                in_tex     = NULL;
@@ -513,13 +634,9 @@ cl_process (GeglOperation       *operation,
   cl_int                chunks_x   = (result->width  + CHUNK_SIZE - 1) / CHUNK_SIZE;
   cl_int                chunks_y   = (result->height + CHUNK_SIZE - 1) / CHUNK_SIZE;
   cl_int                unpremultiply;
-  cl_float              centre_x   = lens->centre_x;
-  cl_float              centre_y   = lens->centre_y;
-  cl_float              mult_sq    = lens->mult_sq;
-  cl_float              mult_qd    = lens->mult_qd;
-  cl_float              rescale    = lens->rescale;
+  cl_float2             coord_args[6];
   cl_float              brighten   = lens->brighten;
-  cl_float              norm       = lens->norm;
+  cl_ulong              max_alloc  = 0;
   gint                  j, k;
 
   if (out_format == format)
@@ -550,30 +667,43 @@ cl_process (GeglOperation       *operation,
         areas[k * chunks_x + j].s[1] = area.y;
         areas[k * chunks_x + j].s[2] = area.width;
         areas[k * chunks_x + j].s[3] = area.height;
-
-        gegl_rectangle_bounding_box (&needed, &needed, &area);
       }
 
-  /* samples outside an area are averaged with their top-left neighbours */
-  needed.x      -= 1;
-  needed.y      -= 1;
-  needed.width  += 1;
-  needed.height += 1;
-
-  if (! cl_get_source_rect (&needed, abyss, GEGL_ABYSS_CLAMP, &src_rect))
-    {
-      g_free (areas);
-      return FALSE;
-    }
+  coord_args[0] = cl_float_float (lens->centre_x);
+  coord_args[1] = cl_float_float (lens->centre_y);
+  coord_args[2] = cl_float_float (lens->mult_sq);
+  coord_args[3] = cl_float_float (lens->mult_qd);
+  coord_args[4] = cl_float_float (lens->rescale);
+  coord_args[5] = cl_float_float (lens->norm);
 
   if (!cl_data)
     {
-      const char *kernel_name[] = {"lens_distortion", NULL};
+      const char *kernel_name[] = {"lens_distortion",
+                                   "lens_distortion_bounds", NULL};
       cl_data = gegl_cl_compile_and_build (lens_distortion_cl_source,
                                            kernel_name);
     }
 
   if (!cl_data)
+    {
+      g_free (areas);
+      return FALSE;
+    }
+
+  /* upload only the part of the input that is read */
+  if (! cl_get_needed (result, boundary, coord_args, &needed) ||
+      ! cl_get_source_rect (&needed, abyss, GEGL_ABYSS_CLAMP, &src_rect))
+    {
+      g_free (areas);
+      return FALSE;
+    }
+
+  cl_err = gegl_clGetDeviceInfo (gegl_cl_get_device (),
+                                 CL_DEVICE_MAX_MEM_ALLOC_SIZE,
+                                 sizeof (max_alloc), &max_alloc, NULL);
+  if (cl_err != CL_SUCCESS ||
+      (gdouble) src_rect.width * src_rect.height *
+      babl_format_get_bytes_per_pixel (format) > MIN (max_alloc, 1 << 30))
     {
       g_free (areas);
       return FALSE;
@@ -635,13 +765,13 @@ cl_process (GeglOperation       *operation,
                                         sizeof (cl_int),    &chunks_x,
                                         sizeof (cl_int4),   &boundary4,
                                         sizeof (cl_float4), &bg,
-                                        sizeof (cl_float),  &centre_x,
-                                        sizeof (cl_float),  &centre_y,
-                                        sizeof (cl_float),  &mult_sq,
-                                        sizeof (cl_float),  &mult_qd,
-                                        sizeof (cl_float),  &rescale,
+                                        sizeof (cl_float2), &coord_args[0],
+                                        sizeof (cl_float2), &coord_args[1],
+                                        sizeof (cl_float2), &coord_args[2],
+                                        sizeof (cl_float2), &coord_args[3],
+                                        sizeof (cl_float2), &coord_args[4],
+                                        sizeof (cl_float2), &coord_args[5],
                                         sizeof (cl_float),  &brighten,
-                                        sizeof (cl_float),  &norm,
                                         sizeof (cl_int),    &unpremultiply,
                                         NULL);
       CL_CHECK;
