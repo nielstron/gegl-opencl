@@ -176,6 +176,21 @@ static inline GeglRectangle _gegl_sampler_compute_rectangle (
   if (rectangle.height < level->context_rect.height)
     rectangle.height = level->context_rect.height;
 
+  /* the predictive shift above must not move the context out of the
+   * fetched rectangle */
+  if (rectangle.x > x + level->context_rect.x)
+    rectangle.x = x + level->context_rect.x;
+  if (rectangle.y > y + level->context_rect.y)
+    rectangle.y = y + level->context_rect.y;
+  if (rectangle.x + rectangle.width <
+      x + level->context_rect.x + level->context_rect.width)
+    rectangle.x = x + level->context_rect.x + level->context_rect.width -
+                  rectangle.width;
+  if (rectangle.y + rectangle.height <
+      y + level->context_rect.y + level->context_rect.height)
+    rectangle.y = y + level->context_rect.y + level->context_rect.height -
+                  rectangle.height;
+
   return rectangle;
 }
 
