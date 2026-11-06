@@ -75,11 +75,23 @@ buffer_get_min_max (GeglOperation       *operation,
   gegl_operation_progress (operation, 0.5, "");
 }
 
+/* The CIE LCH(ab) format the CPU path works in */
+static const Babl *
+get_lch_format (GeglOperation *operation)
+{
+  const Babl *space     = gegl_operation_get_source_space (operation, "input");
+  const Babl *in_format = gegl_operation_get_source_format (operation, "input");
+
+  if (in_format && babl_format_has_alpha (in_format))
+    return babl_format_with_space ("CIE LCH(ab) alpha float", space);
+
+  return babl_format_with_space ("CIE LCH(ab) float", space);
+}
+
 static void prepare (GeglOperation *operation)
 {
   const Babl *space = gegl_operation_get_source_space (operation, "input");
   const Babl *format;
-  const Babl *in_format = gegl_operation_get_source_format (operation, "input");
 
   /* The OpenCL path converts to and from CIE LCH(ab) itself. For sRGB it
    * also applies the TRC, since R'G'B'A float is cheaper to convert to the
@@ -97,17 +109,7 @@ static void prepare (GeglOperation *operation)
       return;
     }
 
-  if (in_format)
-    {
-       if (babl_format_has_alpha (in_format))
-         format = babl_format_with_space ("CIE LCH(ab) alpha float", space);
-       else
-         format = babl_format_with_space ("CIE LCH(ab) float", space);
-    }
-  else
-    {
-      format = babl_format_with_space ("CIE LCH(ab) float", space);
-    }
+  format = get_lch_format (operation);
 
   gegl_operation_set_format (operation, "input", format);
   gegl_operation_set_format (operation, "output", format);
@@ -383,16 +385,25 @@ process (GeglOperation       *operation,
          gint                 level)
 {
   const Babl *format = gegl_operation_get_format (operation, "output");
-  gboolean has_alpha = babl_format_has_alpha (format);
+  gboolean has_alpha;
   GeglBufferIterator *gi;
   gint                done_pixels = 0;
   gdouble  min;
   gdouble  max;
   gdouble  delta;
 
-  if (gegl_operation_use_opencl (operation) &&
-      cl_process (operation, input, output, result))
-    return TRUE;
+  if (gegl_operation_use_opencl (operation))
+    {
+      if (cl_process (operation, input, output, result))
+        return TRUE;
+
+      /* prepare () selected RGB formats for the OpenCL path, the CPU
+       * path needs to work in CIE LCH(ab)
+       */
+      format = get_lch_format (operation);
+    }
+
+  has_alpha = babl_format_has_alpha (format);
 
   buffer_get_min_max (operation, input, result, &min, &max,
                       babl_format_with_space ("CIE LCH(ab) float",
