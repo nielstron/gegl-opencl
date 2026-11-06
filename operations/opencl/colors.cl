@@ -446,7 +446,7 @@ __kernel void ragabaf_to_yaf (__global const float4 * in,
 {
   int gid = get_global_id(0);
   float4 in_v  = in[gid];
-  float4 tmp_v = in_v / (float4) (in_v.w);
+  float4 tmp_v = (in_v.w > BABL_ALPHA_THRESHOLD)? in_v / in_v.w : (float4)(0.0f);
 
   float luminance = tmp_v.x * RGB_LUMINANCE_RED +
                     tmp_v.y * RGB_LUMINANCE_GREEN +
