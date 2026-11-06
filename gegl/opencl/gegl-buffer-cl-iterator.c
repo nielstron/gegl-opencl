@@ -368,8 +368,8 @@ gegl_buffer_cl_iterator_next (GeglBufferClIterator *iterator, gboolean *err)
                                                      0, NULL, NULL, &cl_err);
                       CL_CHECK;
 
-                      /* color conversion using BABL */
-                      gegl_buffer_set (i->buffer[no], &i->roi[no], 0, i->format[no], data, GEGL_AUTO_ROWSTRIDE);
+                      /* tex_buf is already in the buffer's format */
+                      gegl_buffer_set (i->buffer[no], &i->roi[no], 0, NULL, data, GEGL_AUTO_ROWSTRIDE);
 
                       cl_err = gegl_clEnqueueUnmapMemObject (gegl_cl_get_command_queue(), i->tex_buf[no], data,
                                                              0, NULL, NULL);
