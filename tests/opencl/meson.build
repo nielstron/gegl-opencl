@@ -9,6 +9,7 @@ opencl_tests = [
   'gaussian-blur',
   'invert-linear',
   'levels',
+  'median-blur',
   'mono-mixer',
   'motion-blur',
   'noise-reduction',
