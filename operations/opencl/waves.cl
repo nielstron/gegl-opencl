@@ -35,7 +35,7 @@
  */
 #pragma OPENCL FP_CONTRACT OFF
 
-inline float2
+static inline float2
 two_sum (float a,
          float b)
 {
@@ -46,7 +46,7 @@ two_sum (float a,
 }
 
 /* requires |a| >= |b| or a == 0 */
-inline float2
+static inline float2
 fast_two_sum (float a,
               float b)
 {
@@ -55,7 +55,7 @@ fast_two_sum (float a,
   return (float2) (s, b - (s - a));
 }
 
-inline float2
+static inline float2
 split (float a)
 {
   const float c  = 4097.0f * a;
@@ -64,7 +64,7 @@ split (float a)
   return (float2) (hi, a - hi);
 }
 
-inline float2
+static inline float2
 two_prod (float a,
           float b)
 {
@@ -76,7 +76,7 @@ two_prod (float a,
                       as.y * bs.y);
 }
 
-inline float2
+static inline float2
 df_add (float2 a,
         float2 b)
 {
@@ -90,7 +90,7 @@ df_add (float2 a,
   return fast_two_sum (s.x, s.y);
 }
 
-inline float2
+static inline float2
 df_mul (float2 a,
         float2 b)
 {
@@ -102,7 +102,7 @@ df_mul (float2 a,
 }
 
 /* does not rely on the accuracy of float division */
-inline float2
+static inline float2
 df_div (float2 a,
         float2 b)
 {
@@ -118,7 +118,7 @@ df_div (float2 a,
 }
 
 /* does not rely on the accuracy of float sqrt; a > 0 */
-inline float2
+static inline float2
 df_sqrt (float2 a)
 {
   const float  s = sqrt (a.x);
@@ -128,7 +128,7 @@ df_sqrt (float2 a)
 }
 
 /* floor () of hi + lo */
-inline int
+static inline int
 df_floor (float2 a)
 {
   const float f = floor (a.x);
@@ -141,7 +141,7 @@ df_floor (float2 a)
  * abyss policy, everything else is read from the uploaded source
  * rectangle 'srect' (x, y, width, height).
  */
-inline float4
+static inline float4
 fetch (__global const float4 *src,
        int4                   srect,
        int4                   abyss,
@@ -183,7 +183,7 @@ fetch (__global const float4 *src,
 #define NOHALO_MAX(x,y)  select (y, x, (x) >= (y))
 #define NOHALO_ABS(x)    fabs (x)
 #define NOHALO_SIGN(x)   select ((float4) -1.0f, (float4) 1.0f, (x) >= 0.0f)
-inline void
+static inline void
 nohalo_subdivision (const float4 uno_two,
                     const float4 uno_thr,
                     const float4 uno_fou,
@@ -433,7 +433,7 @@ nohalo_subdivision (const float4 uno_two,
   *qua_thr_1 = newval_qua_thr;
   *qua_fou_1 =        qua_fou;
 }
-inline float4
+static inline float4
 lbb (const float  c00,
      const float  c10,
      const float  c01,
@@ -649,7 +649,7 @@ lbb (const float  c00,
 
 #define NOHALO_OFFSET_0 13
 
-inline float
+static inline float
 nohalo_teepee (const float c_major_x,
                const float c_major_y,
                const float c_minor_x,
@@ -668,7 +668,7 @@ nohalo_teepee (const float c_major_x,
  * computing all four channels at once.  The 2x2 matrix (a b; c d) is
  * the inverse Jacobian as computed by gegl_sampler_compute_scale.
  */
-inline float4
+static inline float4
 nohalo_get (__global const float4 *src,
             int4                   srect,
             int4                   abyss,
@@ -910,7 +910,7 @@ nohalo_get (__global const float4 *src,
 #define SAMPLER_NOHALO  3
 
 /* gegl_sampler_nearest_get () */
-inline float4
+static inline float4
 nearest_get (__global const float4 *src,
              int4                   srect,
              int4                   abyss,
@@ -923,7 +923,7 @@ nearest_get (__global const float4 *src,
 }
 
 /* gegl_sampler_linear_interpolate () */
-inline float4
+static inline float4
 linear_get (__global const float4 *src,
             int4                   srect,
             int4                   abyss,
@@ -951,7 +951,7 @@ linear_get (__global const float4 *src,
 
 /* cubicKernel () of gegl-sampler-cubic.c, with GeglSamplerCubic's
  * b = 0.5 and c = 0.5 * (1 - b) */
-inline float
+static inline float
 cubic_kernel (float x)
 {
   const float b  = 0.5f;
@@ -975,7 +975,7 @@ cubic_kernel (float x)
 }
 
 /* gegl_sampler_cubic_interpolate () */
-inline float4
+static inline float4
 cubic_get (__global const float4 *src,
            int4                   srect,
            int4                   abyss,
@@ -1011,7 +1011,7 @@ cubic_get (__global const float4 *src,
 
 /* gegl_sampler_get () without a scale matrix; nearest returns pixels in
  * the op's format, the others in "RaGaBaA float" */
-inline float4
+static inline float4
 sampler_get (__global const float4 *src,
              int4                   srect,
              int4                   abyss,
@@ -1037,7 +1037,7 @@ sampler_get (__global const float4 *src,
 /* "RaGaBaA float" to "RGBA float", like babl does it */
 #define ALPHA_FLOOR (1.0f / 65536.0f)
 
-inline float4
+static inline float4
 unpremultiply (float4 v)
 {
   const float alpha = v.w;
@@ -1053,7 +1053,7 @@ unpremultiply (float4 v)
  * computed in double on the host */
 #define WAVES_TABLE_SIZE 256
 
-inline float2
+static inline float2
 df_sin2pi (float2                 u,
            __global const float4 *table)
 {
@@ -1071,7 +1071,7 @@ df_sin2pi (float2                 u,
   return two_sum (sc.x, sc.y + (sc.z * sin_t - sc.x * omc_t));
 }
 
-inline void
+static inline void
 waves (__global const float4 *src,
        int4                   srect,
        int4                   abyss,
