@@ -57,19 +57,22 @@ prepare (GeglOperation *operation)
 {
   const Babl *space  = gegl_operation_get_source_space (operation, "input");
   const Babl *format = babl_format_with_space ("R'G'B'A float", space);
+  const Babl *input  = format;
 
-  /* With OpenCL, process 8-bit input as is: the kernel converts to and
-   * from float itself, which saves two conversion passes on the device.
+  /* With OpenCL, read 8-bit input as is: the kernel converts it to float
+   * itself, which saves a conversion pass on the device.  The output stays
+   * float in any case, so that what follows sees the same data with and
+   * without OpenCL.
    */
   if (gegl_operation_use_opencl (operation))
     {
       const Babl *u8 = babl_format_with_space ("R'G'B'A u8", space);
 
       if (gegl_operation_get_source_format (operation, "input") == u8)
-        format = u8;
+        input = u8;
     }
 
-  gegl_operation_set_format (operation, "input", format);
+  gegl_operation_set_format (operation, "input", input);
   gegl_operation_set_format (operation, "output", format);
 }
 
@@ -138,29 +141,25 @@ process (GeglOperation       *op,
          const GeglRectangle *roi,
          gint                 level)
 {
-  const Babl *format = gegl_operation_get_format (op, "output");
+  const Babl *format = gegl_operation_get_format (op, "input");
   glong       j;
 
   if (babl_format_get_type (format, 0) == babl_type ("u8"))
     {
       /* only used when OpenCL processing failed, see prepare () */
       const guint8 *src  = in_buf;
-      guint8       *dest = out_buf;
+      gfloat       *dest = out_buf;
 
       for (j = 0; j < samples; j++)
         {
-          gfloat rgb[3];
+          gfloat rgba[4];
           gint   c;
 
-          for (c = 0; c < 3; c++)
-            rgb[c] = src[c] / 255.0f;
+          for (c = 0; c < 4; c++)
+            rgba[c] = src[c] / 255.0f;
 
-          value_invert (rgb, rgb);
-
-          for (c = 0; c < 3; c++)
-            dest[c] = CLAMP (rgb[c], 0.0f, 1.0f) * 255.0f + 0.5f;
-
-          dest[3] = src[3];
+          value_invert (rgba, dest);
+          dest[3] = rgba[3];
 
           src  += 4;
           dest += 4;
@@ -197,7 +196,7 @@ cl_process (GeglOperation       *op,
             const GeglRectangle *roi,
             gint                 level)
 {
-  const Babl *format = gegl_operation_get_format (op, "output");
+  const Babl *format = gegl_operation_get_format (op, "input");
   cl_kernel   kernel;
   cl_int      cl_err = 0;
 

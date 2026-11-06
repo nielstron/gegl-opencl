@@ -29,25 +29,18 @@ __kernel void gegl_value_invert (__global const float4 *in,
   out[gid] = value_invert (in[gid]);
 }
 
-/* R'G'B'A u8 in and out, which avoids two conversion passes and the float
- * buffers in between.  The conversions give the same result as babl: k /
- * 255.0f correctly rounded (refined with an fma, as the division need not
- * be), and the float -> u8 rounding of babl.
+/* R'G'B'A u8 in, R'G'B'A float out, which saves the conversion pass and
+ * the float buffer on the input side.  The conversion gives the same result
+ * as babl: k / 255.0f correctly rounded (refined with an fma, as the
+ * division need not be).
  */
 __kernel void gegl_value_invert_u8 (__global const uchar4 *in,
-                                    __global       uchar4 *out)
+                                    __global       float4 *out)
 {
-  int    gid   = get_global_id (0);
-  uchar4 in_v  = in[gid];
-  float4 k     = convert_float4 (in_v);
-  float4 v     = k * (1.0f / 255.0f);
-  float4 out_v;
-  uchar4 res;
+  int    gid = get_global_id (0);
+  float4 k   = convert_float4 (in[gid]);
+  float4 v   = k * (1.0f / 255.0f);
 
-  v     = fma (fma (-v, 255.0f, k), (float4) (1.0f / 255.0f), v);
-  out_v = value_invert (v);
-  res   = convert_uchar4_sat (clamp (out_v, 0.0f, 1.0f) * 255.0f + 0.5f);
-
-  res.w    = in_v.w;
-  out[gid] = res;
+  v        = fma (fma (-v, 255.0f, k), (float4) (1.0f / 255.0f), v);
+  out[gid] = value_invert (v);
 }
