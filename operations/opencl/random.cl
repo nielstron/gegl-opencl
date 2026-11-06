@@ -20,6 +20,13 @@
 
 typedef ushort4 GeglRandom;
 
+unsigned int _gegl_cl_random_mod32 (unsigned int x,
+                                    unsigned int p,
+                                    float        inv_p);
+
+unsigned int _gegl_cl_random_mod (unsigned long idx,
+                                  unsigned int  p);
+
 unsigned int _gegl_cl_random_int (__global const int *cl_random_data,
                                   const GeglRandom  rand,
                                   int x,
@@ -59,6 +66,45 @@ float gegl_cl_random_float_range (__global const int  *cl_random_data,
                                   float min,
                                   float max);
 
+/* x % p for p < 2^16, using a float estimate of the quotient, which is
+ * off by at most one
+ */
+unsigned int
+_gegl_cl_random_mod32 (unsigned int x,
+                       unsigned int p,
+                       float        inv_p)
+{
+  unsigned int q = (unsigned int) ((float) x * inv_p);
+  unsigned int r = x - q * p;
+
+  if ((int) r < 0)
+    r += p;
+  else if (r >= p)
+    r -= p;
+
+  return r;
+}
+
+/* idx % p for p < 2^16, without 64-bit divisions, which are very slow
+ * on GPUs
+ */
+unsigned int
+_gegl_cl_random_mod (unsigned long idx,
+                     unsigned int  p)
+{
+  float        inv_p = 1.0f / (float) p;
+  unsigned int hi    = (unsigned int) (idx >> 32);
+  unsigned int lo    = (unsigned int) idx;
+  unsigned int r32   = _gegl_cl_random_mod32 (0xffffffffu, p, inv_p) + 1;  /* 2^32 % p */
+
+  if (r32 == p)
+    r32 = 0;
+
+  return _gegl_cl_random_mod32 (_gegl_cl_random_mod32 (hi, p, inv_p) * r32 +
+                                _gegl_cl_random_mod32 (lo, p, inv_p),
+                                p, inv_p);
+}
+
 unsigned int
 _gegl_cl_random_int (__global const int  *cl_random_data,
                      const GeglRandom    rand,
@@ -75,9 +121,9 @@ _gegl_cl_random_int (__global const int  *cl_random_data,
                       y * YPRIME * XPRIME +
                       n * NPRIME * YPRIME * XPRIME;
 
-  int r0 = cl_random_data[idx % rand.x],
-      r1 = cl_random_data[rand.x + (idx % rand.y)],
-      r2 = cl_random_data[rand.x + rand.y + (idx % rand.z)];
+  int r0 = cl_random_data[_gegl_cl_random_mod (idx, rand.x)],
+      r1 = cl_random_data[rand.x + _gegl_cl_random_mod (idx, rand.y)],
+      r2 = cl_random_data[rand.x + rand.y + _gegl_cl_random_mod (idx, rand.z)];
   return r0 ^ r1 ^ r2;
 }
 

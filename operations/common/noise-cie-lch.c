@@ -95,23 +95,48 @@ randomize_value (gfloat      now,
   return new_val;
 }
 
+static gboolean lch_kernel_matches_babl (const Babl *space,
+                                         gboolean   *contract);
+
 static void
 prepare (GeglOperation *operation)
 {
-  const Babl *space = gegl_operation_get_source_space (operation, "input");
-  gegl_operation_set_format (operation, "input" ,
-                             babl_format_with_space ("CIE LCH(ab) alpha float", space));
-  gegl_operation_set_format (operation, "output",
-                             babl_format_with_space ("CIE LCH(ab) alpha float", space));
+  const Babl *space  = gegl_operation_get_source_space (operation, "input");
+  const Babl *source = gegl_operation_get_source_format (operation, "input");
+  const Babl *lch    = babl_format_with_space ("CIE LCH(ab) alpha float",
+                                               space);
+  const Babl *rgbaf  = babl_format_with_space ("RGBA float", space);
+
+  /* There is no OpenCL color conversion for LCH, so for the most common
+   * input formats the OpenCL kernel converts from and to RGB itself, with
+   * the same math as babl.  8-bit input is passed through untouched, so
+   * that the kernel can linearize it with the exact values babl uses.
+   * For float input, gray pixels can have any value, so this is only done
+   * if the kernel's conversion reproduces babl's for this babl build.
+   */
+  if (gegl_operation_use_opencl (operation) &&
+      ((source == rgbaf &&
+        lch_kernel_matches_babl (babl_format_get_space (rgbaf), NULL)) ||
+       source == babl_format_with_space ("R'G'B'A u8", space) ||
+       source == babl_format_with_space ("R'G'B' u8", space)))
+    {
+      gegl_operation_set_format (operation, "input",  source);
+      gegl_operation_set_format (operation, "output", rgbaf);
+    }
+  else
+    {
+      gegl_operation_set_format (operation, "input",  lch);
+      gegl_operation_set_format (operation, "output", lch);
+    }
 }
 
 static gboolean
-process (GeglOperation       *operation,
-         void                *in_buf,
-         void                *out_buf,
-         glong                n_pixels,
-         const GeglRectangle *roi,
-         gint                 level)
+process_lch (GeglOperation       *operation,
+             void                *in_buf,
+             void                *out_buf,
+             glong                n_pixels,
+             const GeglRectangle *roi,
+             gint                 level)
 {
   GeglProperties *o = GEGL_PROPERTIES (operation);
   gfloat         *GEGL_ALIGNED in_pixel;
@@ -177,6 +202,441 @@ process (GeglOperation       *operation,
   return TRUE;
 }
 
+/* also the CPU fallback when the OpenCL formats were chosen in prepare () */
+static gboolean
+process (GeglOperation       *operation,
+         void                *in_buf,
+         void                *out_buf,
+         glong                n_pixels,
+         const GeglRectangle *roi,
+         gint                 level)
+{
+  const Babl *in_format  = gegl_operation_get_format (operation, "input");
+  const Babl *out_format = gegl_operation_get_format (operation, "output");
+  const Babl *lch;
+  gfloat     *buf;
+
+  lch = babl_format_with_space ("CIE LCH(ab) alpha float", out_format);
+
+  if (in_format == lch && out_format == lch)
+    return process_lch (operation, in_buf, out_buf, n_pixels, roi, level);
+
+  buf = gegl_malloc (n_pixels * 4 * sizeof (gfloat));
+
+  babl_process (babl_fish (in_format, lch), in_buf, buf, n_pixels);
+  process_lch (operation, buf, buf, n_pixels, roi, level);
+  babl_process (babl_fish (lch, out_format), buf, out_buf, n_pixels);
+
+  gegl_free (buf);
+
+  return TRUE;
+}
+
+#include "opencl/gegl-cl.h"
+#include "opencl/noise-cie-lch.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+static GeglClRunData *
+get_cl_data (void)
+{
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "cl_noise_cie_lch_lch",
+                                    "cl_noise_cie_lch",
+                                    "cl_noise_cie_lch_u8",
+                                    "cl_noise_cie_lch_probe",
+                                    NULL };
+      cl_data = gegl_cl_compile_and_build (noise_cie_lch_cl_source,
+                                           kernel_name);
+    }
+
+  return cl_data;
+}
+
+/* The matrices babl's "RGBA float" <-> "CIE Lab alpha float" conversions
+ * use for the space of format.  The RGB to XYZ matrix is read back from
+ * babl by converting the three primaries.
+ */
+static void
+get_lab_matrices (const Babl *format,
+                  cl_float   *rgb_to_lab,
+                  cl_float   *lab_to_rgb)
+{
+  const gfloat white[3] = { 0.964202880f, 1.000000000f, 0.824905400f };
+  const gfloat rgba[12] = { 1.0f, 0.0f, 0.0f, 1.0f,
+                            0.0f, 1.0f, 0.0f, 1.0f,
+                            0.0f, 0.0f, 1.0f, 1.0f };
+  gfloat       xyza[12];
+  gdouble      m[9];
+  gdouble      inv[9];
+  gdouble      det;
+  gint         i;
+
+  babl_process (babl_fish (format,
+                           babl_format_with_space ("CIE XYZ alpha float",
+                                                   format)),
+                rgba, xyza, 3);
+
+  /* column c of the matrix is the XYZ of primary c */
+  for (i = 0; i < 9; i++)
+    m[i] = xyza[(i % 3) * 4 + i / 3];
+
+  det = m[0] * (m[4] * m[8] - m[7] * m[5]) -
+        m[1] * (m[3] * m[8] - m[5] * m[6]) +
+        m[2] * (m[3] * m[7] - m[4] * m[6]);
+
+  inv[0] = (m[4] * m[8] - m[7] * m[5]) / det;
+  inv[1] = (m[2] * m[7] - m[1] * m[8]) / det;
+  inv[2] = (m[1] * m[5] - m[2] * m[4]) / det;
+  inv[3] = (m[5] * m[6] - m[3] * m[8]) / det;
+  inv[4] = (m[0] * m[8] - m[2] * m[6]) / det;
+  inv[5] = (m[3] * m[2] - m[0] * m[5]) / det;
+  inv[6] = (m[3] * m[7] - m[6] * m[4]) / det;
+  inv[7] = (m[6] * m[1] - m[0] * m[7]) / det;
+  inv[8] = (m[0] * m[4] - m[3] * m[1]) / det;
+
+  for (i = 0; i < 9; i++)
+    {
+      rgb_to_lab[i] = (gfloat) m[i] / white[i / 3];
+      lab_to_rgb[i] = (gfloat) inv[i] * white[i % 3];
+    }
+
+  for (i = 9; i < 16; i++)
+    rgb_to_lab[i] = lab_to_rgb[i] = 0.0f;
+}
+
+#define N_PROBES 4096
+
+/* The probe colors: all 8-bit and many other gray levels, including out of
+ * range ones and slightly off gray ones, whose chroma and hue are rounding
+ * noise, and some arbitrary colors.
+ */
+static void
+make_probes (gfloat *rgba)
+{
+  guint32 r = 1;
+  gint    i;
+
+  for (i = 0; i < N_PROBES; i++)
+    {
+      gfloat *p = rgba + 4 * i;
+      gfloat  v;
+
+      r = r * 1664525u + 1013904223u;
+
+      if (i < 256)
+        v = i / 255.0f;
+      else if (i < 512)
+        v = (i - 256) / 1023.0f;
+      else
+        v = (r >> 8) / (gfloat) (1 << 24) * 1.25f - 0.05f;
+
+      p[0] = p[1] = p[2] = v;
+      p[3] = 1.0f;
+
+      if (i >= 3072 && i < 3584)
+        {
+          p[(i / 4) % 3] = nextafterf (v, (i & 1) ? 2.0f : -2.0f);
+        }
+      else if (i >= 3584)
+        {
+          p[1] = (r & 0xff) / 255.0f;
+          p[2] = ((r >> 24) & 0xff) / 255.0f;
+        }
+    }
+}
+
+static gboolean
+lch_probes_match (const gfloat *gpu,
+                  const gfloat *cpu)
+{
+  gint i;
+
+  for (i = 0; i < N_PROBES; i++)
+    {
+      const gfloat *g = gpu + 4 * i;
+      const gfloat *c = cpu + 4 * i;
+      gfloat        dh;
+
+      if (fabsf (g[0] - c[0]) > 1e-4f ||
+          fabsf (g[1] - c[1]) > 1e-4f ||
+          (g[1] == 0.0f) != (c[1] == 0.0f))
+        return FALSE;
+
+      dh = fabsf (g[2] - c[2]);
+      if (dh > 180.0f)
+        dh = 360.0f - dh;
+
+      if (c[1] > 0.0f && dh > 0.01f)
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+/* Runs the kernel's RGB to LCH conversion on the probes, with or without
+ * contraction, and compares the results to babl's.  Returns -1 on an
+ * OpenCL error.
+ */
+static gint
+lch_probe (const Babl   *space,
+           const gfloat *rgba,
+           const gfloat *lch,
+           gboolean      contract)
+{
+  cl_int     cl_err   = 0;
+  cl_mem     cl_in    = NULL;
+  cl_mem     cl_out   = NULL;
+  size_t     n        = N_PROBES;
+  cl_float16 rgb_to_lab;
+  cl_float16 lab_to_rgb;
+  gfloat    *out      = g_new (gfloat, 4 * N_PROBES);
+  gint       result   = -1;
+  cl_kernel  kernel   = cl_data->kernel[3];
+
+  get_lab_matrices (babl_format_with_space ("RGBA float", space),
+                    rgb_to_lab.s, lab_to_rgb.s);
+  rgb_to_lab.s[9] = contract ? 1.0f : 0.0f;
+
+  cl_in = gegl_clCreateBuffer (gegl_cl_get_context (),
+                               CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                               4 * N_PROBES * sizeof (gfloat), (void *) rgba,
+                               &cl_err);
+  CL_CHECK;
+
+  cl_out = gegl_clCreateBuffer (gegl_cl_get_context (), CL_MEM_WRITE_ONLY,
+                                4 * N_PROBES * sizeof (gfloat), NULL,
+                                &cl_err);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (kernel,
+                                    sizeof (cl_mem),     &cl_in,
+                                    sizeof (cl_mem),     &cl_out,
+                                    sizeof (cl_float16), &rgb_to_lab,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        kernel, 1, NULL, &n, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueReadBuffer (gegl_cl_get_command_queue (), cl_out,
+                                     CL_TRUE, 0,
+                                     4 * N_PROBES * sizeof (gfloat), out,
+                                     0, NULL, NULL);
+  CL_CHECK;
+
+  result = lch_probes_match (out, lch);
+
+error:
+  if (cl_in)
+    gegl_clReleaseMemObject (cl_in);
+  if (cl_out)
+    gegl_clReleaseMemObject (cl_out);
+  g_free (out);
+
+  return result;
+}
+
+/* Whether the kernel's RGB to LCH conversion reproduces babl's for space,
+ * and with which contraction mode; the result is cached per space.
+ */
+static gboolean
+lch_kernel_matches_babl (const Babl *space,
+                         gboolean   *contract)
+{
+  /* 0: no match, 1: match without contraction, 2: match with contraction */
+  static GHashTable *modes = NULL;
+  G_LOCK_DEFINE_STATIC (modes);
+  gpointer           value;
+  gint               mode = 0;
+
+  G_LOCK (modes);
+
+  if (!modes)
+    modes = g_hash_table_new (NULL, NULL);
+
+  if (g_hash_table_lookup_extended (modes, space, NULL, &value))
+    {
+      mode = GPOINTER_TO_INT (value);
+    }
+  else if (get_cl_data ())
+    {
+      const Babl *rgbaf = babl_format_with_space ("RGBA float", space);
+      gfloat     *rgba  = g_new (gfloat, 4 * N_PROBES);
+      gfloat     *lch   = g_new (gfloat, 4 * N_PROBES);
+      gint        r     = -1;
+
+      make_probes (rgba);
+      babl_process (babl_fish (rgbaf,
+                               babl_format_with_space (
+                                 "CIE LCH(ab) alpha float", space)),
+                    rgba, lch, N_PROBES);
+
+      r = lch_probe (space, rgba, lch, TRUE);
+      if (r == 1)
+        mode = 2;
+      else if (r == 0)
+        mode = lch_probe (space, rgba, lch, FALSE) == 1 ? 1 : 0;
+
+      /* do not cache OpenCL errors */
+      if (r >= 0)
+        g_hash_table_insert (modes, (gpointer) space, GINT_TO_POINTER (mode));
+
+      g_free (rgba);
+      g_free (lch);
+    }
+
+  G_UNLOCK (modes);
+
+  if (contract)
+    *contract = mode != 1;
+
+  return mode != 0;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            cl_mem               in,
+            cl_mem               out,
+            size_t               global_worksize,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  GeglProperties *o  = GEGL_PROPERTIES (operation);
+  GeglRectangle  *wr = gegl_operation_source_get_bounding_box (operation,
+                                                               "input");
+  cl_int          cl_err             = 0;
+  cl_mem          cl_random_data;
+  cl_ushort4      rand;
+  cl_int          wr_width           = wr->width;
+  cl_int          holdness           = o->holdness;
+  cl_float        lightness_distance = o->lightness_distance;
+  cl_float        chroma_distance    = o->chroma_distance;
+  cl_float        hue_distance       = o->hue_distance;
+  cl_float16      rgb_to_lab;
+  cl_float16      lab_to_rgb;
+  const Babl     *in_format  = gegl_operation_get_format (operation, "input");
+  const Babl     *out_format = gegl_operation_get_format (operation, "output");
+  cl_kernel       kernel;
+  cl_mem          cl_lut      = NULL;
+  cl_mem          cl_gray_lch = NULL;
+
+  const Babl     *space      = babl_format_get_space (out_format);
+  gboolean        contract   = TRUE;
+
+  if (!get_cl_data ())
+    return TRUE;
+
+  /* for "RGBA float" input this was already checked in prepare (); for
+   * 8-bit input only non-gray pixels are converted by the kernel, whose
+   * chroma is far above the rounding noise, so a mismatch does not matter
+   */
+  if (out_format == babl_format_with_space ("RGBA float", space) &&
+      !lch_kernel_matches_babl (space, &contract) &&
+      in_format == out_format)
+    return TRUE;
+
+  gegl_cl_random_get_ushort4 (o->rand, &rand);
+
+  cl_random_data = gegl_cl_load_random_data (&cl_err);
+  CL_CHECK;
+
+  get_lab_matrices (out_format, rgb_to_lab.s, lab_to_rgb.s);
+  rgb_to_lab.s[9] = contract ? 1.0f : 0.0f;
+
+  if (out_format != babl_format_with_space ("RGBA float", out_format))
+    {
+      kernel = cl_data->kernel[0];
+    }
+  else if (in_format == out_format)
+    {
+      kernel = cl_data->kernel[1];
+    }
+  else
+    {
+      const Babl *lch = babl_format_with_space ("CIE LCH(ab) alpha float",
+                                                out_format);
+      cl_int      bpp = babl_format_get_bytes_per_pixel (in_format);
+      guint8      gray[256 * 4];
+      gfloat      tmp[256 * 4];
+      gfloat      lut[256];
+      gint        i;
+
+      kernel = cl_data->kernel[2];
+
+      for (i = 0; i < 256 * bpp; i++)
+        gray[i] = (i % bpp) < 3 ? i / bpp : 255;
+
+      babl_process (babl_fish (in_format, out_format), gray, tmp, 256);
+
+      for (i = 0; i < 256; i++)
+        lut[i] = tmp[i * 4];
+
+      cl_lut = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                    CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                    sizeof (lut), lut, &cl_err);
+      CL_CHECK;
+
+      babl_process (babl_fish (in_format, lch), gray, tmp, 256);
+
+      cl_gray_lch = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                         CL_MEM_COPY_HOST_PTR |
+                                         CL_MEM_READ_ONLY,
+                                         sizeof (tmp), tmp, &cl_err);
+      CL_CHECK;
+
+      cl_err = gegl_clSetKernelArg (kernel, 14, sizeof (cl_mem), &cl_lut);
+      CL_CHECK;
+      cl_err = gegl_clSetKernelArg (kernel, 15, sizeof (cl_mem),
+                                    &cl_gray_lch);
+      CL_CHECK;
+      cl_err = gegl_clSetKernelArg (kernel, 16, sizeof (cl_int), &bpp);
+      CL_CHECK;
+    }
+
+  cl_err = gegl_cl_set_kernel_args (kernel,
+                                    sizeof (cl_mem),     &in,
+                                    sizeof (cl_mem),     &out,
+                                    sizeof (cl_mem),     &cl_random_data,
+                                    sizeof (cl_ushort4), &rand,
+                                    sizeof (cl_int),     &roi->x,
+                                    sizeof (cl_int),     &roi->y,
+                                    sizeof (cl_int),     &roi->width,
+                                    sizeof (cl_int),     &wr_width,
+                                    sizeof (cl_int),     &holdness,
+                                    sizeof (cl_float),   &lightness_distance,
+                                    sizeof (cl_float),   &chroma_distance,
+                                    sizeof (cl_float),   &hue_distance,
+                                    sizeof (cl_float16), &rgb_to_lab,
+                                    sizeof (cl_float16), &lab_to_rgb,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        kernel, 1,
+                                        NULL, &global_worksize, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  if (cl_lut)
+    gegl_clReleaseMemObject (cl_lut);
+  if (cl_gray_lch)
+    gegl_clReleaseMemObject (cl_gray_lch);
+
+  return FALSE;
+
+error:
+  if (cl_lut)
+    gegl_clReleaseMemObject (cl_lut);
+  if (cl_gray_lch)
+    gegl_clReleaseMemObject (cl_gray_lch);
+
+  return TRUE;
+}
+
 static void
 gegl_op_class_init (GeglOpClass *klass)
 {
@@ -186,8 +646,10 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class    = GEGL_OPERATION_CLASS (klass);
   point_filter_class = GEGL_OPERATION_POINT_FILTER_CLASS (klass);
 
-  operation_class->prepare    = prepare;
-  point_filter_class->process = process;
+  operation_class->prepare        = prepare;
+  operation_class->opencl_support = TRUE;
+  point_filter_class->process     = process;
+  point_filter_class->cl_process  = cl_process;
 
   gegl_operation_class_set_keys (operation_class,
     "name",               "gegl:noise-cie-lch",
