@@ -29,6 +29,9 @@
  */
 #define BABL_ALPHA_THRESHOLD 0.0f
 
+/* babl/babl.h: BABL_ALPHA_FLOOR_F */
+#define BABL_ALPHA_FLOOR_F (1.0f / 65536.0f)
+
 float linear_to_gamma_2_2 (float value);
 float gamma_2_2_to_linear (float value);
 
@@ -446,7 +449,10 @@ __kernel void ragabaf_to_yaf (__global const float4 * in,
 {
   int gid = get_global_id(0);
   float4 in_v  = in[gid];
-  float4 tmp_v = in_v / (float4) (in_v.w);
+  /* like babl, divide by a floored alpha, so that alpha 0 gives no NaN */
+  float  alpha = (in_v.w > BABL_ALPHA_FLOOR_F || in_v.w < -BABL_ALPHA_FLOOR_F) ?
+                 in_v.w : BABL_ALPHA_FLOOR_F;
+  float4 tmp_v = in_v / (float4) (alpha);
 
   float luminance = tmp_v.x * RGB_LUMINANCE_RED +
                     tmp_v.y * RGB_LUMINANCE_GREEN +
