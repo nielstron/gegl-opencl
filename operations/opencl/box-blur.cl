@@ -1,121 +1,71 @@
-__kernel void kernel_blur_hor (__global const float4     *in,
-                               __global       float4     *aux,
-                               int width, int radius)
+/* Separable box blur.
+ *
+ * Both passes use a sliding window: every work-item produces a run of
+ * consecutive output pixels, so the cost per pixel is independent of the
+ * radius.  The input of the horizontal pass has the full radius margin on
+ * all sides; it writes (height + 2 * radius) rows of width pixels into aux,
+ * which the vertical pass then reduces to height rows.
+ */
+
+__kernel void kernel_blur_hor (__global const float4 *in,
+                               __global       float4 *aux,
+                               int width, int rows, int radius, int run)
 {
-  const int in_index = get_global_id(0) * (width + 2 * radius)
-                       + (radius + get_global_id (1));
+  const int x0  = get_global_id (0) * run;
+  const int row = get_global_id (1);
 
-  const int aux_index = get_global_id(0) * width + get_global_id (1);
-  int i;
-  float4 mean;
+  if (row >= rows || x0 >= width)
+    return;
 
-  mean = (float4)(0.0f);
+  {
+    const int   in_width = width + 2 * radius;
+    const float rad1     = 1.0f / (float)(2 * radius + 1);
+    const int   x1       = min (x0 + run, width);
+    __global const float4 *src = in + row * in_width;
+    __global       float4 *dst = aux + row * width;
+    float4 sum = (float4)(0.0f);
+    int    i;
 
-  if (get_global_id(1) < width)
-    {
-      for (i=-radius; i <= radius; i++)
-        {
-          mean += in[in_index + i];
-        }
-      aux[aux_index] = mean / (float)(2 * radius + 1);
-    }
-}
+    for (i = 0; i <= 2 * radius; i++)
+      sum += src[x0 + i];
 
-__kernel void kernel_blur_ver (__global const float4     *aux,
-                               __global       float4     *out,
-                               int width, int radius)
-{
-  const int out_index = get_global_id(0) * width + get_global_id (1);
-  int i;
-  float4 mean;
+    dst[x0] = sum * rad1;
 
-  mean = (float4)(0.0f);
-  int aux_index = get_global_id(0) * width + get_global_id (1);
-
-  if (get_global_id(1) < width)
-    {
-      for (i=-radius; i <= radius; i++)
-        {
-          mean += aux[aux_index];
-          aux_index += width;
-        }
-      out[out_index] = mean / (float)(2 * radius + 1);
-    }
-}
-
-__kernel
-__attribute__((reqd_work_group_size(256,1,1)))
-void kernel_box_blur_fast (__global const float4 *in,
-                           __global       float4 *out,
-                           __local        float4 *column_sum,
-                                    const int     width,
-                                    const int     height,
-                                    const int     radius,
-                                    const int     size)
-{
-  const int local_id0 = get_local_id(0);
-  const int twice_radius = 2 * radius;
-  const int in_width = twice_radius + width;
-  const int in_height = twice_radius + height;
-  const int start = max( -radius, -local_id0 );
-  const int stop = min( radius, (int)get_local_size(0) - local_id0 );
-  const float4 area = (float4) ( ((stop - start) + 1) * (twice_radius + 1) );
-  int column_index_start,column_index_end;
-  int y = get_global_id(1) * size;
-  const int out_x = get_group_id(0)
-                    * ( get_local_size(0) - twice_radius ) + local_id0 - radius;
-  const int in_x = out_x + radius;
-  int tmp_size = size;
-  int tmp_index = 0;
-  float4 tmp_sum = (float4)0.0f;
-  float4 total_sum = (float4)0.0f;
-
-  if (in_x < in_width)
-    {
-      column_index_start = y;
-      column_index_end = y + twice_radius;
-
-      for (int i = 0; i < twice_radius + 1; ++i)
-        {
-          tmp_sum += in[(y + i) * in_width + in_x];
-        }
-
-      column_sum[local_id0] = tmp_sum;
-    }
-
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  while (1)
-    {
-      if (out_x < width)
-        {
-          total_sum = (float4)0.0f;
-
-          for (int i = start; i < stop; ++i)
-            {
-              total_sum += column_sum[local_id0 + i];
-            }
-
-          out[y * width + out_x] = total_sum / area;
-        }
-
-    if (--tmp_size == 0 || y == height - 1)
-      break;
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    ++y;
-
-    if (in_x < in_width)
+    for (i = x0 + 1; i < x1; i++)
       {
-        tmp_sum = column_sum[local_id0];
-        tmp_sum -= in[(column_index_start)   * in_width + in_x];
-        tmp_sum += in[(column_index_end + 1) * in_width + in_x];
-        ++column_index_start;
-        ++column_index_end;
-        column_sum[local_id0] = tmp_sum;
+        sum += src[i + 2 * radius] - src[i - 1];
+        dst[i] = sum * rad1;
       }
+  }
+}
 
-    barrier(CLK_LOCAL_MEM_FENCE);
+__kernel void kernel_blur_ver (__global const float4 *aux,
+                               __global       float4 *out,
+                               int width, int height, int radius, int run)
+{
+  const int x  = get_global_id (0);
+  const int y0 = get_global_id (1) * run;
+
+  if (x >= width || y0 >= height)
+    return;
+
+  {
+    const float rad1 = 1.0f / (float)(2 * radius + 1);
+    const int   y1   = min (y0 + run, height);
+    __global const float4 *src = aux + x;
+    __global       float4 *dst = out + x;
+    float4 sum = (float4)(0.0f);
+    int    i;
+
+    for (i = y0; i <= y0 + 2 * radius; i++)
+      sum += src[i * width];
+
+    dst[y0 * width] = sum * rad1;
+
+    for (i = y0 + 1; i < y1; i++)
+      {
+        sum += src[(i + 2 * radius) * width] - src[(i - 1) * width];
+        dst[i * width] = sum * rad1;
+      }
   }
 }
