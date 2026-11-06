@@ -239,6 +239,16 @@ __kernel void cl_noise_hsv(__global const float4    *in,
 
 /* R'G'B'A float in and out, converting to and from HSV in the kernel, so
  * that the buffer conversions can stay on the GPU.
+ *
+ * babl does not compute HSV from the R'G'B' values themselves but from
+ * a round trip through its approximated linearization, which moves each
+ * channel by up to about 1e-6 (relative), and by different amounts on
+ * different CPUs.  For nearly gray pixels, whose channels differ by
+ * little more than that, the hue babl computes is dominated by those
+ * deviations and cannot be reproduced here.  Such pixels, with a
+ * saturation (relative chroma) below gray_threshold but not exactly
+ * gray, set *fallback, and the host redoes the work item range on the
+ * CPU.
  */
 __kernel void cl_noise_hsv_rgb(__global const float4    *in,
                                __global       float4    *out,
@@ -251,13 +261,23 @@ __kernel void cl_noise_hsv_rgb(__global const float4    *in,
                                               int        holdness,
                                               float      hue_distance,
                                               float      saturation_distance,
-                                              float      value_distance)
+                                              float      value_distance,
+                                              float      gray_threshold,
+                               __global       int       *fallback)
 {
   const int gid  = get_global_id(0);
   const int gidy = gid / roi_width;
   const int gidx = gid - gidy * roi_width;
 
-  const float4 hsva = noise_hsv (rgb_to_hsv (in[gid]), random_data, rand,
+  const float4 rgba  = in[gid];
+  const float  maxv  = fmax (fmax (rgba.x, rgba.y), rgba.z);
+  const float  minv  = fmin (fmin (rgba.x, rgba.y), rgba.z);
+  const float  range = maxv - minv;
+
+  if (range > 0.0f && range < gray_threshold * maxv)
+    *fallback = 1;
+
+  const float4 hsva = noise_hsv (rgb_to_hsv (rgba), random_data, rand,
                                  gidx + x_offset, gidy + y_offset,
                                  whole_region_width, holdness,
                                  hue_distance, saturation_distance,
