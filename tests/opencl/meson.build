@@ -3,6 +3,7 @@ opencl_tests = [
   'bilateral-filter',
   'box-blur',
   'brightness-contrast',
+  'color-enhance',
   'color-temperature',
   'edge-sobel',
   'edge-sobel-both-axes',
