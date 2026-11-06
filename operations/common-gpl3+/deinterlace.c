@@ -307,6 +307,16 @@ cl_process (GeglOperation       *operation,
   if (rect_width < 1)
     return FALSE;
 
+  /* In the vertical orientation the CPU code reads up to size - 1
+   * columns past the end of a row of its source rectangle, which then
+   * come from the start of the next row (see below). Only when the
+   * rectangle is wider than size do they all stay within that next row,
+   * and does the CPU code not read column -1 (a width of 1 with keep
+   * even); this only excludes images at most size pixels wide.
+   */
+  if (!horizontal && rect_width <= size)
+    return FALSE;
+
   if (!cl_data)
     {
       const char *kernel_name[] = { "deinterlace", NULL };
