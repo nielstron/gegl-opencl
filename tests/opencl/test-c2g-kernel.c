@@ -75,6 +75,8 @@ int main(int argc, char **argv)
 #define ARG(i, v) CHECK(clSetKernelArg(kernel, i, sizeof(v), &(v)))
   ARG(0, input); ARG(1, width); ARG(2, height); ARG(3, r); ARG(4, c);
   ARG(5, s); ARG(6, output); ARG(7, radius); ARG(8, samples); ARG(9, iterations);
+  int origin = 0;
+  if (nargs > 11) { ARG(11, origin); ARG(12, origin); ARG(13, width); ARG(14, height); }
   int failures = 0;
   for (int uniform = 0; uniform <= 1; ++uniform) {
     for (int shadows = 0; shadows <= 1; ++shadows) {
