@@ -1,111 +1,195 @@
 # GEGL OpenCL fork
 
-This is a **general OpenCL fork of [GEGL](https://gitlab.gnome.org/GNOME/gegl)**. It
-fixes GEGL's existing OpenCL kernels where they disagree with the CPU path, and adds
-OpenCL implementations for operations that had none. It is not tied to one
-application. It is developed for, and tested against, the needs of the Android editor
-[Brushkin](https://github.com/nielstron/brushkin).
+This is a **general OpenCL fork of [GEGL](https://gitlab.gnome.org/GNOME/gegl)**.
+It fixes GEGL's OpenCL kernels where they disagree with the CPU path, crash or
+never run. It adds OpenCL implementations for operations that had none. It also
+removes most of the overhead GEGL's OpenCL path spends around the kernels.
 
-> **Status: work in progress.** Nothing is merged into `main` yet: `main` is GNOME
-> master plus this README. Every change lives on its own branch (see below), and the
-> table shows where each one stands. A combined branch will follow once the open
-> issues are fixed.
+The fork is not tied to one application. It was developed against the needs of
+the Android editor [Brushkin](https://github.com/nielstron/brushkin) and is
+tested on Android hardware.
 
-## How it is organised
+## Branches
 
-- Base: GNOME master (`gitlab.gnome.org/GNOME/gegl`, `7f032dd`).
-- **One branch per change**, so each can be reviewed, upstreamed or dropped on its own:
-  - `fix/<op>-opencl`: an existing OpenCL path that produced wrong output, crashed or
-    never ran.
-  - `opencl/<op>`: a new OpenCL implementation.
-  - `fix/<core-topic>`: a fix in GEGL's core that the OpenCL work depends on or
-    uncovered (threading, sampler, iterator, colour conversion).
-  - `perf/<topic>`: a speed change that does not change output.
-- The CPU path is the reference. A branch changes CPU output only where the CPU result
-  was itself wrong (e.g. it depended on thread count or chunk size); the table marks those.
+`main` is GNOME master (`gitlab.gnome.org/GNOME/gegl`, `f51b97273`) with every
+change below merged in. Each change also lives on its own branch, so it can be
+reviewed, upstreamed or dropped by itself:
+
+- `fix/<op>-opencl`: an existing OpenCL path that gave wrong output, crashed or
+  never ran.
+- `opencl/<op>`: a new OpenCL implementation.
+- `perf/<topic>`: a speedup that does not change output.
+- `fix/<topic>`: a fix in GEGL's core (threading, sampler, iterator, colour
+  conversion) that the OpenCL work depends on or uncovered.
+
+Most branches sit directly on GNOME master. These sit on other branches:
+
+- `opencl/gblur-1d-iir` sits on `fix/gblur-1d-opencl-apple`.
+- `fix/motion-blur-circular-opencl` sits on `fix/cl-iterator-abyss-alpha`.
+- `perf/edge-sobel-opencl` sits on `fix/edge-sobel-opencl`.
+- `perf/high-pass-opencl` sits on a merge of `perf/opencl-transfer` and
+  `opencl/gblur-1d-iir`.
+
+`fix/contrast-curve-opencl` is published but not merged. Its kernel was already
+correct, and it is not faster.
 
 ## How equivalence is checked
 
-Every branch is compared against the CPU path using one harness. It renders a
-deterministic test pattern twice, once with `use-opencl` off and once with it on, opaque
-and with varying alpha (error weighted by alpha). It reports which OpenCL kernels
-actually launched, so a silent CPU fallback cannot pass as a GPU result. Formats tested
-are `R'G'B'A u8` (what Brushkin uses), `RGBA float` and others, at sizes from 1×1 to
-3000×2000 so that GEGL's chunk and tile boundaries are crossed.
+The CPU path is the reference. A branch changes CPU output only where the CPU
+result was itself wrong. Each such case is a separate commit, listed under
+"CPU behaviour changes" below.
 
-**Target:** the GPU output must not differ from the CPU by more than 1/255 in u8,
-or 0.5/255 in float.
+1. **Harness, on desktop:** every branch was compared against the CPU on an
+   Apple M3 Max. Each filter was rendered with `use-opencl` off and on, opaque
+   and with varying alpha. The tests used several formats (`R'G'B'A u8`,
+   `RGBA float`, others) and sizes from 1×1 to 4000×3000, so they cross GEGL's
+   chunk and tile boundaries. The harness records which OpenCL kernels actually
+   launched, so a silent CPU fallback cannot pass as a GPU result.
+2. **Independent review:** a separate reviewer then tried to break each branch
+   with untested parameters, odd sizes, other formats, fault injection (forced
+   GPU failures), in-place blits and Mali/Adreno portability checks. Branches
+   went through fix-and-review rounds until they passed.
+3. **On the target device:** Brushkin's OpenCL survey ran on a **Pixel 6 Pro
+   (Mali-G78, Android 17)**, built against `main`.
 
-Each branch was then checked again by an independent reviewer that tried to break it:
-untested parameters, odd sizes, other formats, a code review for portability to
-Mali/Adreno, and a check that CPU output is unchanged.
+Target: the GPU output is within 1/255 of the CPU, opaque and alpha-weighted.
 
-Testing so far is on an Apple M3 Max (OpenCL 1.2 on Metal). Mali/Adreno results are
-still to come.
+## Results on a Pixel 6 Pro
 
-## Results
+All tests ran at 1024×768, `R'G'B'A u8` (Brushkin's format). Each value is the
+median of 3 interleaved rounds.
 
-Verdict comes from the independent review: **pass**, **pass\*** (pass with concerns,
-see notes) or **fail** (being fixed). Error is the max per-channel error on the 0–255
-scale, for u8 opaque / u8 alpha-weighted / RGBA float, as measured by the reviewer
-across all the settings it tried (including extremes). Speedups are **provisional**:
-they were measured on a heavily loaded machine, partly on battery, and against a CPU
-path that GEGL wrongly ran single-threaded (see `fix/opencl-threading-gate`). They will
-be re-measured.
+- **CPU:** GEGL's CPU path with 2 threads, as Brushkin runs it.
+- **GPU before:** master plus the transfer fix only, so the speedup from each
+  per-filter change can be read off.
+- **Max error:** per channel on the 0–255 scale. The alpha value is
+  alpha-weighted.
+- **Allowlist:** Brushkin enables OpenCL for operations that are at least 1.5×
+  faster and within 1/255. c2g samples randomly, so it never matches exactly.
 
-### Fixes to existing OpenCL paths
+GPU time includes a fixed cost of about 60 ms per render on this device. It
+covers uploading, converting and downloading the image, plus the app's own
+pixel copies. Cheap per-pixel filters therefore top out near 2× at this size,
+and larger images gain more.
 
-| Branch | Problem on master | Verdict | Max error u8 / alpha / float | Provisional speedup | Notes |
-|---|---|---|---|---|---|
-| `fix/gblur-1d-opencl-apple` | gaussian-blur / gblur-1d FIR aborted Apple's OpenCL compiler | pass\* | 1 / 0.97 / 0.001 | 3–27× | `cltostring.py` wrote "é" in a kernel comment as an invalid UTF-8 byte. FIR still ignores the mipmap level (pre-existing). |
-| `fix/texturize-canvas-opencl` | Process crashed (SIGBUS) | pass\* | 0 / 0 / 0.0001 | ~1.8× | Read-only table was wrapped with `CL_MEM_USE_HOST_PTR`. |
-| `fix/edge-sobel-opencl` | Both-axes mode never ran on the GPU; single-axis wrong at chunk borders (up to 48/255) | pass\* | 1 / 1 / 0.0001 | ~1.2× | The CPU path samples one pixel off; that is kept, and worth an upstream fix. |
-| `fix/red-eye-removal-opencl` | Up to 95/255 at threshold boundaries | pass | 0 / 0 / 0.00001 | ~1.6× | Threshold now computed like the CPU's double. |
-| `fix/motion-blur-circular-opencl` | Up to 15/255; CPU itself depended on chunk size | pass\* | 255 / 248 / 42 at extreme angles | 21–36× | ≤1 at normal settings. Large errors at angle=360 and other large angles; being fixed. **Changes CPU output** (CPU bugs fixed). |
-| `fix/contrast-curve-opencl` | Up to 3/255 | pass\* | 100 / 62 / 2.9 worst case | ~1.0× | No kernel bug: the error comes from GEGL's GPU colour conversion (see `fix/cl-color-babl-parity`). Not faster. |
-| `fix/noise-reduction-opencl` | OpenCL path compiled out | pass\* | 0 / 0 / 0 | 4–9× | **Changes CPU output**: the CPU result depended on thread count (up to 72/255). The algorithm is chaotic, so exact match on Mali/Adreno is unlikely. Optional. |
-| `fix/c2g-opencl-parity-master` | c2g ignored enhance-shadows and mis-projected | pass\* | n/a (stochastic) / 0 float | n/a | The deterministic kernel test passes. Pre-existing sampling differences remain. |
+| Filter | Kind | CPU (2 threads) | GPU | Speedup | GPU before (transfer fix only) | Max error opaque / alpha | Brushkin allowlist |
+|---|---|---|---|---|---|---|---|
+| `diffraction-patterns` | upstream | 3412 ms | 91 ms | 37.4× | 102 ms | 1 / 1.0 | yes |
+| `c2g` | fixed | 3933 ms | 145 ms | 27.0× | 141 ms | random | no |
+| `motion-blur-circular` | fixed | 1078 ms | 87 ms | 12.3× | 79 ms | 1 / 0.9 | yes |
+| `mean-curvature-blur` | new | 1025 ms | 87 ms | 11.8× | — | 0 / 1.0 | yes |
+| `bilateral-filter` | upstream | 763 ms | 72 ms | 10.6× | 72 ms | 1 / 0.9 | yes |
+| `stretch-contrast-hsv` | new | 536 ms | 67 ms | 8.0× | — | 1 / 1.0 | yes |
+| `ripple` | new | 489 ms | 70 ms | 6.9× | — | 1 / 1.9 | yes |
+| `polar-coordinates` | new | 1061 ms | 155 ms | 6.8× | — | 1 / 1.0 | yes |
+| `gaussian-blur-selective` | upstream | 482 ms | 73 ms | 6.6× | 74 ms | 0 / 0.0 | yes |
+| `cartoon` | new | 506 ms | 79 ms | 6.4× | — | 1 / 1.0 | yes |
+| `motion-blur-linear` | upstream | 426 ms | 69 ms | 6.2× | 68 ms | 1 / 0.8 | yes |
+| `waves` | new | 435 ms | 74 ms | 5.9× | — | 1 / 1.0 | yes |
+| `high-pass` | new | 479 ms | 92 ms | 5.2× | — | 1 / 1.0 | yes |
+| `noise-hsv` | faster | 433 ms | 83 ms | 5.2× | 408 ms | 1 / 1.0 | yes |
+| `noise-reduction` | enabled | 428 ms | 94 ms | 4.5× | CPU | 0 / 0.0 | yes |
+| `normal-map` | new | 277 ms | 62 ms | 4.5× | — | 1 / 1.0 | yes |
+| `snn-mean` | upstream | 294 ms | 67 ms | 4.4× | 67 ms | 0 / 0.0 | yes |
+| `motion-blur-zoom` | new | 321 ms | 75 ms | 4.3× | — | 1 / 0.0 | yes |
+| `noise-pick` | new | 206 ms | 62 ms | 3.3× | — | 0 / 0.0 | yes |
+| `noise-cie-lch` | new | 255 ms | 79 ms | 3.2× | — | 1 / 1.0 | yes |
+| `color-enhance` | new | 213 ms | 67 ms | 3.2× | — | 1 / 1.0 | yes |
+| `noise-slur` | new | 202 ms | 64 ms | 3.2× | — | 0 / 0.0 | yes |
+| `noise-spread` | new | 215 ms | 68 ms | 3.2× | — | 0 / 0.0 | yes |
+| `lens-blur` | new | 275 ms | 89 ms | 3.1× | — | 0 / 0.5 | yes |
+| `noise-rgb` | new | 271 ms | 89 ms | 3.0× | — | 1 / 1.0 | yes |
+| `photocopy` | new | 255 ms | 84 ms | 3.0× | — | 1 / 1.0 | yes |
+| `posterize` | upstream | 187 ms | 62 ms | 3.0× | 63 ms | 0 / 0.0 | yes |
+| `oilify` | upstream | 1512 ms | 526 ms | 2.9× | 460 ms | 1 / 1.0 | yes |
+| `softglow` | new | 225 ms | 79 ms | 2.8× | — | 1 / 1.0 | yes |
+| `gaussian-blur#fir` | fixed (Apple) | 234 ms | 82 ms | 2.8× | 83 ms | 0 / 0.3 | yes |
+| `newsprint` | new | 179 ms | 64 ms | 2.8× | CPU | 0 / 0.0 | yes |
+| `gblur-1d#fir` | fixed (Apple) | 174 ms | 66 ms | 2.6× | 66 ms | 0 / 0.9 | yes |
+| `emboss` | new | 159 ms | 61 ms | 2.6× | — | 1 / 1.0 | yes |
+| `edge-sobel#abs` | enabled | 157 ms | 61 ms | 2.6× | — | 0 / 0.0 | yes |
+| `edge-sobel#both` | enabled | 156 ms | 62 ms | 2.5× | CPU | 0 / 0.0 | yes |
+| `lens-distortion` | new | 183 ms | 74 ms | 2.5× | — | 1 / 1.0 | yes |
+| `bloom` | new | 219 ms | 89 ms | 2.5× | — | 1 / 1.0 | yes |
+| `edge-sobel` | faster | 150 ms | 62 ms | 2.4× | 62 ms | 0 / 0.0 | yes |
+| `brightness-contrast` | upstream | 148 ms | 63 ms | 2.4× | 63 ms | 0 / 0.0 | yes |
+| `box-blur` | faster | 161 ms | 69 ms | 2.3× | 65 ms | 1 / 0.8 | yes |
+| `color-temperature` | upstream | 141 ms | 62 ms | 2.3× | 63 ms | 0 / 0.0 | yes |
+| `whirl-pinch` | new | 898 ms | 399 ms | 2.3× | — | 1 / 1.0 | yes |
+| `pixelize` | fixed, faster | 142 ms | 63 ms | 2.2× | 62 ms | 0 / 0.0 | yes |
+| `invert-linear` | upstream | 138 ms | 62 ms | 2.2× | 63 ms | 0 / 0.0 | yes |
+| `gaussian-blur#small-auto` | upstream | 174 ms | 78 ms | 2.2× | 78 ms | 0 / 0.0 | yes |
+| `levels` | upstream | 133 ms | 62 ms | 2.1× | 64 ms | 0 / 0.0 | yes |
+| `gblur-1d#auto` | enabled (IIR) | 161 ms | 76 ms | 2.1× | CPU | 0 / 0.8 | yes |
+| `deinterlace` | new | 135 ms | 63 ms | 2.1× | — | 0 / 1.0 | yes |
+| `median-blur` | new | 221 ms | 104 ms | 2.1× | — | 0 / 0.0 | yes |
+| `mono-mixer` | upstream | 132 ms | 62 ms | 2.1× | 64 ms | 1 / 0.9 | yes |
+| `gray` | upstream | 132 ms | 66 ms | 2.0× | 66 ms | 0 / 0.0 | no |
+| `vignette` | upstream | 124 ms | 62 ms | 2.0× | 63 ms | 1 / 1.0 | yes |
+| `contrast-curve` | upstream | 121 ms | 62 ms | 2.0× | 64 ms | 0 / 0.0 | no |
+| `stretch-contrast` | upstream | 130 ms | 67 ms | 2.0× | 67 ms | 0 / 0.0 | yes |
+| `gaussian-blur#auto` | enabled (IIR) | 179 ms | 92 ms | 1.9× | CPU | 0 / 0.8 | yes |
+| `exposure` | upstream | 117 ms | 62 ms | 1.9× | 63 ms | 0 / 0.0 | yes |
+| `checkerboard` | upstream | 106 ms | 60 ms | 1.8× | 60 ms | 0 / 0.0 | yes |
+| `weighted-blend` | upstream | 168 ms | 98 ms | 1.7× | 97 ms | 0 / 0.0 | yes |
+| `svg:src-over` | upstream | 163 ms | 98 ms | 1.7× | 98 ms | 0 / 0.0 | yes |
+| `simplex-noise` | upstream | 125 ms | 76 ms | 1.6× | 75 ms | 1 / 1.0 | yes |
+| `edge-laplace` | upstream | 96 ms | 63 ms | 1.5× | 63 ms | 0 / 0.0 | yes |
+| `video-degradation` | upstream | 96 ms | 65 ms | 1.5× | 64 ms | 0 / 0.0 | yes |
+| `cell-noise` | upstream | 132 ms | 89 ms | 1.5× | 85 ms | 1 / 1.0 | no |
+| `texturize-canvas` | fixed | 93 ms | 63 ms | 1.5× | 65 ms | 0 / 0.0 | no |
+| `alien-map` | upstream | 86 ms | 63 ms | 1.4× | 64 ms | 0 / 0.0 | no |
+| `opacity` | upstream | 78 ms | 63 ms | 1.2× | 63 ms | 0 / 0.0 | no |
+| `noise-hurl` | upstream | 90 ms | 76 ms | 1.2× | 78 ms | 0 / 0.0 | no |
+| `channel-mixer` | upstream | 157 ms | 135 ms | 1.2× | CPU | 0 / 0.0 | no |
+| `value-invert` | faster | 69 ms | 60 ms | 1.1× | 63 ms | 1 / 1.0 | no |
+| `threshold` | upstream | 215 ms | 191 ms | 1.1× | 191 ms | 0 / 0.0 | no |
+| `color-exchange` | upstream | 68 ms | 63 ms | 1.1× | 63 ms | 0 / 0.0 | no |
+| `red-eye-removal` | fixed | 67 ms | 62 ms | 1.1× | 62 ms | 0 / 0.0 | no |
+| `shadows-highlights` | new | 212 ms | 202 ms | 1.0× | — | 1 / 1.0 | no |
+| `unsharp-mask` | new | 190 ms | 195 ms | 1.0× | — | 0 / 0.0 | no |
+| `shadows-highlights-correction` | upstream | 183 ms | 198 ms | 0.9× | 199 ms | 1 / 1.0 | no |
+| `hue-chroma` | upstream | 156 ms | 173 ms | 0.9× | 176 ms | 0 / 0.0 | no |
+| `color-to-alpha` | upstream | 75 ms | 106 ms | 0.7× | CPU | 0 / 0.0 | no |
 
-### New OpenCL implementations
+## Core changes
 
-| Branch | Verdict | Max error u8 / alpha / float | Provisional speedup | Notes |
-|---|---|---|---|---|
-| `opencl/gblur-1d-iir` | pass\* | 1 / 1.28 / 0.06 | 1.5–2.1× | IIR gaussian; this is what gaussian-blur's auto mode uses. It is used by unsharp-mask, high-pass, bloom, softglow, cartoon, photocopy and shadows-highlights. Stacked on `fix/gblur-1d-opencl-apple`. |
-| `opencl/mean-curvature-blur` | pass\* | 5 / 4.6 / 6.1 at extremes | 60–87× | ≤1 at defaults. A subnormal gradient gives NaN on devices that keep denormals; being fixed. |
-| `opencl/motion-blur-zoom` | pass | 1 / 0.62 / 0 | 6–10× | |
-| `opencl/median-blur` | pass\* | 0 / 0 / 0 | 8–14× | Fixed 16×16 work group; must respect the device limit. |
-| `opencl/lens-blur` | **fail** | 76 / 2.6 / 25.6 | 3–6× | Float prefix sums lose precision; being fixed. |
-| `opencl/noise-pick` | pass | 0 / 0 / 0 | 10–14× | |
-| `opencl/noise-slur` | pass | 0 / 0 / 0 | 12–14× | |
-| `opencl/noise-spread` | pass | 0 / 0 / 0 | 11–12× | |
-| `opencl/noise-rgb` | pass\* | 1 / 1 / 0.00003 | 4–5× | Also speeds up the shared `random.cl` about 2× (same output). |
-| `opencl/noise-cie-lch` | pass\* | 1 / 1 / 0.001 | ~3× | Exact gray match assumes babl was built with FMA contraction. |
-| `opencl/stretch-contrast-hsv` | **fail** | 1 / 1 / 0.005 | ~27× | Wrong for near-black pixels and non-sRGB spaces; being fixed. |
-| `opencl/color-enhance` | **fail** | 1 / 1 / 0.08 | ~5.5× | Wrong for grayscale input, and CPU fallback after a GPU failure is corrupted; being fixed. |
-| `opencl/normal-map` | pass\* | 1 / 1 / 0.01 | ~11× | NaN with premultiplied-float input that has fully transparent pixels. |
-| `opencl/emboss` | **fail** | 1 / 1 / 0.009 | 7–9× | Can abort (format mismatch on fallback); being fixed. |
-| `opencl/newsprint` | pass\* | 255 in edge cases | 5–16× | Bit-exact at normal settings. Exactness depends on CPU FMA contraction and libm `hypotf`; width or blocksize 0 differ. |
-| `opencl/deinterlace` | pass\* | 1 / 1 / 0.001 | ~5× | Edge cases with size ≥ width differ; the CPU itself reads out of bounds there. |
-| `opencl/whirl-pinch` | pass\* | 22 / 8 / 0.06 at extremes | ~13×+ | Ported NoHalo/cubic/linear samplers. Re-uploads the whole input per chunk; float-vs-double mapping at extreme settings. |
-| `opencl/polar-coordinates` | pass\* | 1 / 1.8 / 0.07 | ~24× | `fmod` sign and a NaN at a pole on the top edge; being fixed. |
-| `opencl/ripple` | **fail** | 255 / 13 / 0.1 | ~8× | Period passed as float (phase drift), and non-static `inline` helpers fail on some compilers; being fixed. |
-| `opencl/waves` | **fail** | 5 / 3.7 / 1.1 | ~6× | Parameters passed as float instead of double; being fixed. |
-| `opencl/lens-distortion` | pass\* | 28 / 75 / 23 at extremes | ~1.5× | Barely faster; may be dropped. |
+| Branch | What |
+|---|---|
+| `perf/opencl-transfer` | Removes most of the overhead around OpenCL kernels. 8-bit conversions now run on the GPU and match babl exactly, via host-built tables. Device buffers are pooled. A default `gegl_node_blit` renders straight into the caller's memory. If the destination aliases a source buffer, it renders into a temporary instead, and if any GPU step fails it falls back to the CPU. It also fixes the iterator's converting write path, which wrote the wrong format. On the Pixel, GPU time for the filters Brushkin used went from about 130 ms to 62–71 ms. |
+| `fix/opencl-threading-gate` | GEGL disabled CPU threading for every OpenCL-capable operation once OpenCL was initialised, even on nodes with `use-opencl=false`. Now only nodes that actually use OpenCL are serialised. |
+| `fix/cl-color-babl-parity` | GEGL's GPU colour conversions now match babl bit-exactly on normal inputs. Before, the last-bit differences flipped threshold- and table-based filters by up to 255. The tables are built lazily, so startup memory stays at master's level. |
+| `fix/cl-iterator-abyss-alpha` | Area filters on sources without alpha got opaque black instead of transparent at image edges on the GPU, by up to 150/255. Upstream's guard checked the wrong rectangle. |
+| `fix/sampler-context-rect` | The sampler cache could miss NoHalo's context, which made CPU output depend on thread count. |
+| `fix/opacity-opencl-components` | gegl:opacity's kernels assumed 4 channels and produced garbage on Y/YA input. |
+| `fix/android-opencl-library` | Loads OpenCL on Android (`libOpenCL.so`, `libOpenCL-pixel.so`). |
+| `fix/buffer-write-empty-span` | Skips empty spans when converting in `gegl_buffer_iterate_write`. |
 
-### Core fixes
+## CPU behaviour changes
 
-| Branch | What | Verdict | Notes |
-|---|---|---|---|
-| `fix/opencl-threading-gate` | GEGL turned off CPU threading for every OpenCL-capable op once OpenCL was initialised, even on nodes with `use-opencl=false` | pass | CPU path of bilateral-filter with 8 threads: 3.4–5.1 s → 0.85 s. Matters for any app that enables OpenCL per graph. |
-| `fix/sampler-context-rect` | Sampler cache could miss the NoHalo context, so CPU output depended on thread count | pass | **Changes CPU output** (only where it was undefined). |
-| `fix/cl-iterator-abyss-alpha` | Area filters on sources without alpha got opaque black instead of transparent at edges on the GPU (up to 150/255) | under review | Upstream's existing guard checked the wrong rectangle. |
-| `fix/cl-color-babl-parity` | GPU colour conversions differ from babl in the last bits, flipping threshold/table ops | under review | |
-| `perf/opencl-transfer` | Speed up GEGL's shared OpenCL transfer/conversion path | in progress | Simple point ops are transfer-bound today. |
+These commits change CPU output where the CPU result was itself wrong:
 
-### Not ported
+- **`fix/noise-reduction-opencl`:** the in-place algorithm depended on thread
+  count (GNOME issue #162). It is now deterministic and matches the kernel.
+- **`fix/motion-blur-circular-opencl`:** output depended on chunk size, and
+  samples near powers of two read the wrong pixel.
+- **`fix/sampler-context-rect`:** see above.
+- **`opencl/color-enhance`:** achromatic input is now left unchanged instead of
+  amplifying rounding noise.
+- **`fix/lens-blur-cpu-precision`:** accumulates in double precision.
 
-mosaic, cubism, distance-transform, dither, lens-flare and rgb-clip are inherently
-sequential, order-dependent, or too cheap to gain from the GPU.
+## Known limits
+
+- **FMA dependence:** some kernels match the CPU exactly only when the CPU code
+  was built with fused multiply-add contraction, as clang on arm64 does. That
+  includes the colour-conversion paths and newsprint. On armv7 or x86 without
+  FMA, rare boundary pixels can differ.
+- **polar-coordinates:** one unexplained single-pixel difference appeared under
+  heavy concurrent load on the desktop. It did not reproduce in repeated runs.
+- **Concurrency:** blitting OpenCL graphs from several threads at once is racy,
+  as it is upstream, because kernels are shared. Serialise renders.
+- **Not ported:** mosaic, cubism, distance-transform, dither, lens-flare and
+  rgb-clip are sequential, order-dependent or too cheap to gain from the GPU.
 
 ## Building
 
@@ -115,4 +199,4 @@ Same as GEGL:
 meson setup _build && ninja -C _build
 ```
 
-Requires babl ≥ 0.1.116.
+Requires babl ≥ 0.1.116; the tests used 0.1.128.
