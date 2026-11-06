@@ -121,6 +121,142 @@ get_pixel_color (gfloat              *in_buf,
 }
 
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+
+#include "opencl/motion-blur-zoom.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_motion_blur_zoom (cl_mem               in_tex,
+                     cl_mem               out_tex,
+                     const GeglRectangle *roi,
+                     const GeglRectangle *src_rect,
+                     gdouble              center_x,
+                     gdouble              center_y,
+                     gdouble              factor)
+{
+  cl_int  cl_err     = 0;
+  cl_mem  deltas_tex = NULL;
+  gfloat *deltas;
+  size_t  global_ws[2];
+  gint    j;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "motion_blur_zoom", NULL };
+      cl_data = gegl_cl_compile_and_build (motion_blur_zoom_cl_source,
+                                           kernel_name);
+    }
+
+  if (!cl_data)
+    return TRUE;
+
+  global_ws[0] = roi->width;
+  global_ws[1] = roi->height;
+
+  /* the offsets to the end point are computed exactly like in process (),
+   * in double precision, per column and per row
+   */
+  deltas = g_new (gfloat, roi->width + roi->height);
+
+  for (j = 0; j < roi->width; j++)
+    {
+      gint   x     = roi->x + j;
+      gfloat x_end = x + (center_x - (gfloat) x) * factor;
+
+      deltas[j] = x_end - (gfloat) x;
+    }
+
+  for (j = 0; j < roi->height; j++)
+    {
+      gint   y     = roi->y + j;
+      gfloat y_end = y + (center_y - (gfloat) y) * factor;
+
+      deltas[roi->width + j] = y_end - (gfloat) y;
+    }
+
+  deltas_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                    (roi->width + roi->height) * sizeof (gfloat),
+                                    deltas, &cl_err);
+  g_free (deltas);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem),   (void *) &in_tex,
+                                    sizeof (cl_int),   (void *) &src_rect->x,
+                                    sizeof (cl_int),   (void *) &src_rect->y,
+                                    sizeof (cl_int),   (void *) &src_rect->width,
+                                    sizeof (cl_int),   (void *) &src_rect->height,
+                                    sizeof (cl_mem),   (void *) &out_tex,
+                                    sizeof (cl_int),   (void *) &roi->x,
+                                    sizeof (cl_int),   (void *) &roi->y,
+                                    sizeof (cl_mem),   (void *) &deltas_tex,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 2,
+                                        NULL, global_ws, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clReleaseMemObject (deltas_tex);
+  CL_CHECK_ONLY (cl_err);
+
+  return FALSE;
+
+error:
+  if (deltas_tex)
+    gegl_clReleaseMemObject (deltas_tex);
+
+  return TRUE;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi,
+            gdouble              center_x,
+            gdouble              center_y)
+{
+  GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
+  GeglProperties          *o       = GEGL_PROPERTIES (operation);
+  const Babl              *format  = gegl_operation_get_format (operation, "output");
+
+  GeglBufferClIterator *i;
+  gint                  read;
+  gint                  err = 0;
+
+  i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, roi, format,
+                                        GEGL_CL_BUFFER_READ,
+                                        op_area->left,
+                                        op_area->right,
+                                        op_area->top,
+                                        op_area->bottom,
+                                        GEGL_ABYSS_NONE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && ! err)
+    {
+      err = cl_motion_blur_zoom (i->tex[read], i->tex[0],
+                                 &i->roi[0], &i->roi[read],
+                                 center_x, center_y, o->factor);
+
+      if (err)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          break;
+        }
+    }
+
+  return ! err;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -143,6 +279,10 @@ process (GeglOperation       *operation,
                 o->center_x, whole_region->width);
   center_y = gegl_coordinate_relative_to_pixel (
                 o->center_y, whole_region->height);
+
+  if (gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, roi, center_x, center_y))
+      return TRUE;
 
   src_rect = *roi;
   src_rect.x -= op_area->left;
@@ -262,9 +402,10 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class = GEGL_OPERATION_CLASS (klass);
   filter_class    = GEGL_OPERATION_FILTER_CLASS (klass);
 
-  operation_class->prepare = prepare;
-  operation_class->process = operation_process;
-  filter_class->process    = process;
+  operation_class->prepare        = prepare;
+  operation_class->process        = operation_process;
+  operation_class->opencl_support = TRUE;
+  filter_class->process           = process;
 
   gegl_operation_class_set_keys (operation_class,
       "name",               "gegl:motion-blur-zoom",

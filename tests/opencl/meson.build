@@ -21,6 +21,7 @@ opencl_tests = [
   'mono-mixer',
   'motion-blur',
   'motion-blur-circular',
+  'motion-blur-zoom',
   'noise-reduction',
   'oilify',
   'opacity',

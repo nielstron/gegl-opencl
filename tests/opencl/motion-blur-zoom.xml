@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<gegl>
+  <node operation='gegl:motion-blur-zoom'>
+    <params>
+      <param name='center-x'>0.4</param>
+      <param name='center-y'>0.6</param>
+      <param name='factor'>0.2</param>
+    </params>
+  </node>
+  <node operation='gegl:load'>
+    <params>
+      <param name='path'>../compositions/data/car-stack.png</param>
+    </params>
+  </node>
+</gegl>
