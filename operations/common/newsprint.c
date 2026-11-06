@@ -16,6 +16,22 @@
  * Copyright 2017,2019 Øyvind Kolås <pippin@gimp.org>
  */
 
+/* Halftoning thresholds every anti-aliasing sample, so letting the
+ * compiler fuse multiply-adds (which depends on the compiler, its flags
+ * and the target's FMA support) flips samples and changes the output
+ * between platforms. Keep every operation separately rounded, as on
+ * x86-64. This comes before any include, so that it also applies to the
+ * fmodf () from gegl-math.h.
+ */
+#ifndef NEWSPRINT_NO_FP_CONTRACT /* this file is included repeatedly */
+#define NEWSPRINT_NO_FP_CONTRACT
+#if defined (__clang__)
+#pragma STDC FP_CONTRACT OFF
+#elif defined (__GNUC__)
+#pragma GCC optimize ("fp-contract=off")
+#endif
+#endif
+
 #include "config.h"
 #include <glib/gi18n-lib.h>
 
