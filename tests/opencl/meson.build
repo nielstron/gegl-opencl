@@ -8,6 +8,7 @@ opencl_tests = [
   'deinterlace',
   'edge-sobel',
   'edge-sobel-both-axes',
+  'emboss',
   'focus-blur',
   'gaussian-blur',
   'gaussian-blur-iir',
