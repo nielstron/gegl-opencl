@@ -55,9 +55,79 @@
 static void
 prepare (GeglOperation *operation)
 {
-  const Babl *space = gegl_operation_get_source_space (operation, "input");
-  gegl_operation_set_format (operation, "input", babl_format_with_space ("R'G'B'A float", space));
-  gegl_operation_set_format (operation, "output", babl_format_with_space ("R'G'B'A float", space));
+  const Babl *space  = gegl_operation_get_source_space (operation, "input");
+  const Babl *format = babl_format_with_space ("R'G'B'A float", space);
+
+  /* With OpenCL, process 8-bit input as is: the kernel converts to and
+   * from float itself, which saves two conversion passes on the device.
+   */
+  if (gegl_operation_use_opencl (operation))
+    {
+      const Babl *u8 = babl_format_with_space ("R'G'B'A u8", space);
+
+      if (gegl_operation_get_source_format (operation, "input") == u8)
+        format = u8;
+    }
+
+  gegl_operation_set_format (operation, "input", format);
+  gegl_operation_set_format (operation, "output", format);
+}
+
+static inline void
+value_invert (const gfloat *src,
+              gfloat       *dest)
+{
+  gfloat r, g, b;
+  gfloat value, min;
+  gfloat delta;
+
+  r = src[0];
+  g = src[1];
+  b = src[2];
+
+  if (r > g)
+    {
+      value = MAX (r, b);
+      min = MIN (g, b);
+    }
+  else
+    {
+      value = MAX (g, b);
+      min = MIN (r, b);
+    }
+
+  delta = value - min;
+  if ((value == 0) || (delta == 0))
+    {
+      r = 1.0 - value;
+      g = 1.0 - value;
+      b = 1.0 - value;
+    }
+  else
+    {
+      if (r == value)
+        {
+          r = 1.0 - r;
+          b = r * b / value;
+          g = r * g / value;
+        }
+      else if (g == value)
+        {
+          g = 1.0 - g;
+          r = g * r / value;
+          b = g * b / value;
+        }
+      else
+        {
+          b = 1.0 - b;
+          g = b * g / value;
+          r = b * r / value;
+        }
+    }
+
+  dest[0] = r;
+  dest[1] = g;
+  dest[2] = b;
 }
 
 static gboolean
@@ -68,69 +138,102 @@ process (GeglOperation       *op,
          const GeglRectangle *roi,
          gint                 level)
 {
-  glong   j;
-  gfloat *src  = in_buf;
-  gfloat *dest = out_buf;
-  gfloat  r, g, b;
-  gfloat  value, min;
-  gfloat  delta;
+  const Babl *format = gegl_operation_get_format (op, "output");
+  glong       j;
 
-  for (j = 0; j < samples; j++)
+  if (babl_format_get_type (format, 0) == babl_type ("u8"))
     {
-      r = *src++;
-      g = *src++;
-      b = *src++;
+      /* only used when OpenCL processing failed, see prepare () */
+      const guint8 *src  = in_buf;
+      guint8       *dest = out_buf;
 
-      if (r > g)
+      for (j = 0; j < samples; j++)
         {
-          value = MAX (r, b);
-          min = MIN (g, b);
-        }
-      else
-        {
-          value = MAX (g, b);
-          min = MIN (r, b);
-        }
+          gfloat rgb[3];
+          gint   c;
 
-      delta = value - min;
-      if ((value == 0) || (delta == 0))
-        {
-          r = 1.0 - value;
-          g = 1.0 - value;
-          b = 1.0 - value;
-        }
-      else
-        {
-          if (r == value)
-            {
-              r = 1.0 - r;
-              b = r * b / value;
-              g = r * g / value;
-            }
-          else if (g == value)
-            {
-              g = 1.0 - g;
-              r = g * r / value;
-              b = g * b / value;
-            }
-          else
-            {
-              b = 1.0 - b;
-              g = b * g / value;
-              r = b * r / value;
-            }
-        }
+          for (c = 0; c < 3; c++)
+            rgb[c] = src[c] / 255.0f;
 
-      *dest++ = r;
-      *dest++ = g;
-      *dest++ = b;
+          value_invert (rgb, rgb);
 
-      *dest++ = *src++;
+          for (c = 0; c < 3; c++)
+            dest[c] = CLAMP (rgb[c], 0.0f, 1.0f) * 255.0f + 0.5f;
+
+          dest[3] = src[3];
+
+          src  += 4;
+          dest += 4;
+        }
     }
+  else
+    {
+      const gfloat *src  = in_buf;
+      gfloat       *dest = out_buf;
+
+      for (j = 0; j < samples; j++)
+        {
+          value_invert (src, dest);
+          dest[3] = src[3];
+
+          src  += 4;
+          dest += 4;
+        }
+    }
+
   return TRUE;
 }
 
+#include "opencl/gegl-cl.h"
 #include "opencl/value-invert.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_process (GeglOperation       *op,
+            cl_mem               in_tex,
+            cl_mem               out_tex,
+            size_t               global_worksize,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  const Babl *format = gegl_operation_get_format (op, "output");
+  cl_kernel   kernel;
+  cl_int      cl_err = 0;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"gegl_value_invert",
+                                   "gegl_value_invert_u8",
+                                   NULL};
+      cl_data = gegl_cl_compile_and_build (value_invert_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return TRUE;
+
+  if (babl_format_get_type (format, 0) == babl_type ("u8"))
+    kernel = cl_data->kernel[1];
+  else
+    kernel = cl_data->kernel[0];
+
+  cl_err = gegl_cl_set_kernel_args (kernel,
+                                    sizeof (cl_mem), &in_tex,
+                                    sizeof (cl_mem), &out_tex,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        kernel, 1,
+                                        NULL, &global_worksize, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  return FALSE;
+
+error:
+  return TRUE;
+}
 
 static void
 gegl_op_class_init (GeglOpClass *klass)
@@ -141,8 +244,10 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class    = GEGL_OPERATION_CLASS (klass);
   point_filter_class = GEGL_OPERATION_POINT_FILTER_CLASS (klass);
 
-  point_filter_class->process = process;
-  operation_class->prepare = prepare;
+  point_filter_class->process    = process;
+  point_filter_class->cl_process = cl_process;
+  operation_class->prepare        = prepare;
+  operation_class->opencl_support = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:value-invert",
@@ -152,7 +257,6 @@ gegl_op_class_init (GeglOpClass *klass)
     "description",
         _("Invert the value component, the result has the brightness "
           "inverted, keeping the color."),
-    "cl-source"  , value_invert_cl_source,
     NULL);
 }
 
