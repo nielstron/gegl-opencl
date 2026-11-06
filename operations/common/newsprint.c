@@ -204,6 +204,20 @@ property_double (angleboost, _("Angle boost"), 0.0)
 
 #include "gegl-op.h"
 
+/* hypotf (), correctly rounded in practice. The libm hypotf () of glibc
+ * and macOS computes exactly this; others (like bionic's) are only
+ * accurate to an ulp, which flips halftone samples.
+ */
+static inline float
+newsprint_hypotf (float a,
+                  float b)
+{
+  if (isinf (a) || isinf (b))
+    return INFINITY;
+
+  return (float) sqrt ((double) a * a + (double) b * b);
+}
+
 /* for details and more liberal licensing of the following function, see
    https://pippin.gimp.org/spachrotyzer/ */
 
@@ -286,11 +300,11 @@ float spachrotyze (
           {
             ay = 1.0f - ay;
             ax = 1.0f - ax;
-            v = 2.0f - hypotf (ax, ay);
+            v = 2.0f - newsprint_hypotf (ax, ay);
           }
           else
           {
-            v = hypotf (ax, ay);
+            v = newsprint_hypotf (ax, ay);
           }
           v/=2.0f;
           if (v < part_white)
