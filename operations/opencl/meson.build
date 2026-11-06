@@ -29,6 +29,7 @@ gegl_operations_opencl_sources = [
   'lens-blur.cl',
   'lens-distortion.cl',
   'levels.cl',
+  'mean-curvature-blur.cl',
   'mono-mixer.cl',
   'motion-blur-circular.cl',
   'motion-blur-linear.cl',

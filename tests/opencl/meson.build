@@ -16,6 +16,7 @@ opencl_tests = [
   'lens-blur',
   'lens-distortion',
   'levels',
+  'mean-curvature-blur',
   'mono-mixer',
   'motion-blur',
   'motion-blur-circular',
