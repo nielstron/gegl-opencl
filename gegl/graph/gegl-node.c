@@ -1269,6 +1269,12 @@ gegl_node_get_output_producer (GeglNode *node)
  * format on the GPU (or at least skip an intermediate copy), instead of
  * storing the result in the operation's working format and converting it
  * on the CPU afterwards.
+ *
+ * The output buffer the operation gets is then in the destination's format
+ * rather than in the format of its output pad, also when it falls back to
+ * the CPU. Operations with OpenCL support must therefore take their working
+ * format from gegl_operation_get_format(), never from
+ * gegl_buffer_get_format() of the output buffer.
  */
 static GeglBuffer *
 gegl_node_blit_direct_target (GeglNode            *self,
