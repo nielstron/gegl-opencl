@@ -115,8 +115,10 @@ cl_process (GeglOperation       *operation,
             const GeglRectangle *roi,
             gint                level)
 {
-  GeglProperties *o           = GEGL_PROPERTIES (operation);
-  cl_float   threshold    = o->threshold;
+  GeglProperties *o         = GEGL_PROPERTIES (operation);
+  gfloat          threshold = o->threshold;
+  /* computed like in red_eye_reduction (), in double precision */
+  cl_float        adjusted_threshold = (threshold - 0.4) * 2;
 
 
   if (!cl_data)
@@ -134,7 +136,7 @@ cl_process (GeglOperation       *operation,
   gegl_cl_set_kernel_args (cl_data->kernel[0],
                            sizeof(cl_mem),   &in,
                            sizeof(cl_mem),   &out,
-                           sizeof(cl_float), &threshold,
+                           sizeof(cl_float), &adjusted_threshold,
                            NULL);
   CL_CHECK;
 
