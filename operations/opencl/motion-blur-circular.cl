@@ -23,11 +23,81 @@ bilinear_mix (const float4 p00,
   return mix (mix (p00, p10, dy), mix (p01, p11, dy), dx);
 }
 
-float
-compute_phi (float xr,
-             float yr)
+/* Double-float helpers: a value is represented as hi + lo.  They are
+ * used to compute the number of samples and the sample positions like
+ * the CPU code does in double precision, so that ceil () and the image
+ * edge test give the same result.  They need IEEE float operations
+ * without contraction into fma; the products use Dekker's splitting
+ * instead of fma ().
+ */
+#pragma OPENCL FP_CONTRACT OFF
+
+float2
+df_two_sum (float a,
+            float b)
 {
-  return atan2 (yr, xr);
+  const float s  = a + b;
+  const float bb = s - a;
+  return (float2)(s, (a - (s - bb)) + (b - bb));
+}
+
+float2
+df_split (float a)
+{
+  const float c  = 4097.0f * a;
+  const float hi = c - (c - a);
+  return (float2)(hi, a - hi);
+}
+
+float2
+df_two_prod (float a,
+             float b)
+{
+  const float  p  = a * b;
+  const float2 as = df_split (a);
+  const float2 bs = df_split (b);
+  const float  e  = ((as.x * bs.x - p) + as.x * bs.y + as.y * bs.x) +
+                    as.y * bs.y;
+  return (float2)(p, e);
+}
+
+float2
+df_add (float2 a,
+        float2 b)
+{
+  float2 s = df_two_sum (a.x, b.x);
+  s.y += a.y + b.y;
+  return df_two_sum (s.x, s.y);
+}
+
+float2
+df_mul (float2 a,
+        float2 b)
+{
+  float2 p = df_two_prod (a.x, b.x);
+  p.y += a.x * b.y + a.y * b.x;
+  return df_two_sum (p.x, p.y);
+}
+
+/* returns TRUE if a < b */
+int
+df_less (float2 a,
+         float2 b)
+{
+  const float2 d = df_add (a, -b);
+  return d.x < 0.0f || (d.x == 0.0f && d.y < 0.0f);
+}
+
+/* ceil (sqrt (sq)) for sq given as a double-float */
+int
+df_ceil_sqrt (float2 sq)
+{
+  int m = (int) ceil (sqrt (sq.x + sq.y));
+  if (m > 0 && ! df_less (df_two_prod ((float) (m - 1), (float) (m - 1)), sq))
+    m--;
+  else if (df_less (df_two_prod ((float) m, (float) m), sq))
+    m++;
+  return m;
 }
 
 #define NOMINAL_NUM_IT 100
@@ -45,9 +115,11 @@ cl_motion_blur_circular (__global const float4 *in,
                                   const int     whole_region_height,
                                   const int     whole_region_x,
                                   const int     whole_region_y,
-                                  const float   angle,
-                                  const float   center_x,
-                                  const float   center_y)
+         __global const float4 *trig,
+                                  const int     max_n,
+                                  const float2  arc_factor_sq,
+                                  const float2  center_x,
+                                  const float2  center_y)
 {
   const int gidx = get_global_id(0);
   const int gidy = get_global_id(1);
@@ -55,35 +127,72 @@ cl_motion_blur_circular (__global const float4 *in,
   const int x = gidx + dst_x;
   const int y = gidy + dst_y;
 
-  const float xr = x - center_x;
-  const float yr = y - center_y;
-  const float radius = hypot (xr, yr);
+  const float2 xr2 = df_add ((float2)((float) x, 0.0f), -center_x);
+  const float2 yr2 = df_add ((float2)((float) y, 0.0f), -center_y);
 
-  /* This is not the "real" length, a bit shorter */
-  const float arc_length = radius * angle * M_SQRT2_F;
+  /* n = ceil (radius * angle * SQRT_2), computed as the ceil of the
+   * square root of (xr^2 + yr^2) * (angle * SQRT_2)^2 in double-float
+   * precision to match the CPU.  This is not the "real" arc length, a
+   * bit shorter.
+   */
+  const float2 radius_sq = df_add (df_mul (xr2, xr2), df_mul (yr2, yr2));
+  int n = df_ceil_sqrt (df_mul (radius_sq, arc_factor_sq));
 
   /* ensure quality with small angles */
-  int n = max ((int)ceil (arc_length), 3);
+  n = max (n, 3);
 
   /* performance concern */
   if (n > NOMINAL_NUM_IT)
-    n = NOMINAL_NUM_IT + (int) sqrt ((float)(n - NOMINAL_NUM_IT));
+    {
+      const int v = n - NOMINAL_NUM_IT;
+      int r = (int) sqrt ((float) v);
+      if ((r + 1) * (r + 1) <= v)
+        r++;
+      else if (r * r > v)
+        r--;
+      n = NOMINAL_NUM_IT + r;
+    }
 
-  const float phi_base = compute_phi (xr, yr);
-  const float phi_start = phi_base + angle / 2.0f;
-  const float phi_step = angle / (float)n;
+  /* the host computed the table up to max_n, with a margin */
+  n = min (n, max_n);
+  trig += n * (n - 1) / 2 - 3;
+
+  /* far above the rounding noise of the positions, see below */
+  const float snap = (fabs ((float) x) + fabs ((float) y) +
+                      fabs (xr2.x) + fabs (yr2.x)) * 0x1.0p-36f;
 
   float4 sum = (float4)0.0f;
   int count = 0;
 
-  /* Iterate over the arc */
+  /* Iterate over the arc, rotating the offset of the pixel from the
+   * center by theta in [angle / 2, -angle / 2), like the CPU code.
+   * The middle sample (theta == 0) lands exactly on the pixel.
+   * sin (theta) and cos (theta) - 1 come from a table computed in double
+   * precision on the host, and the position is computed in double-float
+   * precision before it is rounded to float like on the CPU, so samples
+   * that lie exactly on the edge of the input (e.g. at 180 or 360
+   * degrees around a center between pixels) are tested the same way.
+   */
   for (int i = 0; i < n; i++)
     {
-      float s_val, c_val;
-      s_val = sincos (phi_start - i * phi_step, &c_val);
+      const float4 t     = trig[i];
+      const float2 s_val = t.xy;
+      const float2 c_m1  = t.zw;
 
-      const float fx = center_x + radius * c_val;
-      const float fy = center_y + radius * s_val;
+      const float2 px = df_add ((float2)((float) x, 0.0f),
+                                df_add (df_mul (xr2, c_m1),
+                                        -df_mul (yr2, s_val)));
+      const float2 py = df_add ((float2)((float) y, 0.0f),
+                                df_add (df_mul (xr2, s_val),
+                                        df_mul (yr2, c_m1)));
+      /* A sample exactly on the left or top edge of an input at 0 can
+       * come out as a tiny positive or negative value, depending on the
+       * rounding of sin () and cos (); float keeps it, so snap it to 0,
+       * the exact result, like the CPU code does.  Elsewhere the
+       * rounding to float hides that noise.
+       */
+      const float fx = fabs (px.x) < snap ? 0.0f : px.x;
+      const float fy = fabs (py.x) < snap ? 0.0f : py.x;
       const int ix = (int)floor (fx);
       const int iy = (int)floor (fy);
 
