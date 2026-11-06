@@ -254,7 +254,7 @@ cl_process (GeglOperation       *operation,
   gint                  count, k;
   gdouble               radius, std_dev1, std_dev2;
   gdouble               ramp_down, ramp_up;
-  size_t                n, global_ws, local_ws;
+  size_t                n, global_ws, local_ws, max_local_ws;
 
   /* The kernels use the sRGB luminance */
   if (babl_format_get_space (gegl_buffer_get_format (input)) !=
@@ -343,7 +343,22 @@ cl_process (GeglOperation       *operation,
   if (cl_err != CL_SUCCESS)
     goto cleanup;
 
-  local_ws  = 256;
+  /* The kernel works with any work-group size; use at most 256, within
+   * the limits of the device and the kernel.  The histogram is counted
+   * exactly, so the results do not depend on it.
+   */
+  cl_err = gegl_clGetDeviceInfo (gegl_cl_get_device (),
+                                 CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                                 sizeof (size_t), &max_local_ws, NULL);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  max_local_ws = MIN (max_local_ws, cl_data->work_group_size[0]);
+
+  local_ws = 256;
+  while (local_ws > 1 && local_ws > max_local_ws)
+    local_ws /= 2;
+
   global_ws = local_ws * CLAMP (n_pixels / 16384, 1, 256);
 
   cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
