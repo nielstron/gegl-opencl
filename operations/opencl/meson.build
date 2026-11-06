@@ -65,6 +65,7 @@ gegl_operations_opencl_sources = [
   'value-invert.cl',
   'video-degradation.cl',
   'vignette.cl',
+  'waves.cl',
   'weighted-blend.cl',
 ]
 
