@@ -220,6 +220,153 @@ prepare (GeglOperation *operation)
   gegl_operation_set_format (operation, "output", babl_format_with_space ("RaGaBaA float", space));
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+
+#include "opencl/whirl-pinch.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+/* Copies @rect of @buffer, converted to @format, into a new OpenCL buffer. */
+static cl_mem
+cl_upload_rect (GeglBuffer          *buffer,
+                const GeglRectangle *rect,
+                const Babl          *format)
+{
+  cl_int   cl_err = 0;
+  cl_mem   tex    = NULL;
+  size_t   size   = (size_t) rect->width * rect->height *
+                    babl_format_get_bytes_per_pixel (format);
+  gpointer data;
+
+  tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                             CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
+                             size, NULL, &cl_err);
+  CL_CHECK;
+
+  data = gegl_clEnqueueMapBuffer (gegl_cl_get_command_queue (), tex, CL_TRUE,
+                                  CL_MAP_WRITE, 0, size,
+                                  0, NULL, NULL, &cl_err);
+  CL_CHECK;
+
+  gegl_buffer_get (buffer, rect, 1.0, format, data,
+                   GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
+
+  cl_err = gegl_clEnqueueUnmapMemObject (gegl_cl_get_command_queue (), tex,
+                                         data, 0, NULL, NULL);
+  CL_CHECK;
+
+  return tex;
+
+error:
+  if (tex)
+    gegl_clReleaseMemObject (tex);
+
+  return NULL;
+}
+
+/* Implements apply_whirl_pinch () with the NoHalo sampler on the GPU.  The
+ * sampler uses GEGL_ABYSS_CLAMP, so every sample lands inside the input's
+ * abyss rectangle, which is uploaded as a whole.
+ */
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi,
+            const GeglRectangle *boundary,
+            gdouble              whirl,
+            gdouble              pinch,
+            gdouble              radius)
+{
+  const Babl           *format = gegl_operation_get_format (operation, "output");
+  const GeglRectangle  *abyss  = gegl_buffer_get_abyss (input);
+  GeglBufferClIterator *i;
+  cl_mem                in_tex = NULL;
+  cl_int                cl_err = 0;
+  gboolean              err;
+  cl_int4               srect;
+  cl_int4               abyss4;
+  cl_int                policy  = GEGL_ABYSS_CLAMP;
+  cl_float              cen_x   = boundary->width  / 2.0;
+  cl_float              cen_y   = boundary->height / 2.0;
+  cl_float              scale_x = 1.0;
+  cl_float              scale_y = (gdouble) boundary->width / boundary->height;
+  cl_float              f_whirl = whirl * G_PI / 180;
+  cl_float              f_pinch = pinch;
+  cl_float              f_radius = radius;
+
+  if (abyss->width < 1 || abyss->height < 1 ||
+      (gdouble) abyss->width * abyss->height > (1 << 26))
+    return FALSE;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"whirl_pinch", NULL};
+      cl_data = gegl_cl_compile_and_build (whirl_pinch_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return FALSE;
+
+  srect.s[0] = abyss4.s[0] = abyss->x;
+  srect.s[1] = abyss4.s[1] = abyss->y;
+  srect.s[2] = abyss4.s[2] = abyss->width;
+  srect.s[3] = abyss4.s[3] = abyss->height;
+
+  in_tex = cl_upload_rect (input, abyss, format);
+  if (!in_tex)
+    return FALSE;
+
+  i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err))
+    {
+      size_t global_ws[2];
+
+      if (err)
+        goto error_iter;
+
+      global_ws[0] = i->roi[0].width;
+      global_ws[1] = i->roi[0].height;
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem),   &in_tex,
+                                        sizeof (cl_int4),  &srect,
+                                        sizeof (cl_int4),  &abyss4,
+                                        sizeof (cl_int),   &policy,
+                                        sizeof (cl_mem),   &i->tex[0],
+                                        sizeof (cl_int),   &i->roi[0].x,
+                                        sizeof (cl_int),   &i->roi[0].y,
+                                        sizeof (cl_float), &cen_x,
+                                        sizeof (cl_float), &cen_y,
+                                        sizeof (cl_float), &scale_x,
+                                        sizeof (cl_float), &scale_y,
+                                        sizeof (cl_float), &f_whirl,
+                                        sizeof (cl_float), &f_pinch,
+                                        sizeof (cl_float), &f_radius,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2,
+                                            NULL, global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  gegl_clReleaseMemObject (in_tex);
+
+  return TRUE;
+
+error:
+  gegl_buffer_cl_iterator_stop (i);
+error_iter:
+  gegl_clReleaseMemObject (in_tex);
+
+  return FALSE;
+}
+
 /* Perform the specified operation.
  */
 static gboolean
@@ -232,6 +379,11 @@ process (GeglOperation       *operation,
   GeglProperties *o        = GEGL_PROPERTIES (operation);
   GeglRectangle   boundary = gegl_operation_get_bounding_box (operation);
   const Babl     *format   = gegl_operation_get_format (operation, "output");
+
+  if (level == 0 && gegl_operation_use_opencl (operation) &&
+      cl_process (operation, input, output, result, &boundary,
+                  o->whirl, o->pinch, o->radius))
+    return TRUE;
 
   apply_whirl_pinch (o->whirl,
                      o->pinch,
@@ -287,6 +439,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->prepare                 = prepare;
   operation_class->process                 = operation_process;
   operation_class->get_required_for_output = get_required_for_output;
+  operation_class->opencl_support          = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",               "gegl:whirl-pinch",

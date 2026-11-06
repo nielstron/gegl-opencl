@@ -47,6 +47,7 @@ gegl_operations_opencl_sources = [
   'video-degradation.cl',
   'vignette.cl',
   'weighted-blend.cl',
+  'whirl-pinch.cl',
 ]
 
 cltostring = files('cltostring.py')
