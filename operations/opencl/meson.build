@@ -67,6 +67,7 @@ gegl_operations_opencl_sources = [
   'vignette.cl',
   'waves.cl',
   'weighted-blend.cl',
+  'whirl-pinch.cl',
 ]
 
 cltostring = files('cltostring.py')

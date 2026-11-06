@@ -44,6 +44,7 @@ opencl_tests = [
   'value-invert',
   'vignette',
   'waves',
+  'whirl-pinch',
 ]
 
 foreach _test : opencl_tests
