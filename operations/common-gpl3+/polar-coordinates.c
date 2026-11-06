@@ -82,6 +82,25 @@ property_boolean (middle, _("Choose middle"), TRUE)
 #define SCALE_WIDTH     200
 #define ENTRY_WIDTH      60
 
+/* (int) (v + 0.5), saturating, with NaN mapped to 0.  With the pole on
+ * the image's top or left edge, rmax can be 0 and the coordinates NaN or
+ * infinite, which a plain cast does not handle.
+ */
+static gint
+round_to_int (gdouble v)
+{
+  v += 0.5;
+
+  if (isnan (v))
+    return 0;
+  else if (v >= G_MAXINT)
+    return G_MAXINT;
+  else if (v <= G_MININT)
+    return G_MININT;
+
+  return (gint) v;
+}
+
 static gboolean
 calc_undistorted_coords (gdouble        wx,
                          gdouble        wy,
@@ -283,8 +302,8 @@ calc_undistorted_coords (gdouble        wx,
         }
     }
 
-  xi = (int) (x_calc + 0.5);
-  yi = (int) (y_calc + 0.5);
+  xi = round_to_int (x_calc);
+  yi = round_to_int (y_calc);
 
   inside = (WITHIN (0, xi, boundary.width - 1) && WITHIN (0, yi, boundary.height - 1));
   if (inside)
