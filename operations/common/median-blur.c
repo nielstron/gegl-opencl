@@ -768,6 +768,43 @@ get_abyss_policy (GeglOperation *operation,
 #define CL_LOCAL_SIZE     16
 
 static GeglClRunData *cl_data = NULL;
+static size_t         cl_local_ws[2];
+
+/* pick the largest work group of at most CL_LOCAL_SIZE x CL_LOCAL_SIZE
+ * that the kernel and device support; CL_KERNEL_WORK_GROUP_SIZE may be
+ * well below 256 on register-starved mobile GPUs.
+ */
+static void
+cl_choose_local_size (void)
+{
+  size_t max_wg = cl_data->work_group_size[0];
+  size_t max_item[3] = { CL_LOCAL_SIZE, CL_LOCAL_SIZE, 1 };
+  size_t lw = CL_LOCAL_SIZE;
+  size_t lh = CL_LOCAL_SIZE;
+
+  if (gegl_clGetDeviceInfo (gegl_cl_get_device (),
+                            CL_DEVICE_MAX_WORK_ITEM_SIZES,
+                            sizeof (max_item), max_item, NULL) != CL_SUCCESS)
+    {
+      max_item[0] = CL_LOCAL_SIZE;
+      max_item[1] = CL_LOCAL_SIZE;
+    }
+
+  max_wg = MAX (max_wg, 1);
+  lw     = MAX (MIN (lw, max_item[0]), 1);
+  lh     = MAX (MIN (lh, max_item[1]), 1);
+
+  while (lw * lh > max_wg)
+    {
+      if (lh >= lw && lh > 1)
+        lh /= 2;
+      else
+        lw /= 2;
+    }
+
+  cl_local_ws[0] = lw;
+  cl_local_ws[1] = lh;
+}
 
 /* represent a percentile p in [0, 1] as mantissa / 2^shift */
 static void
@@ -808,17 +845,23 @@ cl_median_blur (cl_mem               in_tex,
     {
       const char *kernel_name[] = { "median_blur", NULL };
       cl_data = gegl_cl_compile_and_build (median_blur_cl_source, kernel_name);
+
+      if (cl_data)
+        cl_choose_local_size ();
     }
 
   if (!cl_data)
     return TRUE;
 
-  local_ws[0]  = CL_LOCAL_SIZE;
-  local_ws[1]  = CL_LOCAL_SIZE;
-  global_ws[0] = (roi->width  + CL_LOCAL_SIZE - 1) / CL_LOCAL_SIZE * CL_LOCAL_SIZE;
-  global_ws[1] = (roi->height + CL_LOCAL_SIZE - 1) / CL_LOCAL_SIZE * CL_LOCAL_SIZE;
-  cache_size   = (CL_LOCAL_SIZE + 2 * radius) * (CL_LOCAL_SIZE + 2 * radius) *
+  local_ws[0]  = cl_local_ws[0];
+  local_ws[1]  = cl_local_ws[1];
+  global_ws[0] = (roi->width  + local_ws[0] - 1) / local_ws[0] * local_ws[0];
+  global_ws[1] = (roi->height + local_ws[1] - 1) / local_ws[1] * local_ws[1];
+  cache_size   = (local_ws[0] + 2 * radius) * (local_ws[1] + 2 * radius) *
                  sizeof (cl_uchar4);
+
+  if (cache_size > gegl_cl_get_local_mem_size ())
+    return TRUE;
 
   cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
                                     sizeof (cl_mem),   (void *) &in_tex,
