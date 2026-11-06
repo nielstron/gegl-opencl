@@ -427,86 +427,282 @@ pixelize (gfloat              *input,
 
 static GeglClRunData *cl_data = NULL;
 
+/* Blocks with at least this many pixels are averaged by a whole
+ * work-group instead of a single work-item.
+ */
+#define CL_GROUP_MEAN_THRESHOLD 256
+#define CL_GROUP_SIZE           64
+
+static gint64
+floor_div (gint64 a,
+           gint64 b)
+{
+  return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
+/* Same tests as set_rectangle (), with x and y relative to the block. */
+static gboolean
+shape_contains (GeglPixelizeNorm     norm,
+                gint                 x,
+                gint                 y,
+                const GeglRectangle *rect_shape)
+{
+  gfloat shape_area = rect_shape->width * rect_shape->height;
+  gfloat center_x   = rect_shape->x + rect_shape->width / 2.0f;
+  gfloat center_y   = rect_shape->y + rect_shape->height / 2.0f;
+
+  switch (norm)
+    {
+    case GEGL_PIXELIZE_NORM_EUCLIDEAN:
+      return SQR ((x - center_x) / (gfloat) rect_shape->width) +
+             SQR ((y - center_y) / (gfloat) rect_shape->height) <= 1.0f;
+
+    case GEGL_PIXELIZE_NORM_MANHATTAN:
+      return fabsf (center_x - x) * rect_shape->height +
+             fabsf (center_y - y) * rect_shape->width < shape_area;
+
+    case GEGL_PIXELIZE_NORM_INFINITY:
+    default:
+      return x >= rect_shape->x &&
+             y >= rect_shape->y &&
+             (gint64) x < (gint64) rect_shape->x + rect_shape->width &&
+             (gint64) y < (gint64) rect_shape->y + rect_shape->height;
+    }
+}
+
+/* Finds the pixels [*start, *end) of row y of a block that lie inside
+ * the shape. All shapes are convex and the tests only get worse the
+ * farther a pixel is from the shape's center, so the inside pixels of a
+ * row are contiguous and can be found by bisection.
+ */
+static void
+shape_row_span (GeglPixelizeNorm     norm,
+                gint                 y,
+                gint                 xsize,
+                const GeglRectangle *rect_shape,
+                gint                *start,
+                gint                *end)
+{
+  gint pivot = CLAMP ((gint) floorf (rect_shape->x + rect_shape->width / 2.0f),
+                      0, xsize - 1);
+  gint lo, hi;
+
+  *start = *end = 0;
+
+  if (! shape_contains (norm, pivot, y, rect_shape))
+    {
+      if (pivot + 1 < xsize && shape_contains (norm, pivot + 1, y, rect_shape))
+        pivot++;
+      else
+        return;
+    }
+
+  /* first inside pixel in [0, pivot] */
+  lo = 0;
+  hi = pivot;
+  while (lo < hi)
+    {
+      gint mid = lo + (hi - lo) / 2;
+
+      if (shape_contains (norm, mid, y, rect_shape))
+        hi = mid;
+      else
+        lo = mid + 1;
+    }
+  *start = lo;
+
+  /* last inside pixel in [pivot, xsize - 1] */
+  lo = pivot;
+  hi = xsize - 1;
+  while (lo < hi)
+    {
+      gint mid = hi - (hi - lo) / 2;
+
+      if (shape_contains (norm, mid, y, rect_shape))
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+  *end = lo + 1;
+}
+
 static gboolean
 cl_pixelize (cl_mem               in_tex,
-             cl_mem               aux_tex,
              cl_mem               out_tex,
              const GeglRectangle *src_rect,
              const GeglRectangle *roi,
-             gint                 xsize,
-             gint                 ysize,
-             gfloat               xratio,
-             gfloat               yratio,
-             gfloat               bg_color[4],
-             gint                 norm,
-             GeglRectangle       *image_extent)
+             const GeglRectangle *image_extent,
+             const gfloat         bg_color[4],
+             GeglProperties      *o)
 {
-  cl_int cl_err = 0;
-  const size_t gbl_size[2]= {roi->width, roi->height};
+  cl_int     cl_err   = 0;
+  cl_mem     blocks   = NULL;
+  cl_mem     columns  = NULL;
+  cl_mem     rows     = NULL;
+  cl_int    *column_table;
+  cl_int    *row_table;
+  cl_kernel  mean_kernel;
+  size_t     mean_global[2];
+  size_t     mean_local[2] = {CL_GROUP_SIZE, 1};
+  gboolean   group_mean;
+  const size_t fill_global[2] = {roi->width, roi->height};
 
-  gint cx0 = block_index (roi->x, xsize);
-  gint cy0 = block_index (roi->y, ysize);
-  gint block_count_x = block_index (roi->x + roi->width  + xsize - 1, xsize) - cx0;
-  gint block_count_y = block_index (roi->y + roi->height + ysize - 1, ysize) - cy0;
-  cl_int4 bbox = {{ image_extent->x, image_extent->y,
+  gint xsize = o->size_x;
+  gint ysize = o->size_y;
+
+  /* position of the roi's top-left pixel inside its block */
+  gint phase_x = (gint64) roi->x + align_offset (o->offset_x, xsize) -
+                 floor_div ((gint64) roi->x + align_offset (o->offset_x, xsize),
+                            xsize) * xsize;
+  gint phase_y = (gint64) roi->y + align_offset (o->offset_y, ysize) -
+                 floor_div ((gint64) roi->y + align_offset (o->offset_y, ysize),
+                            ysize) * ysize;
+
+  cl_int block_x       = roi->x - phase_x;
+  cl_int block_y       = roi->y - phase_y;
+  cl_int block_count_x = (roi->width  - 1 + (gint64) phase_x) / xsize + 1;
+  cl_int block_count_y = (roi->height - 1 + (gint64) phase_y) / ysize + 1;
+  cl_int in_width      = src_rect->width;
+
+  cl_int4 bbox = {{ image_extent->x,
+                    image_extent->y,
                     image_extent->x + image_extent->width,
                     image_extent->y + image_extent->height }};
+  cl_float4 bg = {{ bg_color[0], bg_color[1], bg_color[2], bg_color[3] }};
 
-  cl_int line_width = roi->width + 2 * xsize;
+  GeglRectangle rect_shape;
+  gint          x, y;
 
-  size_t gbl_size_tmp[2] = {block_count_x, block_count_y};
+  rect_shape.width  = ceilf (o->size_x * (gfloat)o->ratio_x);
+  rect_shape.height = ceilf (o->size_y * (gfloat)o->ratio_y);
+  rect_shape.x      = floorf ((o->size_x - (gfloat)o->ratio_x * o->size_x) / 2.0f);
+  rect_shape.y      = floorf ((o->size_y - (gfloat)o->ratio_y * o->size_y) / 2.0f);
 
   if (!cl_data)
-  {
-    const char *kernel_name[] = {"calc_block_color", "kernel_pixelize", NULL};
-    cl_data = gegl_cl_compile_and_build (pixelize_cl_source, kernel_name);
-  }
+    {
+      const char *kernel_name[] = {"pixelize_block_mean",
+                                   "pixelize_block_mean_wg",
+                                   "pixelize_fill",
+                                   NULL};
+      cl_data = gegl_cl_compile_and_build (pixelize_cl_source, kernel_name);
+    }
 
-  if (!cl_data) return 1;
+  if (!cl_data)
+    return TRUE;
 
-  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
-                                    sizeof(cl_mem), (void*)&in_tex,
-                                    sizeof(cl_mem), (void*)&aux_tex,
-                                    sizeof(cl_int), (void*)&xsize,
-                                    sizeof(cl_int), (void*)&ysize,
-                                    sizeof(cl_int), (void*)&roi->x,
-                                    sizeof(cl_int), (void*)&roi->y,
-                                    sizeof(cl_int4), &bbox,
-                                    sizeof(cl_int), (void*)&line_width,
-                                    sizeof(cl_int), (void*)&block_count_x,
+  /* per-column block and position inside the block */
+  column_table = g_new (cl_int, 2 * roi->width);
+  for (x = 0; x < roi->width; x++)
+    {
+      gint64 u      = (gint64) x + phase_x;
+      gint   abs_x  = roi->x + x;
+      gboolean in_bbox = abs_x >= bbox.s[0] && abs_x < bbox.s[2];
+
+      column_table[2 * x]     = in_bbox ? u / xsize : -1;
+      column_table[2 * x + 1] = u % xsize;
+    }
+
+  /* per-row block and span of the shape inside the block */
+  row_table = g_new (cl_int, 4 * roi->height);
+  for (y = 0; y < roi->height; y++)
+    {
+      gint64 v      = (gint64) y + phase_y;
+      gint   abs_y  = roi->y + y;
+      gboolean in_bbox = abs_y >= bbox.s[1] && abs_y < bbox.s[3];
+      gint   start, end;
+
+      shape_row_span (o->norm, v % ysize, xsize, &rect_shape, &start, &end);
+
+      row_table[4 * y]     = in_bbox ? v / ysize : -1;
+      row_table[4 * y + 1] = start;
+      row_table[4 * y + 2] = end;
+      row_table[4 * y + 3] = 0;
+    }
+
+  columns = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                 CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                 2 * roi->width * sizeof (cl_int),
+                                 column_table, &cl_err);
+  g_free (column_table);
+  if (cl_err != CL_SUCCESS)
+    {
+      g_free (row_table);
+      CL_ERROR;
+    }
+
+  rows = gegl_clCreateBuffer (gegl_cl_get_context (),
+                              CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                              4 * roi->height * sizeof (cl_int),
+                              row_table, &cl_err);
+  g_free (row_table);
+  CL_CHECK;
+
+  blocks = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                CL_MEM_READ_WRITE,
+                                (size_t) block_count_x * block_count_y *
+                                sizeof (cl_float4),
+                                NULL, &cl_err);
+  CL_CHECK;
+
+  group_mean  = (gint64) xsize * ysize >= CL_GROUP_MEAN_THRESHOLD;
+  mean_kernel = cl_data->kernel[group_mean ? 1 : 0];
+
+  cl_err = gegl_cl_set_kernel_args (mean_kernel,
+                                    sizeof (cl_mem),  &in_tex,
+                                    sizeof (cl_mem),  &blocks,
+                                    sizeof (cl_int),  &src_rect->x,
+                                    sizeof (cl_int),  &src_rect->y,
+                                    sizeof (cl_int),  &in_width,
+                                    sizeof (cl_int),  &block_x,
+                                    sizeof (cl_int),  &block_y,
+                                    sizeof (cl_int),  &xsize,
+                                    sizeof (cl_int),  &ysize,
+                                    sizeof (cl_int4), &bbox,
+                                    sizeof (cl_int),  &block_count_x,
+                                    NULL);
+  CL_CHECK;
+
+  mean_global[0] = (size_t) block_count_x * (group_mean ? CL_GROUP_SIZE : 1);
+  mean_global[1] = block_count_y;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        mean_kernel, 2,
+                                        NULL, mean_global,
+                                        group_mean ? mean_local : NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[2],
+                                    sizeof (cl_mem),    &blocks,
+                                    sizeof (cl_mem),    &out_tex,
+                                    sizeof (cl_mem),    &columns,
+                                    sizeof (cl_mem),    &rows,
+                                    sizeof (cl_float4), &bg,
+                                    sizeof (cl_int),    &block_count_x,
+                                    sizeof (cl_int),    &roi->width,
                                     NULL);
   CL_CHECK;
 
   cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                        cl_data->kernel[0], 2,
-                                        NULL, gbl_size_tmp, NULL,
+                                        cl_data->kernel[2], 2,
+                                        NULL, fill_global, NULL,
                                         0, NULL, NULL);
   CL_CHECK;
 
-  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[1],
-                                    sizeof(cl_mem),   (void*)&aux_tex,
-                                    sizeof(cl_mem),   (void*)&out_tex,
-                                    sizeof(cl_int),   (void*)&xsize,
-                                    sizeof(cl_int),   (void*)&ysize,
-                                    sizeof(cl_float), (void*)&xratio,
-                                    sizeof(cl_float), (void*)&yratio,
-                                    sizeof(cl_int),   (void*)&roi->x,
-                                    sizeof(cl_int),   (void*)&roi->y,
-                                    sizeof(cl_float4),(void*)bg_color,
-                                    sizeof(cl_int),   (void*)&norm,
-                                    sizeof(cl_int),   (void*)&block_count_x,
-                                    NULL);
-  CL_CHECK;
-
-  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                        cl_data->kernel[1], 2,
-                                        NULL, gbl_size, NULL,
-                                        0, NULL, NULL);
-  CL_CHECK;
+  gegl_clReleaseMemObject (blocks);
+  gegl_clReleaseMemObject (rows);
+  gegl_clReleaseMemObject (columns);
 
   return FALSE;
 
 error:
+  if (blocks)
+    gegl_clReleaseMemObject (blocks);
+  if (rows)
+    gegl_clReleaseMemObject (rows);
+  if (columns)
+    gegl_clReleaseMemObject (columns);
+
   return TRUE;
 }
 
@@ -517,11 +713,8 @@ cl_process (GeglOperation       *operation,
             const GeglRectangle *roi,
             const Babl          *format)
 {
-  const Babl *in_format  = format;
-  const Babl *out_format = format;
-  gint   err;
+  gint   err = 0;
   gfloat bg_color[4];
-  gint   norm;
 
   GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
   GeglProperties *o = GEGL_PROPERTIES (operation);
@@ -529,13 +722,13 @@ cl_process (GeglOperation       *operation,
 
   GeglBufferClIterator *i = gegl_buffer_cl_iterator_new   (output,
                                                            roi,
-                                                           out_format,
+                                                           format,
                                                            GEGL_CL_BUFFER_WRITE);
 
   gint read = gegl_buffer_cl_iterator_add_2 (i,
                                              input,
                                              roi,
-                                             in_format,
+                                             format,
                                              GEGL_CL_BUFFER_READ,
                                              op_area->left,
                                              op_area->right,
@@ -543,37 +736,19 @@ cl_process (GeglOperation       *operation,
                                              op_area->bottom,
                                              GEGL_ABYSS_CLAMP);
 
-  gint aux = gegl_buffer_cl_iterator_add_aux (i,
-                                              roi,
-                                              in_format,
-                                              op_area->left,
-                                              op_area->right,
-                                              op_area->top,
-                                              op_area->bottom);
-
-
-  gegl_color_get_pixel (o->background, in_format, bg_color);
-
-  norm = 0;
-  norm = o->norm == GEGL_PIXELIZE_NORM_EUCLIDEAN ? 1 : norm;
-  norm = o->norm == GEGL_PIXELIZE_NORM_INFINITY  ? 2 : norm;
+  gegl_color_get_pixel (o->background, format, bg_color);
 
   image_extent = gegl_operation_source_get_bounding_box (operation, "input");
 
   while (gegl_buffer_cl_iterator_next (i, &err) && !err)
     {
-      err = cl_pixelize(i->tex[read],
-                        i->tex[aux],
-                        i->tex[0],
-                        &i->roi[read],
-                        &i->roi[0],
-                        o->size_x,
-                        o->size_y,
-                        o->ratio_x,
-                        o->ratio_y,
-                        bg_color,
-                        norm,
-                        image_extent);
+      err = cl_pixelize (i->tex[read],
+                         i->tex[0],
+                         &i->roi[read],
+                         &i->roi[0],
+                         image_extent,
+                         bg_color,
+                         o);
 
       if (err)
         {

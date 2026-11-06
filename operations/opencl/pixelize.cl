@@ -17,116 +17,169 @@
  * Copyright 2013 Carlos Zubieta  <czubieta.dev@gmail.com>
  */
 
+/* Block means.  Blocks are numbered from the top-left block of the
+ * chunk; block (bx, by) starts at block_x + bx * xsize,
+ * block_y + by * ysize and is clipped to bbox (x0, y0, x1, y1).  Blocks
+ * that lie completely outside bbox get a zero mean, the fill kernel
+ * never uses it.
+ */
+
 int
-block_index (int pos,
-             int size)
+clip_end (int start,
+          int size,
+          int limit)
 {
-  return pos < 0 ? ((pos + 1) / size - 1) : (pos / size);
+  /* min (start + size, limit) without overflowing for huge sizes */
+  return limit - start > size ? start + size : limit;
 }
 
-__kernel void calc_block_color(__global float4 *in,
-                               __global float4 *out,
-                                        int     xsize,
-                                        int     ysize,
-                                        int     roi_x,
-                                        int     roi_y,
-                                        int4    bbox,
-                                        int     line_width,
-                                        int     block_count_x )
+/* One work-item per block, for small blocks. */
+__kernel void pixelize_block_mean (__global const float4 *in,
+                                   __global       float4 *blocks,
+                                                  int     in_x,
+                                                  int     in_y,
+                                                  int     in_width,
+                                                  int     block_x,
+                                                  int     block_y,
+                                                  int     xsize,
+                                                  int     ysize,
+                                                  int4    bbox,
+                                                  int     block_count_x)
 {
-  int gidx = get_global_id(0);
-  int gidy = get_global_id(1);
+  int bx = get_global_id (0);
+  int by = get_global_id (1);
 
-  int cx = block_index (roi_x, xsize) + gidx;
-  int cy = block_index (roi_y, ysize) + gidy;
-
-  int px0 = max (bbox.s0, cx * xsize) - roi_x + xsize;
-  int py0 = max (bbox.s1, cy * ysize) - roi_y + ysize;
-
-  int px1 = min (bbox.s2, cx * xsize + xsize) - roi_x + xsize;
-  int py1 = min (bbox.s3, cy * ysize + ysize) - roi_y + ysize;
-
+  int x0 = block_x + bx * xsize;
+  int y0 = block_y + by * ysize;
+  int x1 = clip_end (x0, xsize, bbox.s2);
+  int y1 = clip_end (y0, ysize, bbox.s3);
+  float4 sum = (float4) (0.0f);
   int i, j;
 
-  float4 col = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+  x0 = max (x0, bbox.s0);
+  y0 = max (y0, bbox.s1);
 
-  int real_xsize = px1 - px0;
-  int real_ysize = py1 - py0;
-
-  float weight = 1.0f / (real_xsize * real_ysize);
-
-  for (j = py0; j < py1; ++j)
+  if (x1 > x0 && y1 > y0)
     {
-      for (i = px0; i < px1; ++i)
+      for (j = y0; j < y1; j++)
         {
-          col += in[j * line_width + i];
+          __global const float4 *row = in + (j - in_y) * in_width;
+
+          for (i = x0 - in_x; i < x1 - in_x; i++)
+            sum += row[i];
         }
+
+      sum /= (float) ((x1 - x0) * (y1 - y0));
     }
-  out[gidy * block_count_x + gidx] = col * weight;
+
+  blocks[by * block_count_x + bx] = sum;
 }
 
+/* One work-group per block, for large blocks. The local size must be
+ * PIXELIZE_GROUP_SIZE.
+ */
+#define PIXELIZE_GROUP_SIZE 64
 
-#define NORM_MANHATTAN 0
-#define NORM_EUCLIDEAN 1
-#define NORM_INFINITY  2
-#define SQR(x)         ((x)*(x))
-
-__kernel void kernel_pixelize(__global float4 *in,
-                              __global float4 *out,
-                                       int     xsize,
-                                       int     ysize,
-                                       float   xratio,
-                                       float   yratio,
-                                       int     roi_x,
-                                       int     roi_y,
-                                       float4  bg_color,
-                                       int     norm,
-                                       int     block_count_x)
+__kernel __attribute__((reqd_work_group_size (PIXELIZE_GROUP_SIZE, 1, 1)))
+void pixelize_block_mean_wg (__global const float4 *in,
+                             __global       float4 *blocks,
+                                            int     in_x,
+                                            int     in_y,
+                                            int     in_width,
+                                            int     block_x,
+                                            int     block_y,
+                                            int     xsize,
+                                            int     ysize,
+                                            int4    bbox,
+                                            int     block_count_x)
 {
-  int gidx = get_global_id(0);
-  int gidy = get_global_id(1);
+  __local float4 partial[PIXELIZE_GROUP_SIZE];
 
-  int src_width  = get_global_size(0);
-  int cx = block_index (gidx + roi_x, xsize) - block_index (roi_x, xsize);
-  int cy = block_index (gidy + roi_y, ysize) - block_index (roi_y, ysize);
+  int lid = get_local_id (0);
+  int bx  = get_group_id (0);
+  int by  = get_global_id (1);
 
-  float4 grid_color = in[cx + cy * block_count_x];
-  float4 out_color = bg_color;
+  int x0 = block_x + bx * xsize;
+  int y0 = block_y + by * ysize;
+  int x1 = clip_end (x0, xsize, bbox.s2);
+  int y1 = clip_end (y0, ysize, bbox.s3);
+  float4 sum = (float4) (0.0f);
+  int width, height;
+  int s;
 
-  int x_pos = gidx + roi_x;
-  int y_pos = gidy + roi_y;
+  x0 = max (x0, bbox.s0);
+  y0 = max (y0, bbox.s1);
+  width  = x1 - x0;
+  height = y1 - y0;
 
-  int rect_shape_width  = ceil (xsize * xratio);
-  int rect_shape_height = ceil (ysize * yratio);
+  if (width > 0 && height > 0)
+    {
+      /* walk the block in row-major order, PIXELIZE_GROUP_SIZE pixels
+       * apart, so neighbouring work-items read neighbouring pixels
+       */
+      int step_y = PIXELIZE_GROUP_SIZE / width;
+      int step_x = PIXELIZE_GROUP_SIZE - step_y * width;
+      int i = lid % width;
+      int j = lid / width;
 
-  int off_shape_x = floor ((xsize - xratio * xsize) / 2.0f);
-  int off_shape_y = floor ((ysize - yratio * ysize) / 2.0f);
+      __global const float4 *base = in + (y0 - in_y) * in_width + (x0 - in_x);
 
-  int start_x = block_index (x_pos, xsize) * xsize - roi_x;
-  int start_y = block_index (y_pos, ysize) * ysize - roi_y;
+      while (j < height)
+        {
+          sum += base[j * in_width + i];
 
-  float shape_area = rect_shape_width * rect_shape_height;
+          i += step_x;
+          j += step_y;
+          if (i >= width)
+            {
+              i -= width;
+              j++;
+            }
+        }
+    }
 
-  float center_x = start_x + off_shape_x + (float)(rect_shape_width)  / 2.0f;
-  float center_y = start_y + off_shape_y + (float)(rect_shape_height) / 2.0f;
+  partial[lid] = sum;
+  barrier (CLK_LOCAL_MEM_FENCE);
 
-  if (norm == NORM_MANHATTAN &&
-      (fabs (gidx - center_x) * rect_shape_height +
-       fabs (gidy - center_y) * rect_shape_width
-       < shape_area))
-    out_color = grid_color;
+  for (s = PIXELIZE_GROUP_SIZE / 2; s > 0; s >>= 1)
+    {
+      if (lid < s)
+        partial[lid] += partial[lid + s];
+      barrier (CLK_LOCAL_MEM_FENCE);
+    }
 
-  if (norm == NORM_EUCLIDEAN &&
-      SQR ((gidx - center_x) / (float)rect_shape_width) +
-      SQR ((gidy - center_y) / (float)rect_shape_height) <= 1.0f)
-    out_color = grid_color;
+  if (lid == 0)
+    blocks[by * block_count_x + bx] =
+      width > 0 && height > 0 ? partial[0] / (float) (width * height)
+                              : (float4) (0.0f);
+}
 
-  if (norm == NORM_INFINITY &&
-      (gidx >= start_x + off_shape_x &&
-       gidy >= start_y + off_shape_y &&
-       gidx < start_x + off_shape_x + rect_shape_width &&
-       gidy < start_y + off_shape_y + rect_shape_height))
-      out_color = grid_color;
+/* Fill the output.  For each output column, columns.x is its block
+ * column, or -1 when the column is outside the bounding box, and
+ * columns.y is its position inside the block.  For each output row,
+ * rows.x is its block row, or -1 when the row is outside the bounding
+ * box, and pixels whose position inside the block lies in
+ * [rows.y, rows.z) are inside the block's shape.  The tables are
+ * computed on the host with the same arithmetic as the CPU path.
+ */
+__kernel void pixelize_fill (__global const float4 *blocks,
+                             __global       float4 *out,
+                             __global const int2   *columns,
+                             __global const int4   *rows,
+                                            float4  bg_color,
+                                            int     block_count_x,
+                                            int     width)
+{
+  int x = get_global_id (0);
+  int y = get_global_id (1);
 
-  out[gidx + gidy * src_width] = out_color;
+  int2   column = columns[x];
+  int4   row    = rows[y];
+  float4 color  = bg_color;
+
+  if (column.x >= 0 && row.x >= 0 &&
+      column.y >= row.y && column.y < row.z)
+    color = blocks[row.x * block_count_x + column.x];
+
+  out[y * width + x] = color;
 }
