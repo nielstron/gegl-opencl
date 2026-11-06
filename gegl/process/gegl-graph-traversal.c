@@ -427,6 +427,27 @@ GeglBuffer *
 gegl_graph_process (GeglGraphTraversal *path,
                     gint                level)
 {
+  return gegl_graph_process_into (path, level, NULL, NULL);
+}
+
+/**
+ * gegl_graph_process_into:
+ * @path: The traversal path
+ * @level: mipmap level to render at
+ * @target_node: (nullable): node whose output should go to @target
+ * @target: (nullable): buffer @target_node should render into, if it can
+ *
+ * Like gegl_graph_process(), but suggests @target as the output buffer of
+ * @target_node.  The operation is free to produce its output elsewhere
+ * (for example when processing in place, or when passing its input
+ * through), so callers must compare the returned buffer against @target.
+ */
+GeglBuffer *
+gegl_graph_process_into (GeglGraphTraversal *path,
+                         gint                level,
+                         GeglNode           *target_node,
+                         GeglBuffer         *target)
+{
   GList *list_iter = NULL;
   GeglBuffer *result = NULL;
   GeglOperationContext *context = NULL;
@@ -480,10 +501,14 @@ gegl_graph_process (GeglGraphTraversal *path,
 
               context->level = level;
 
+              if (target && node == target_node)
+                context->target = target;
+
               /* note: this hard-coding of "output" makes some more custom
                * graph topologies harder than necessary.
                */
               gegl_operation_process (operation, context, "output", &context->need_rect, context->level);
+              context->target = NULL;
               operation_result = GEGL_BUFFER (gegl_operation_context_get_object (context, "output"));
 
               if (operation_result && operation_result == (GeglBuffer *)operation->node->cache)

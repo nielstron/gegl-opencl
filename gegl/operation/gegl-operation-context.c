@@ -326,8 +326,15 @@ gegl_operation_context_get_target (GeglOperationContext *context,
 
   result = &context->result_rect;
 
-  if (result->width == 0 ||
-      result->height == 0)
+  if (context->target &&
+      result->width > 0 && result->height > 0 &&
+      gegl_rectangle_contains (gegl_buffer_get_extent (context->target),
+                               result))
+    {
+      output = g_object_ref (context->target);
+    }
+  else if (result->width == 0 ||
+           result->height == 0)
     {
       if (linear_buffers)
         output = gegl_buffer_linear_new (GEGL_RECTANGLE(0, 0, 0, 0), format);
@@ -389,6 +396,7 @@ gegl_operation_context_get_output_maybe_in_place (GeglOperation *operation,
   GeglBuffer *output;
 
   if (klass->want_in_place                    &&
+      ! context->target                       &&
       ! gegl_node_use_cache (operation->node) &&
       gegl_can_do_inplace_processing (operation, input, roi))
     {

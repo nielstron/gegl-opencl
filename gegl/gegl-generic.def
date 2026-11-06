@@ -332,6 +332,7 @@ EXPORTS
   gegl_downscale_2x2_get_fun_generic
   gegl_downscale_2x2_nearest_generic
   gegl_eval_manager_apply
+  gegl_eval_manager_apply_into
   gegl_eval_manager_get_bounding_box
   gegl_eval_manager_get_type
   gegl_eval_manager_new
@@ -360,6 +361,7 @@ EXPORTS
   gegl_graph_prepare
   gegl_graph_prepare_request
   gegl_graph_process
+  gegl_graph_process_into
   gegl_graph_rebuild
   gegl_has_operation
   gegl_init

@@ -46,6 +46,9 @@
 #include "operation/gegl-operation-context-private.h"
 #include "operation/gegl-operations-private.h"
 #include "operation/gegl-operation-meta.h"
+#include "operation/gegl-operation-point-composer.h"
+#include "operation/gegl-operation-point-composer3.h"
+#include "operation/gegl-operation-point-filter.h"
 
 #include "process/gegl-eval-manager-private.h"
 
@@ -1211,6 +1214,112 @@ gegl_node_blit_buffer (GeglNode            *self,
     }
 }
 
+/* Whether the operation has an OpenCL implementation */
+static gboolean
+gegl_node_operation_has_opencl (GeglOperation *operation)
+{
+  GeglOperationClass *klass = GEGL_OPERATION_GET_CLASS (operation);
+
+  /* cl_data is built from the "cl-source" key when preparing */
+  if (klass->opencl_support || klass->cl_data)
+    return TRUE;
+
+  if (GEGL_IS_OPERATION_POINT_FILTER (operation))
+    return GEGL_OPERATION_POINT_FILTER_GET_CLASS (operation)->cl_process != NULL;
+  if (GEGL_IS_OPERATION_POINT_COMPOSER (operation))
+    return GEGL_OPERATION_POINT_COMPOSER_GET_CLASS (operation)->cl_process != NULL;
+  if (GEGL_IS_OPERATION_POINT_COMPOSER3 (operation))
+    return GEGL_OPERATION_POINT_COMPOSER3_GET_CLASS (operation)->cl_process != NULL;
+
+  return FALSE;
+}
+
+/* The node whose output a node delivers: the node itself, or for a graph
+ * (such as a meta-operation) the node connected to its output proxy, as
+ * long as nothing else consumes that node's output.
+ */
+static GeglNode *
+gegl_node_get_output_producer (GeglNode *node)
+{
+  gint depth;
+
+  for (depth = 0; node && node->is_graph; depth++)
+    {
+      GeglPad  *pad = gegl_node_get_pad (node, "output");
+      GeglNode *proxy;
+
+      if (! pad || depth > 16)
+        return NULL;
+
+      proxy = gegl_pad_get_node (pad);
+      if (! proxy || proxy == node)
+        return NULL;
+
+      node = gegl_node_get_producer (proxy, "input", NULL);
+
+      if (node && gegl_node_get_consumers (node, "output", NULL, NULL) != 1)
+        return NULL;
+    }
+
+  return node;
+}
+
+/* For an operation that runs on OpenCL, rendering straight into the
+ * caller's memory lets the OpenCL buffer iterator convert to the requested
+ * format on the GPU (or at least skip an intermediate copy), instead of
+ * storing the result in the operation's working format and converting it
+ * on the CPU afterwards.
+ */
+static GeglBuffer *
+gegl_node_blit_direct_target (GeglNode            *self,
+                              const GeglRectangle *roi,
+                              const Babl          *format,
+                              gpointer             destination_buf,
+                              gint                 rowstride,
+                              GeglNode           **target_node)
+{
+  GeglOperation *operation;
+  GeglNode      *node;
+  GeglRectangle  bbox;
+  gint           bpp;
+
+  bpp = babl_format_get_bytes_per_pixel (format);
+  if (rowstride <= 0 || rowstride % bpp != 0 || rowstride / bpp < roi->width)
+    return NULL;
+
+  /* a default blit only caches when the graph explicitly asks for it,
+   * leave such nodes alone
+   */
+  if (self->cache_policy == GEGL_CACHE_POLICY_ALWAYS)
+    return NULL;
+
+  gegl_eval_manager_prepare (gegl_node_get_eval_manager (self));
+
+  node = gegl_node_get_output_producer (self);
+  if (! node || ! node->operation || node->inert ||
+      node->cache_policy == GEGL_CACHE_POLICY_ALWAYS)
+    return NULL;
+
+  operation = node->operation;
+
+  if (! gegl_operation_use_opencl (operation)       ||
+      ! gegl_node_operation_has_opencl (operation) ||
+      ! gegl_operation_get_format (operation, "output"))
+    return NULL;
+
+  /* the whole destination must be produced by the operation, as the
+   * buffer is not cleared beforehand
+   */
+  bbox = gegl_node_get_bounding_box (node);
+  if (! gegl_rectangle_contains (&bbox, roi))
+    return NULL;
+
+  *target_node = node;
+
+  return gegl_buffer_linear_new_from_data (destination_buf, format, roi,
+                                           rowstride, NULL, NULL);
+}
+
 static inline gboolean gegl_mipmap_rendering_enabled (void)
 {
   return gegl_config()->mipmap_rendering;
@@ -1247,7 +1356,27 @@ gegl_node_blit (GeglNode            *self,
         }
       else
         {
-          buffer = gegl_node_apply_roi (self, roi, 0);
+          GeglBuffer *target      = NULL;
+          GeglNode   *target_node = NULL;
+
+          if (destination_buf && format)
+            target = gegl_node_blit_direct_target (self, roi, format,
+                                                   destination_buf, rowstride,
+                                                   &target_node);
+
+          if (target)
+            {
+              buffer = gegl_eval_manager_apply_into (gegl_node_get_eval_manager (self),
+                                                     roi, 0,
+                                                     target_node, target);
+              if (buffer == target)
+                g_clear_object (&buffer);
+              g_object_unref (target);
+            }
+          else
+            {
+              buffer = gegl_node_apply_roi (self, roi, 0);
+            }
         }
       if (buffer && destination_buf)
         gegl_buffer_get (buffer, roi, scale, format, destination_buf, rowstride, GEGL_ABYSS_NONE | interpolation);
