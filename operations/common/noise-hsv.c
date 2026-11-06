@@ -48,6 +48,7 @@ property_seed   (seed, _("Random seed"), rand)
 #include "gegl-op.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static gfloat
 randomize_value (gfloat      now,
@@ -96,21 +97,56 @@ randomize_value (gfloat      now,
   return new_val;
 }
 
+static gboolean
+use_rgb_format (GeglOperation *operation,
+                const Babl    *space,
+                const Babl    *source_format)
+{
+  const char *model;
+
+  /* babl's HSV model is computed on sRGB-TRC encoded values, which equal
+   * R'G'B' only for spaces with the sRGB TRC.  In that case the OpenCL
+   * path works on R'G'B'A float, which GEGL can convert on the GPU, and
+   * converts to and from HSV in the kernel.
+   *
+   * Only do so for R'G'B' and Y' sources, though.  babl converts other
+   * sources, like linear or premultiplied ones, to HSV without going
+   * through R'G'B'A float, and for nearly gray pixels the hue depends on
+   * the rounding of the path taken (see cl_noise_hsv_rgb).
+   */
+  if (! gegl_operation_use_opencl (operation) ||
+      ! (space == NULL || space == babl_space ("sRGB")) ||
+      ! source_format)
+    return FALSE;
+
+  model = babl_get_name (babl_format_get_model (source_format));
+
+  return ! strcmp (model, "R'G'B'A") || ! strcmp (model, "R'G'B'") ||
+         ! strcmp (model, "Y'A")     || ! strcmp (model, "Y'");
+}
+
 static void
 prepare (GeglOperation *operation)
 {
-  const Babl *space = gegl_operation_get_source_space (operation, "input");
-  gegl_operation_set_format (operation, "input", babl_format_with_space ("HSVA float", space));
-  gegl_operation_set_format (operation, "output", babl_format_with_space ("HSVA float", space));
+  const Babl *space  = gegl_operation_get_source_space (operation, "input");
+  const Babl *source = gegl_operation_get_source_format (operation, "input");
+  const Babl *format;
+
+  if (use_rgb_format (operation, space, source))
+    format = babl_format ("R'G'B'A float");
+  else
+    format = babl_format_with_space ("HSVA float", space);
+
+  gegl_operation_set_format (operation, "input", format);
+  gegl_operation_set_format (operation, "output", format);
 }
 
-static gboolean
-process (GeglOperation       *operation,
-         void                *in_buf,
-         void                *out_buf,
-         glong                n_pixels,
-         const GeglRectangle *roi,
-         gint                 level)
+static void
+process_hsva (GeglOperation       *operation,
+              gfloat              *in_buf,
+              gfloat              *out_buf,
+              glong                n_pixels,
+              const GeglRectangle *roi)
 {
   GeglProperties *o  = GEGL_PROPERTIES (operation);
   GeglRectangle whole_region;
@@ -175,6 +211,44 @@ process (GeglOperation       *operation,
         y++;
       }
   }
+}
+
+/* R'G'B'A float, chosen for the OpenCL path; work on HSVA with babl */
+static void
+process_rgba (GeglOperation       *operation,
+              const Babl          *format,
+              void                *in_buf,
+              void                *out_buf,
+              glong                n_pixels,
+              const GeglRectangle *roi)
+{
+  const Babl *hsva = babl_format_with_space ("HSVA float",
+                                             babl_format_get_space (format));
+  gfloat     *tmp  = gegl_malloc (sizeof (gfloat) * 4 * n_pixels);
+
+  babl_process (babl_fish (format, hsva), in_buf, tmp, n_pixels);
+  process_hsva (operation, tmp, tmp, n_pixels, roi);
+  babl_process (babl_fish (hsva, format), tmp, out_buf, n_pixels);
+
+  gegl_free (tmp);
+}
+
+static gboolean
+process (GeglOperation       *operation,
+         void                *in_buf,
+         void                *out_buf,
+         glong                n_pixels,
+         const GeglRectangle *roi,
+         gint                 level)
+{
+  const Babl *format = gegl_operation_get_format (operation, "input");
+  const Babl *hsva   = babl_format_with_space ("HSVA float",
+                                               babl_format_get_space (format));
+
+  if (format == hsva)
+    process_hsva (operation, in_buf, out_buf, n_pixels, roi);
+  else
+    process_rgba (operation, format, in_buf, out_buf, n_pixels, roi);
 
   return TRUE;
 }
@@ -195,8 +269,12 @@ cl_process (GeglOperation       *operation,
   GeglProperties *o = GEGL_PROPERTIES (operation);
   GeglRectangle *wr = gegl_operation_source_get_bounding_box (operation,
                                                               "input");
+  const Babl *format           = gegl_operation_get_format (operation, "input");
   cl_int      cl_err           = 0;
   cl_mem      cl_random_data   = NULL;
+  cl_mem      cl_fallback      = NULL;
+  cl_int      fallback         = 0;
+  cl_float    gray_threshold;
   cl_int      x_offset         = roi->x;
   cl_int      y_offset         = roi->y;
   cl_int      roi_width        = roi->width;
@@ -206,12 +284,13 @@ cl_process (GeglOperation       *operation,
   cl_float    hue_distance;
   cl_float    saturation_distance;
   cl_float    value_distance;
+  cl_kernel   kernel;
 
   gegl_cl_random_get_ushort4 (o->rand, &rand);
 
   if (!cl_data)
     {
-      const char *kernel_name[] = { "cl_noise_hsv", NULL };
+      const char *kernel_name[] = { "cl_noise_hsv", "cl_noise_hsv_rgb", NULL };
       cl_data = gegl_cl_compile_and_build (noise_hsv_cl_source, kernel_name);
     }
 
@@ -226,7 +305,39 @@ cl_process (GeglOperation       *operation,
   saturation_distance = o->saturation_distance;
   value_distance = o->value_distance;
 
-  gegl_cl_set_kernel_args (cl_data->kernel[0],
+  if (format == babl_format ("R'G'B'A float"))
+    kernel = cl_data->kernel[1];
+  else
+    kernel = cl_data->kernel[0];
+
+  if (kernel == cl_data->kernel[1])
+    {
+      /* babl's HSV conversion moves each channel by up to about 1e-6
+       * (relative, see cl_noise_hsv_rgb), so for a pixel with saturation
+       * s the hue babl computes differs from the kernel's by an amount
+       * proportional to 1 / s.  The output moves by that times the output
+       * chroma, which grows with saturation_distance.  With this
+       * threshold the difference stays around 0.05 on a 0-255 scale for
+       * any saturation_distance; pixels with a smaller saturation make
+       * the kernel ask for a CPU fallback.
+       */
+      gray_threshold = 1e-3 * saturation_distance;
+
+      cl_fallback = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                         CL_MEM_READ_WRITE |
+                                         CL_MEM_COPY_HOST_PTR,
+                                         sizeof (cl_int), &fallback, &cl_err);
+      CL_CHECK;
+
+      cl_err = gegl_clSetKernelArg (kernel, 12, sizeof (cl_float),
+                                    &gray_threshold);
+      CL_CHECK;
+      cl_err = gegl_clSetKernelArg (kernel, 13, sizeof (cl_mem),
+                                    &cl_fallback);
+      CL_CHECK;
+    }
+
+  gegl_cl_set_kernel_args (kernel,
                            sizeof(cl_mem),     &in,
                            sizeof(cl_mem),     &out,
                            sizeof(cl_mem),     &cl_random_data,
@@ -243,10 +354,45 @@ cl_process (GeglOperation       *operation,
 
   CL_CHECK;
   cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                        cl_data->kernel[0], 1,
+                                        kernel, 1,
                                         NULL, &global_worksize, NULL,
                                         0, NULL, NULL);
   CL_CHECK;
+
+  if (cl_fallback)
+    {
+      cl_err = gegl_clEnqueueReadBuffer (gegl_cl_get_command_queue (),
+                                         cl_fallback, CL_TRUE, 0,
+                                         sizeof (cl_int), &fallback,
+                                         0, NULL, NULL);
+      CL_CHECK;
+
+      if (fallback)
+        {
+          /* nearly gray pixels; redo this part with babl, like process() */
+          size_t  size = global_worksize * 4 * sizeof (cl_float);
+          gfloat *buf  = gegl_malloc (size);
+
+          cl_err = gegl_clEnqueueReadBuffer (gegl_cl_get_command_queue (),
+                                             in, CL_TRUE, 0, size, buf,
+                                             0, NULL, NULL);
+          if (cl_err == CL_SUCCESS)
+            {
+              process_rgba (operation, format, buf, buf,
+                            global_worksize, roi);
+
+              cl_err = gegl_clEnqueueWriteBuffer (gegl_cl_get_command_queue (),
+                                                  out, CL_TRUE, 0, size, buf,
+                                                  0, NULL, NULL);
+            }
+
+          gegl_free (buf);
+          CL_CHECK;
+        }
+
+      gegl_clReleaseMemObject (cl_fallback);
+      cl_fallback = NULL;
+    }
 
   cl_err = gegl_clFinish (gegl_cl_get_command_queue ());
   CL_CHECK;
@@ -254,6 +400,9 @@ cl_process (GeglOperation       *operation,
   return  FALSE;
 
 error:
+  if (cl_fallback)
+    gegl_clReleaseMemObject (cl_fallback);
+
   return TRUE;
 }
 
