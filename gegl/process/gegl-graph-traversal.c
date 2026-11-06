@@ -41,6 +41,7 @@
 #include "operation/gegl-operation.h"
 #include "operation/gegl-operation-context.h"
 #include "operation/gegl-operation-context-private.h"
+#include "buffer/gegl-buffer-private.h"
 
 typedef struct
 {
@@ -409,6 +410,42 @@ gegl_graph_get_shared_empty (GeglGraphTraversal *path)
 }
 
 
+/* The buffer the operation of @context can render into in place of
+ * @target: @target itself, or, if it may share memory with one of the
+ * operation's inputs, a new buffer of the same extent and format, so that
+ * the inputs are not overwritten while the operation still reads them.
+ * The operation can, for example, read the input around a part of the
+ * output only after writing the previous part.
+ */
+static GeglBuffer *
+gegl_graph_get_safe_target (GeglOperationContext *context,
+                            GeglBuffer           *target)
+{
+  GSList *iter;
+
+  for (iter = gegl_node_get_input_pads (context->operation->node);
+       iter;
+       iter = iter->next)
+    {
+      const gchar *name  = gegl_pad_get_name (iter->data);
+      GObject     *input = gegl_operation_context_get_object (context, name);
+
+      if (GEGL_IS_BUFFER (input) &&
+          gegl_buffer_may_share_memory (GEGL_BUFFER (input), target))
+        {
+          GEGL_NOTE (GEGL_DEBUG_PROCESS,
+                     "%s: blit destination may alias input \"%s\"",
+                     gegl_node_get_debug_name (context->operation->node),
+                     name);
+
+          return gegl_buffer_linear_new (gegl_buffer_get_extent (target),
+                                         gegl_buffer_get_format (target));
+        }
+    }
+
+  return target;
+}
+
 /**
  * gegl_graph_process:
  * @path: The traversal path
@@ -502,12 +539,14 @@ gegl_graph_process_into (GeglGraphTraversal *path,
               context->level = level;
 
               if (target && node == target_node)
-                context->target = target;
+                context->target = gegl_graph_get_safe_target (context, target);
 
               /* note: this hard-coding of "output" makes some more custom
                * graph topologies harder than necessary.
                */
               gegl_operation_process (operation, context, "output", &context->need_rect, context->level);
+              if (context->target != target)
+                g_clear_object (&context->target);
               context->target = NULL;
               operation_result = GEGL_BUFFER (gegl_operation_context_get_object (context, "output"));
 
