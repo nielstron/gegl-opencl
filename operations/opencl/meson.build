@@ -8,6 +8,7 @@ gegl_operations_opencl_sources = [
   'boxblur-1d.cl',
   'brightness-contrast.cl',
   'c2g.cl',
+  'cartoon.cl',
   'checkerboard.cl',
   'color-exchange.cl',
   'color-temperature.cl',
