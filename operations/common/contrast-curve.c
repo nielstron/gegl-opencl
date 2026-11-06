@@ -118,8 +118,9 @@ cl_process (GeglOperation       *self,
 
       if (sizeof (cl_float) * num_sampling_points < cl_max_constant_size)
         {
+          /* copy the curve, it is freed right after the kernel ran */
           cl_curve = gegl_clCreateBuffer (gegl_cl_get_context (),
-                                          CL_MEM_USE_HOST_PTR | CL_MEM_READ_ONLY,
+                                          CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
                                           num_sampling_points * sizeof (cl_float),
                                           ysf, &cl_err);
           CL_CHECK;
