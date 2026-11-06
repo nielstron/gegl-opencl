@@ -21,16 +21,12 @@
  *
  * gegl-cl-color.c prepends a header, generated from babl at runtime, that
  * defines BABL_LUMINANCE_RED / _GREEN / _BLUE, babl's u8 -> float table
- * babl_u8_to_float[256] and, for each kernel below that converts to RGB, a
- * table <kernel name>_lut[256] holding babl's result of converting each
- * 8-bit value to linear light.  babl picks between implementations of the
- * same conversion (single or double precision) at runtime, so the tables
- * are taken from the very conversion the CPU path would use.
- *
- * The table used for YA can not be recovered from babl's result, so there
- * are variants for the single (gamma_u8_lut_f) and double precision
- * (gamma_u8_lut_d) tables and the luminance code of babl/base and of
- * extensions/grey.c, and gegl-cl-color.c picks the one that matches babl.
+ * babl_u8_to_float[256] and babl's two tables for converting 8-bit sRGB to
+ * linear light, computed in single (gamma_u8_lut_f) and double precision
+ * (gamma_u8_lut_d).  babl picks between implementations of the same
+ * conversion at runtime, so each kernel has a variant for each table (and
+ * for YA for the luminance code of babl/base and of extensions/grey.c),
+ * and gegl-cl-color.c picks the one that matches babl.
  */
 
 #pragma OPENCL FP_CONTRACT OFF
@@ -64,30 +60,38 @@ float luminance_grey (float r, float g, float b)
 }
 
 /* R'G'B' u8 -> RGBA float */
-__kernel void rgb_gamma_u8_to_rgbaf (__global const uchar  * in,
-                                     __global       float4 * out)
-{
-  int gid = get_global_id(0);
-
-  float r = rgb_gamma_u8_to_rgbaf_lut[in[3 * gid + 0]];
-  float g = rgb_gamma_u8_to_rgbaf_lut[in[3 * gid + 1]];
-  float b = rgb_gamma_u8_to_rgbaf_lut[in[3 * gid + 2]];
-
-  out[gid] = (float4) (r, g, b, 1.0f);
+#define RGB_GAMMA_U8_TO_RGBAF(name, lut)                            \
+__kernel void name (__global const uchar  * in,                     \
+                    __global       float4 * out)                    \
+{                                                                   \
+  int gid = get_global_id(0);                                       \
+                                                                    \
+  float r = lut[in[3 * gid + 0]];                                   \
+  float g = lut[in[3 * gid + 1]];                                   \
+  float b = lut[in[3 * gid + 2]];                                   \
+                                                                    \
+  out[gid] = (float4) (r, g, b, 1.0f);                              \
 }
+
+RGB_GAMMA_U8_TO_RGBAF (rgb_gamma_u8_to_rgbaf, gamma_u8_lut_f)
+RGB_GAMMA_U8_TO_RGBAF (rgb_gamma_u8_to_rgbaf_d, gamma_u8_lut_d)
 
 /* R'G'B' u8 -> RaGaBaA float */
-__kernel void rgb_gamma_u8_to_ragabaf (__global const uchar  * in,
-                                       __global       float4 * out)
-{
-  int gid = get_global_id(0);
-
-  float r = rgb_gamma_u8_to_ragabaf_lut[in[3 * gid + 0]];
-  float g = rgb_gamma_u8_to_ragabaf_lut[in[3 * gid + 1]];
-  float b = rgb_gamma_u8_to_ragabaf_lut[in[3 * gid + 2]];
-
-  out[gid] = (float4) (r, g, b, 1.0f);
+#define RGB_GAMMA_U8_TO_RAGABAF(name, lut)                          \
+__kernel void name (__global const uchar  * in,                     \
+                    __global       float4 * out)                    \
+{                                                                   \
+  int gid = get_global_id(0);                                       \
+                                                                    \
+  float r = lut[in[3 * gid + 0]];                                   \
+  float g = lut[in[3 * gid + 1]];                                   \
+  float b = lut[in[3 * gid + 2]];                                   \
+                                                                    \
+  out[gid] = (float4) (r, g, b, 1.0f);                              \
 }
+
+RGB_GAMMA_U8_TO_RAGABAF (rgb_gamma_u8_to_ragabaf, gamma_u8_lut_f)
+RGB_GAMMA_U8_TO_RAGABAF (rgb_gamma_u8_to_ragabaf_d, gamma_u8_lut_d)
 
 /* R'G'B' u8 -> YA float */
 #define RGB_GAMMA_U8_TO_YAF(name, lut, luminance)                   \
@@ -109,38 +113,46 @@ RGB_GAMMA_U8_TO_YAF (rgb_gamma_u8_to_yaf_d, gamma_u8_lut_d, luminance)
 RGB_GAMMA_U8_TO_YAF (rgb_gamma_u8_to_yaf_d_grey, gamma_u8_lut_d, luminance_grey)
 
 /* R'G'B'A u8 -> RGBA float */
-__kernel void rgba_gamma_u8_to_rgbaf (__global const uchar4 * in,
-                                      __global       float4 * out)
-{
-  int gid = get_global_id(0);
-  uchar4 in_v = in[gid];
-
-  float r = rgba_gamma_u8_to_rgbaf_lut[in_v.x];
-  float g = rgba_gamma_u8_to_rgbaf_lut[in_v.y];
-  float b = rgba_gamma_u8_to_rgbaf_lut[in_v.z];
-
-  out[gid] = (float4) (r, g, b, babl_u8_to_float[in_v.w]);
+#define RGBA_GAMMA_U8_TO_RGBAF(name, lut)                           \
+__kernel void name (__global const uchar4 * in,                     \
+                    __global       float4 * out)                    \
+{                                                                   \
+  int gid = get_global_id(0);                                       \
+  uchar4 in_v = in[gid];                                            \
+                                                                    \
+  float r = lut[in_v.x];                                            \
+  float g = lut[in_v.y];                                            \
+  float b = lut[in_v.z];                                            \
+                                                                    \
+  out[gid] = (float4) (r, g, b, babl_u8_to_float[in_v.w]);          \
 }
+
+RGBA_GAMMA_U8_TO_RGBAF (rgba_gamma_u8_to_rgbaf, gamma_u8_lut_f)
+RGBA_GAMMA_U8_TO_RGBAF (rgba_gamma_u8_to_rgbaf_d, gamma_u8_lut_d)
 
 /* R'G'B'A u8 -> RaGaBaA float */
-__kernel void rgba_gamma_u8_to_ragabaf (__global const uchar4 * in,
-                                        __global       float4 * out)
-{
-  int gid = get_global_id(0);
-  uchar4 in_v  = in[gid];
-  float4 out_v;
-  float4 tmp_v;
-
-  tmp_v = (float4)(rgba_gamma_u8_to_ragabaf_lut[in_v.x],
-                   rgba_gamma_u8_to_ragabaf_lut[in_v.y],
-                   rgba_gamma_u8_to_ragabaf_lut[in_v.z],
-                   babl_u8_to_float[in_v.w]);
-
-  out_v   = tmp_v * babl_epsilon_for_zero (tmp_v.w);
-  out_v.w = tmp_v.w;
-
-  out[gid] = out_v;
+#define RGBA_GAMMA_U8_TO_RAGABAF(name, lut)                         \
+__kernel void name (__global const uchar4 * in,                     \
+                    __global       float4 * out)                    \
+{                                                                   \
+  int gid = get_global_id(0);                                       \
+  uchar4 in_v  = in[gid];                                           \
+  float4 out_v;                                                     \
+  float4 tmp_v;                                                     \
+                                                                    \
+  tmp_v = (float4)(lut[in_v.x],                                     \
+                   lut[in_v.y],                                     \
+                   lut[in_v.z],                                     \
+                   babl_u8_to_float[in_v.w]);                       \
+                                                                    \
+  out_v   = tmp_v * babl_epsilon_for_zero (tmp_v.w);                \
+  out_v.w = tmp_v.w;                                                \
+                                                                    \
+  out[gid] = out_v;                                                 \
 }
+
+RGBA_GAMMA_U8_TO_RAGABAF (rgba_gamma_u8_to_ragabaf, gamma_u8_lut_f)
+RGBA_GAMMA_U8_TO_RAGABAF (rgba_gamma_u8_to_ragabaf_d, gamma_u8_lut_d)
 
 /* R'G'B'A u8 -> YA float */
 #define RGBA_GAMMA_U8_TO_YAF(name, lut, luminance)                  \

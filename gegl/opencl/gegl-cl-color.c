@@ -230,13 +230,16 @@ make_probe_pixels (const Babl *format,
 /* babl picks between conversion paths at runtime, by measuring their speed,
  * and the paths can differ in the last bit.  Run each kernel variant on
  * probe pixels and keep the one closest to what babl computes.
+ *
+ * This is done on first use rather than when the kernels are compiled:
+ * babl builds a 2^24-entry lookup table the first time it is asked for some
+ * conversions from 8-bit formats (if it has converted enough pixels with
+ * them before, counting earlier runs), which costs a lot of time and memory
+ * at startup for conversions that may never be used on the GPU.
  */
 static void
-pick_variant (gpointer key,
-              gpointer value,
-              gpointer user_data)
+pick_variant (ColorConversionInfo *info)
 {
-  ColorConversionInfo *info    = value;
   gint                 in_bpp  = babl_format_get_bytes_per_pixel (info->from_fmt);
   gint                 out_bpp = babl_format_get_bytes_per_pixel (info->to_fmt);
   guint8              *in;
@@ -246,6 +249,7 @@ pick_variant (gpointer key,
   cl_mem               out_tex = NULL;
   gint                 best_mismatches = G_MAXINT;
   cl_int               cl_err = 0;
+  GArray              *variants;
 
   if (! info->variants)
     return;
@@ -303,12 +307,15 @@ error:
   g_free (ref);
   g_free (out);
 
-  g_array_free (info->variants, TRUE);
-  info->variants = NULL;
+  variants = info->variants;
+  g_atomic_pointer_set (&info->variants, NULL);
+  g_array_free (variants, TRUE);
 }
 
 /* Converts each 8-bit value from @from to @to with babl, alpha opaque, and
- * stores the first output component of each in @table.
+ * stores the first output component of each in @table.  Only use this with
+ * single channel formats: for some formats with more channels, babl builds
+ * a 2^24-entry lookup table on first use.
  */
 static void
 babl_u8_table (const gchar *from,
@@ -361,18 +368,6 @@ append_table (GString      *source,
   g_string_append (source, "};\n\n");
 }
 
-static void
-append_u8_table (GString     *source,
-                 const gchar *name,
-                 const gchar *from,
-                 const gchar *to)
-{
-  gfloat table[256];
-
-  babl_u8_table (from, to, table);
-  append_table (source, name, table);
-}
-
 /* The two 8-bit sRGB to linear tables babl has: computed in single
  * precision (extensions/gimp-8bit.c) and in double precision
  * (extensions/gegl-fixups.c).
@@ -412,6 +407,9 @@ babl_kernel_header (void)
   GString             *header    = g_string_new (NULL);
   cl_device_fp_config  fp_config = 0;
   double               lum[3];
+  gfloat               u8[256];
+  gfloat               table[256];
+  gfloat               rgba[256 * 4];
 
   babl_space_get_rgb_luminance (babl_format_get_space (babl_format ("RGBA float")),
                                 &lum[0], &lum[1], &lum[2]);
@@ -424,9 +422,20 @@ babl_kernel_header (void)
   append_float (header, lum[2]);
   g_string_append (header, "\n\n");
 
-  append_u8_table (header, "babl_u8_to_float", "Y u8", "Y float");
-  append_u8_table (header, "rgbau8_to_rgba_gamma_f_lut",
-                   "RGBA u8", "R'G'B'A float");
+  babl_u8_table ("Y u8", "Y float", u8);
+  append_table (header, "babl_u8_to_float", u8);
+
+  /* babl converts RGBA u8 to R'G'B'A float through RGBA float.  Do the
+   * same, rather than converting from RGBA u8 directly, for which babl
+   * would build a 2^24-entry lookup table.
+   */
+  for (gint i = 0; i < 256; i++)
+    for (gint c = 0; c < 4; c++)
+      rgba[i * 4 + c] = (c == 3) ? 1.0f : u8[i];
+  babl_process (babl_fish ("RGBA float", "R'G'B'A float"), rgba, rgba, 256);
+  for (gint i = 0; i < 256; i++)
+    table[i] = rgba[i * 4];
+  append_table (header, "rgbau8_to_rgba_gamma_f_lut", table);
 
   /* gegl_cl_compile_and_build () passes -cl-fp32-correctly-rounded-divide-sqrt
    * when the device supports it.
@@ -509,13 +518,17 @@ gegl_cl_color_compile_kernels (void)
 
   ColorConversionInfo lut8_conversions[] = {
     { babl_format ("R'G'B'A u8"), babl_format("RGBA float"), "rgba_gamma_u8_to_rgbaf", NULL },
+    { babl_format ("R'G'B'A u8"), babl_format("RGBA float"), "rgba_gamma_u8_to_rgbaf_d", NULL },
     { babl_format ("R'G'B'A u8"), babl_format("RaGaBaA float"), "rgba_gamma_u8_to_ragabaf", NULL },
+    { babl_format ("R'G'B'A u8"), babl_format("RaGaBaA float"), "rgba_gamma_u8_to_ragabaf_d", NULL },
     { babl_format ("R'G'B'A u8"), babl_format("YA float"), "rgba_gamma_u8_to_yaf", NULL },
     { babl_format ("R'G'B'A u8"), babl_format("YA float"), "rgba_gamma_u8_to_yaf_grey", NULL },
     { babl_format ("R'G'B'A u8"), babl_format("YA float"), "rgba_gamma_u8_to_yaf_d", NULL },
     { babl_format ("R'G'B'A u8"), babl_format("YA float"), "rgba_gamma_u8_to_yaf_d_grey", NULL },
     { babl_format ("R'G'B' u8"), babl_format("RGBA float"), "rgb_gamma_u8_to_rgbaf", NULL },
+    { babl_format ("R'G'B' u8"), babl_format("RGBA float"), "rgb_gamma_u8_to_rgbaf_d", NULL },
     { babl_format ("R'G'B' u8"), babl_format("RaGaBaA float"), "rgb_gamma_u8_to_ragabaf", NULL },
+    { babl_format ("R'G'B' u8"), babl_format("RaGaBaA float"), "rgb_gamma_u8_to_ragabaf_d", NULL },
     { babl_format ("R'G'B' u8"), babl_format("YA float"), "rgb_gamma_u8_to_yaf", NULL },
     { babl_format ("R'G'B' u8"), babl_format("YA float"), "rgb_gamma_u8_to_yaf_grey", NULL },
     { babl_format ("R'G'B' u8"), babl_format("YA float"), "rgb_gamma_u8_to_yaf_d", NULL },
@@ -535,20 +548,6 @@ gegl_cl_color_compile_kernels (void)
   g_string_append (float_source, colors_cl_source);
 
   lut8_source = babl_kernel_header ();
-  for (gint i = 0; i < G_N_ELEMENTS (lut8_conversions); i++)
-    {
-      const gchar *from = babl_get_name (lut8_conversions[i].from_fmt);
-      const gchar *to   = babl_get_name (lut8_conversions[i].to_fmt);
-      gchar       *name;
-
-      /* For YA the table can not be recovered from the result */
-      if (lut8_conversions[i].to_fmt == babl_format ("YA float"))
-        continue;
-
-      name = g_strconcat (lut8_conversions[i].kernel_name, "_lut", NULL);
-      append_u8_table (lut8_source, name, from, to);
-      g_free (name);
-    }
   append_gamma_u8_tables (lut8_source);
   g_string_append (lut8_source, colors_8bit_lut_cl_source);
 
@@ -571,8 +570,6 @@ gegl_cl_color_compile_kernels (void)
   g_string_free (float_source, TRUE);
   g_string_free (lut8_source, TRUE);
 
-  g_hash_table_foreach (color_kernels_hash, pick_variant, NULL);
-
   if (!lut8_kernels)
     {
       g_warning ("OpenCL Failed to compile color conversions (lut8_kernels)");
@@ -582,16 +579,34 @@ gegl_cl_color_compile_kernels (void)
   return result;
 }
 
+static ColorConversionInfo *
+find_color_conversion (const Babl *in_format,
+                       const Babl *out_format)
+{
+  ColorConversionInfo search = { in_format, out_format, NULL, NULL };
+
+  return g_hash_table_lookup (color_kernels_hash, &search);
+}
+
 static cl_kernel
 find_color_kernel (const Babl *in_format,
                    const Babl *out_format)
 {
-  ColorConversionInfo *info;
-  ColorConversionInfo search = { in_format, out_format, NULL, NULL };
-  info = g_hash_table_lookup (color_kernels_hash, &search);
-  if (info)
-    return info->kernel;
-  return NULL;
+  static GMutex        mutex;
+  ColorConversionInfo *info = find_color_conversion (in_format, out_format);
+
+  if (! info)
+    return NULL;
+
+  if (g_atomic_pointer_get (&info->variants))
+    {
+      g_mutex_lock (&mutex);
+      if (info->variants)
+        pick_variant (info);
+      g_mutex_unlock (&mutex);
+    }
+
+  return info->kernel;
 }
 
 gboolean
@@ -611,7 +626,7 @@ gegl_cl_color_supported (const Babl *in_format,
   if (in_format == out_format)
     return GEGL_CL_COLOR_EQUAL;
 
-  if (color_kernels_hash && find_color_kernel (in_format, out_format))
+  if (color_kernels_hash && find_color_conversion (in_format, out_format))
     return GEGL_CL_COLOR_CONVERT;
 
   GEGL_NOTE (GEGL_DEBUG_OPENCL, "Missing OpenCL conversion for %s -> %s",
