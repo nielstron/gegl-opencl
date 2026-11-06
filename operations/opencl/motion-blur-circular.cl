@@ -23,11 +23,64 @@ bilinear_mix (const float4 p00,
   return mix (mix (p00, p10, dy), mix (p01, p11, dy), dx);
 }
 
-float
-compute_phi (float xr,
-             float yr)
+/* Double-float helpers: a value is represented as hi + lo.  They are used
+ * to compute the number of samples exactly like the CPU code does in
+ * double precision, so that ceil () gives the same result.
+ */
+float2
+df_two_sum (float a,
+            float b)
 {
-  return atan2 (yr, xr);
+  const float s  = a + b;
+  const float bb = s - a;
+  return (float2)(s, (a - (s - bb)) + (b - bb));
+}
+
+float2
+df_two_prod (float a,
+             float b)
+{
+  const float p = a * b;
+  return (float2)(p, fma (a, b, -p));
+}
+
+float2
+df_add (float2 a,
+        float2 b)
+{
+  float2 s = df_two_sum (a.x, b.x);
+  s.y += a.y + b.y;
+  return df_two_sum (s.x, s.y);
+}
+
+float2
+df_mul (float2 a,
+        float2 b)
+{
+  float2 p = df_two_prod (a.x, b.x);
+  p.y += a.x * b.y + a.y * b.x;
+  return df_two_sum (p.x, p.y);
+}
+
+/* returns TRUE if a < b */
+int
+df_less (float2 a,
+         float2 b)
+{
+  const float2 d = df_add (a, -b);
+  return d.x < 0.0f || (d.x == 0.0f && d.y < 0.0f);
+}
+
+/* ceil (sqrt (sq)) for sq given as a double-float */
+int
+df_ceil_sqrt (float2 sq)
+{
+  int m = (int) ceil (sqrt (sq.x + sq.y));
+  if (m > 0 && ! df_less (df_two_prod ((float) (m - 1), (float) (m - 1)), sq))
+    m--;
+  else if (df_less (df_two_prod ((float) m, (float) m), sq))
+    m++;
+  return m;
 }
 
 #define NOMINAL_NUM_IT 100
@@ -46,8 +99,9 @@ cl_motion_blur_circular (__global const float4 *in,
                                   const int     whole_region_x,
                                   const int     whole_region_y,
                                   const float   angle,
-                                  const float   center_x,
-                                  const float   center_y)
+                                  const float2  arc_factor_sq,
+                                  const float2  center_x,
+                                  const float2  center_y)
 {
   const int gidx = get_global_id(0);
   const int gidy = get_global_id(1);
@@ -55,35 +109,50 @@ cl_motion_blur_circular (__global const float4 *in,
   const int x = gidx + dst_x;
   const int y = gidy + dst_y;
 
-  const float xr = x - center_x;
-  const float yr = y - center_y;
-  const float radius = hypot (xr, yr);
+  const float2 xr2 = df_add ((float2)((float) x, 0.0f), -center_x);
+  const float2 yr2 = df_add ((float2)((float) y, 0.0f), -center_y);
 
-  /* This is not the "real" length, a bit shorter */
-  const float arc_length = radius * angle * M_SQRT2_F;
+  /* n = ceil (radius * angle * SQRT_2), computed as the ceil of the
+   * square root of (xr^2 + yr^2) * (angle * SQRT_2)^2 in double-float
+   * precision to match the CPU.  This is not the "real" arc length, a
+   * bit shorter.
+   */
+  const float2 radius_sq = df_add (df_mul (xr2, xr2), df_mul (yr2, yr2));
+  int n = df_ceil_sqrt (df_mul (radius_sq, arc_factor_sq));
 
   /* ensure quality with small angles */
-  int n = max ((int)ceil (arc_length), 3);
+  n = max (n, 3);
 
   /* performance concern */
   if (n > NOMINAL_NUM_IT)
-    n = NOMINAL_NUM_IT + (int) sqrt ((float)(n - NOMINAL_NUM_IT));
-
-  const float phi_base = compute_phi (xr, yr);
-  const float phi_start = phi_base + angle / 2.0f;
-  const float phi_step = angle / (float)n;
+    {
+      const int v = n - NOMINAL_NUM_IT;
+      int r = (int) sqrt ((float) v);
+      if ((r + 1) * (r + 1) <= v)
+        r++;
+      else if (r * r > v)
+        r--;
+      n = NOMINAL_NUM_IT + r;
+    }
 
   float4 sum = (float4)0.0f;
   int count = 0;
 
-  /* Iterate over the arc */
+  /* Iterate over the arc, rotating the offset of the pixel from the
+   * center by theta in [angle / 2, -angle / 2), like the CPU code.
+   * The middle sample (theta == 0) lands exactly on the pixel.
+   */
   for (int i = 0; i < n; i++)
     {
-      float s_val, c_val;
-      s_val = sincos (phi_start - i * phi_step, &c_val);
+      const float theta = angle * (float)(n - 2 * i) / (float)(2 * n);
+      const float s_val = sin (theta);
+      const float h_val = sin (theta * 0.5f);
+      const float c_m1  = -2.0f * h_val * h_val; /* cos (theta) - 1 */
 
-      const float fx = center_x + radius * c_val;
-      const float fy = center_y + radius * s_val;
+      const float fx = (float)x + ((xr2.x * c_m1 - yr2.x * s_val) +
+                                   (xr2.y * c_m1 - yr2.y * s_val));
+      const float fy = (float)y + ((xr2.x * s_val + yr2.x * c_m1) +
+                                   (xr2.y * s_val + yr2.y * c_m1));
       const int ix = (int)floor (fx);
       const int iy = (int)floor (fy);
 
