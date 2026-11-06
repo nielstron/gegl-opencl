@@ -20,6 +20,7 @@ opencl_tests = [
   'threshold',
   'value-invert',
   'vignette',
+  'waves',
 ]
 
 foreach _test : opencl_tests
