@@ -806,20 +806,10 @@ unpremultiply (float4 v)
   return (float4) (v.xyz * recip, alpha);
 }
 
-/* GEGL's fmod () (gegl-math.h) is floored, so unlike OpenCL's fmod ()
- * its result has the sign of y, not of x.
- */
-static float
-gegl_fmod (float x,
-           float y)
-{
-  return x - y * floor (x / y);
-}
-
 /* Port of calc_undistorted_coords () in polar-coordinates.c */
 static inline int
-polar_unmap (float  wx,
-             float  wy,
+polar_unmap (int    wxi,
+             int    wyi,
              float  cen_x,
              float  cen_y,
              int    width,
@@ -831,9 +821,11 @@ polar_unmap (float  wx,
              int    polar,
              float2 col,
              int2   rows,
+             int16  prow,
              float *x,
              float *y)
 {
+  const float wx = wxi, wy = wyi;
   float phi = 0.0f;
   float r = 0.0f, m;
   float xmax, ymax, rmax, t;
@@ -841,10 +833,25 @@ polar_unmap (float  wx,
   const int   x1 = 0, y1 = 0, x2 = width, y2 = height;
   const int   xdiff = x2 - x1, ydiff = y2 - y1;
   const float xm = xdiff / 2.0f, ym = ydiff / 2.0f;
-  int xi, yi;
 
   if (polar)
     {
+      /* prow holds the row's hard decisions, taken on the host in double
+       * precision since single precision cannot always resolve them:
+       * whether the pixel is inside, whether phi + angl wraps, and whether
+       * m <= ydiff / xdiff (see polar_row_decisions ())
+       */
+      const int dx    = wxi - (int) cen_x;
+      const int right = wxi >= (int) cen_x;
+      const int k     = right ? prow.s9 : prow.s8;
+      const int up    = (prow.sa >> right) & 1;
+
+      if (! ((prow.s0 <= wxi && wxi <= prow.s1) ||
+             (prow.s2 <= wxi && wxi <= prow.s3) ||
+             (prow.s4 <= wxi && wxi <= prow.s5) ||
+             (prow.s6 <= wxi && wxi <= prow.s7)))
+        return 0;
+
       if (wx >= cen_x)
         {
           if (wy > cen_y)
@@ -871,18 +878,15 @@ polar_unmap (float  wx,
       else
         m = 0;
 
-      if (m <= ((float) (y2 - y1) / (float) (x2 - x1)))
+      if (dx == 0)
         {
-          if (wx == cen_x)
-            {
-              xmax = 0;
-              ymax = cen_y - y1;
-            }
-          else
-            {
-              xmax = cen_x - x1;
-              ymax = m * xmax;
-            }
+          xmax = 0;
+          ymax = cen_y - y1;
+        }
+      else if ((dx < 0 ? -dx : dx) >= prow.sb)
+        {
+          xmax = cen_x - x1;
+          ymax = m * xmax;
         }
       else
         {
@@ -895,7 +899,9 @@ polar_unmap (float  wx,
       t = ((cen_y - y1) < (cen_x - x1)) ? (cen_y - y1) : (cen_x - x1);
       rmax = (rmax - t) / 100 * (100 - circle) + t;
 
-      phi = gegl_fmod (phi + angl, 2 * M_PI_F);
+      phi += angl;
+      if (up ? wxi >= k : wxi < k)
+        phi -= 2 * M_PI_F;
 
       if (bw)
         x_calc = x2 - 1 - (x2 - x1 - 1) / (2 * M_PI_F) * phi;
@@ -927,21 +933,17 @@ polar_unmap (float  wx,
       *x = x_calc;
       *y = y_calc;
 
-      return rows.x <= (int) wy && (int) wy <= rows.y;
+      return rows.x <= wyi && wyi <= rows.y;
     }
 
   /* With rmax == 0 (the pole on the top or left edge) the coordinates
-   * can be NaN or infinite.  Convert them with saturation, NaN going to
-   * 0, as the CPU's (int) cast does on ARM; the sampler then reads
-   * non-finite coordinates as 0, like gegl_sampler_get () does.
+   * can be NaN or infinite; the sampler reads non-finite coordinates as 0,
+   * like gegl_sampler_get () does.
    */
-  xi = convert_int_sat (x_calc + 0.5f);
-  yi = convert_int_sat (y_calc + 0.5f);
-
   *x = isfinite (x_calc) ? x_calc : 0.0f;
   *y = isfinite (y_calc) ? y_calc : 0.0f;
 
-  return 0 <= xi && xi <= width - 1 && 0 <= yi && yi <= height - 1;
+  return 1;
 }
 
 __kernel void
@@ -964,6 +966,8 @@ polar_coordinates (__global const float4 *src,
                    __global const float2 *cols,
                    __global const int2   *rows,
                    int                    cols_x,
+                   __global const int16  *prows,
+                   int                    prows_y,
                    int                    unpremultiply_output)
 {
   const int gidx = get_global_id (0);
@@ -974,7 +978,8 @@ polar_coordinates (__global const float4 *src,
   if (polar_unmap (roi_x + gidx, roi_y + gidy, cen_x, cen_y, width, height,
                    circle, angl, bw, top, polar,
                    cols[polar ? 0 : roi_x + gidx - cols_x],
-                   rows[polar ? 0 : roi_x + gidx - cols_x], &px, &py))
+                   rows[polar ? 0 : roi_x + gidx - cols_x],
+                   prows[polar ? roi_y + gidy - prows_y : 0], &px, &py))
     {
       /* the CPU code passes an all-zero scale matrix, which disables
        * NoHalo's EWA path */

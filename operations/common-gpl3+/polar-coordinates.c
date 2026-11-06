@@ -589,6 +589,285 @@ polar_column_rows (GeglProperties      *o,
   *row_hi = hi;
 }
 
+/* In "to polar" = TRUE mode the kernel's single precision cannot take the
+ * hard decisions either: at 3000x2000, top=1, depth=63, pixel (357,562)'s
+ * y_calc is 5.5e-5 pixels below the half-pixel threshold, half a single
+ * precision ulp, and whether phi + angl wraps around 2 pi moves x_calc by
+ * the whole width.  So for each row they are taken here, with
+ * calc_undistorted_coords () itself, and uploaded as column intervals.
+ *
+ * For a fixed row, phi is monotone in the column on either side of the
+ * pole, so the wrapped columns of a side are a prefix or a suffix of it.
+ * r / rmax, which decides whether a pixel is inside, grows with the
+ * distance from the pole column, except that rmax jumps where m crosses
+ * (y2 - y1) / (x2 - x1) if the pole is not where that ratio predicts.  m
+ * <= (y2 - y1) / (x2 - x1) is exactly |dy| * xdiff <= |dx| * ydiff (the
+ * two sides of the double comparison differ by many ulps otherwise), so
+ * each side of the row splits into two pieces at |dx| = ceil (|dy| *
+ * xdiff / ydiff) in which r / rmax is monotone and the inside pixels form
+ * one interval.
+ */
+
+/* phi + angl before the wrap and r / rmax, computed the same way as by
+ * calc_undistorted_coords (); only used where they are far from any
+ * threshold
+ */
+static void
+polar_estimate (GeglProperties      *o,
+                const GeglRectangle *boundary,
+                gdouble              cen_x,
+                gdouble              cen_y,
+                gint                 wx,
+                gint                 wy,
+                gdouble             *v,
+                gdouble             *q)
+{
+  const gdouble w = boundary->width, h = boundary->height;
+  gdouble       phi, r, m, xmax, ymax, rmax, t;
+
+  if (wx >= cen_x)
+    {
+      if (wy > cen_y)
+        phi = G_PI - atan ((wx - cen_x) / (wy - cen_y));
+      else if (wy < cen_y)
+        phi = atan ((wx - cen_x) / (cen_y - wy));
+      else
+        phi = G_PI / 2;
+    }
+  else
+    {
+      if (wy < cen_y)
+        phi = 2 * G_PI - atan ((cen_x - wx) / (cen_y - wy));
+      else if (wy > cen_y)
+        phi = G_PI + atan ((cen_x - wx) / (wy - cen_y));
+      else
+        phi = 1.5 * G_PI;
+    }
+
+  r = sqrt (SQR (wx - cen_x) + SQR (wy - cen_y));
+  m = wx != cen_x ? fabs ((wy - cen_y) / (wx - cen_x)) : 0;
+
+  if (m <= h / w)
+    {
+      xmax = wx == cen_x ? 0 : cen_x;
+      ymax = wx == cen_x ? cen_y : m * xmax;
+    }
+  else
+    {
+      ymax = cen_y;
+      xmax = ymax / m;
+    }
+
+  rmax = sqrt (SQR (xmax) + SQR (ymax));
+  t    = MIN (cen_x, cen_y);
+  rmax = (rmax - t) / 100 * (100 - o->depth) + t;
+
+  *v = phi + o->angle / 180.0 * G_PI;
+  *q = r / rmax;
+}
+
+typedef struct
+{
+  GeglProperties      *o;
+  const GeglRectangle *boundary;
+  gdouble              cen_x;
+  gdouble              cen_y;
+  gint                 wy;
+} PolarRow;
+
+/* 0: outside on the pole's side, 1: inside, 2: outside beyond, mirrored if
+ * dir < 0
+ */
+static gint
+polar_rank (const PolarRow *p,
+            gint            wx,
+            gint            dir)
+{
+  gdouble x, y, v, q;
+  gint    rank = 1;
+
+  if (! calc_undistorted_coords (wx, p->wy, p->cen_x, p->cen_y, &x, &y,
+                                 p->o, *p->boundary))
+    {
+      polar_estimate (p->o, p->boundary, p->cen_x, p->cen_y, wx, p->wy,
+                      &v, &q);
+      rank = q < 0.5 ? 0 : 2;
+    }
+
+  return dir > 0 ? rank : 2 - rank;
+}
+
+/* whether calc_undistorted_coords ()'s phi + angl is >= 2 pi */
+static gboolean
+polar_wraps (const PolarRow *p,
+             gint            wx)
+{
+  const gint w = p->boundary->width;
+  gdouble    x, y, v, q;
+
+  polar_estimate (p->o, p->boundary, p->cen_x, p->cen_y, wx, p->wy, &v, &q);
+
+  /* close to the wrap, tell from x_calc, which is then near one end */
+  if (fabs (v - 2 * G_PI) < 1e-6 &&
+      calc_undistorted_coords (wx, p->wy, p->cen_x, p->cen_y, &x, &y,
+                               p->o, *p->boundary))
+    return (p->o->bw ? w - 1 - x : x) < (w - 1) / 2.0;
+
+  return v >= 2 * G_PI;
+}
+
+/* the first wx in [a, b] with polar_rank () >= level, b + 1 if none */
+static gint
+polar_search_rank (const PolarRow *p,
+                   gint            a,
+                   gint            b,
+                   gint            dir,
+                   gint            level)
+{
+  b++;
+
+  while (a < b)
+    {
+      gint mid = a + (b - a) / 2;
+
+      if (polar_rank (p, mid, dir) >= level)
+        b = mid;
+      else
+        a = mid + 1;
+    }
+
+  return a;
+}
+
+/* the inside columns in [a, b], along which r / rmax is monotone */
+static void
+polar_piece_inside (const PolarRow *p,
+                    gint            a,
+                    gint            b,
+                    gint            dir,
+                    cl_int         *lo,
+                    cl_int         *hi)
+{
+  gint first, last, k;
+
+  *lo = 1;
+  *hi = 0;
+
+  if (a > b)
+    return;
+
+  first = polar_search_rank (p, a, b, dir, 1);
+  last  = polar_search_rank (p, first, b, dir, 2) - 1;
+
+  if (first <= last &&
+      (polar_rank (p, first, dir) != 1 || polar_rank (p, last, dir) != 1))
+    {
+      /* not monotone after all; settle for the hull */
+      first = b + 1;
+      last  = a - 1;
+
+      for (k = a; k <= b; k++)
+        if (polar_rank (p, k, dir) == 1)
+          {
+            first = MIN (first, k);
+            last  = k;
+          }
+    }
+
+  if (first <= last)
+    {
+      *lo = first;
+      *hi = last;
+    }
+}
+
+/* the wrapped columns in [a, b], along which phi is monotone, as k and
+ * whether they are those >= k (or else those < k)
+ */
+static void
+polar_side_wrap (const PolarRow *p,
+                 gint            a,
+                 gint            b,
+                 cl_int         *k,
+                 gint           *up)
+{
+  gboolean sa, sb;
+  gint     lo, hi;
+
+  *k  = a;
+  *up = 1;
+
+  if (a > b)
+    return;
+
+  sa = polar_wraps (p, a);
+  sb = polar_wraps (p, b);
+
+  if (sa == sb)
+    {
+      *k = sa ? a : b + 1;
+      return;
+    }
+
+  lo = a;
+  hi = b;
+
+  while (lo < hi)
+    {
+      gint mid = lo + (hi - lo) / 2;
+
+      if (polar_wraps (p, mid) == sb)
+        hi = mid;
+      else
+        lo = mid + 1;
+    }
+
+  *k  = lo;
+  *up = sb;
+}
+
+/* the decisions for row wy and columns [x_lo, x_hi]: s0..s7 the inside
+ * intervals, s8 and s9 the wrap columns left and right of the pole, sa
+ * whether the wrapped columns are those >= them (bit 0 left, bit 1 right),
+ * sb the |dx| from which m <= (y2 - y1) / (x2 - x1)
+ */
+static void
+polar_row_decisions (GeglProperties      *o,
+                     const GeglRectangle *boundary,
+                     gdouble              cen_x,
+                     gdouble              cen_y,
+                     gint                 wy,
+                     gint                 x_lo,
+                     gint                 x_hi,
+                     cl_int16            *d)
+{
+  const gint64 dy  = ABS ((gint64) wy - (gint64) cen_y);
+  const gint64 thr = (dy * boundary->width + boundary->height - 1) /
+                     boundary->height;
+  const gint   cx  = cen_x;
+  gint         t, up_l, up_r;
+  PolarRow     p   = {o, boundary, cen_x, cen_y, wy};
+
+  /* |dx| >= t on the outer pieces */
+  t = MIN (thr, G_MAXINT / 4);
+
+  polar_piece_inside (&p, x_lo, MIN (x_hi, (gint64) cx - MAX (t, 1)), -1,
+                      &d->s[0], &d->s[1]);
+  polar_piece_inside (&p, MAX (x_lo, (gint64) cx - MAX (t, 1) + 1),
+                      MIN (x_hi, cx - 1), -1,
+                      &d->s[2], &d->s[3]);
+  polar_piece_inside (&p, MAX (x_lo, cx), MIN (x_hi, (gint64) cx + t - 1), 1,
+                      &d->s[4], &d->s[5]);
+  polar_piece_inside (&p, MAX (x_lo, (gint64) cx + t), x_hi, 1,
+                      &d->s[6], &d->s[7]);
+
+  polar_side_wrap (&p, x_lo, MIN (x_hi, cx - 1), &d->s[8], &up_l);
+  polar_side_wrap (&p, MAX (x_lo, cx), x_hi, &d->s[9], &up_r);
+
+  d->s[10] = up_l | (up_r << 1);
+  d->s[11] = t;
+}
+
 /* Implements process () with the NoHalo sampler on the GPU.  Samples are
  * only taken at positions that round to a pixel inside the input's bounding
  * box, so only the part of the abyss rectangle that NoHalo's stencil can
@@ -613,9 +892,12 @@ cl_process (GeglOperation       *operation,
   cl_mem                in_tex = NULL;
   cl_mem                col_tex = NULL;
   cl_mem                row_tex = NULL;
+  cl_mem                prow_tex = NULL;
   cl_float2            *cols;
   cl_int2              *rows;
+  cl_int16             *prows;
   cl_int                n_cols;
+  cl_int                n_prows;
   cl_int                cl_err = 0;
   gboolean              err;
   cl_int4               srect;
@@ -647,6 +929,10 @@ cl_process (GeglOperation       *operation,
     return FALSE;
 
   if ((gdouble) src_rect.width * src_rect.height > (1 << 26))
+    return FALSE;
+
+  /* the kernel takes the pole's coordinates as exact floats */
+  if (cen_x >= (1 << 24) || cen_y >= (1 << 24))
     return FALSE;
 
   if (!cl_data)
@@ -692,6 +978,31 @@ cl_process (GeglOperation       *operation,
         }
     }
 
+  /* per row decisions for polar == TRUE; a dummy entry otherwise */
+  n_prows = polar ? roi->height : 1;
+  prows   = g_new0 (cl_int16, n_prows);
+
+  if (polar)
+    {
+      gint y;
+
+      for (y = 0; y < roi->height; y++)
+        polar_row_decisions (o, boundary, cen_x, cen_y, roi->y + y,
+                             roi->x, roi->x + roi->width - 1, &prows[y]);
+    }
+
+  prow_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                  CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                  n_prows * sizeof (cl_int16), prows,
+                                  &cl_err);
+  g_free (prows);
+  if (cl_err != CL_SUCCESS)
+    {
+      g_free (cols);
+      g_free (rows);
+      return FALSE;
+    }
+
   col_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
                                  CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
                                  n_cols * sizeof (cl_float2), cols, &cl_err);
@@ -699,6 +1010,7 @@ cl_process (GeglOperation       *operation,
   if (cl_err != CL_SUCCESS)
     {
       g_free (rows);
+      gegl_clReleaseMemObject (prow_tex);
       return FALSE;
     }
 
@@ -709,6 +1021,7 @@ cl_process (GeglOperation       *operation,
   if (cl_err != CL_SUCCESS)
     {
       gegl_clReleaseMemObject (col_tex);
+      gegl_clReleaseMemObject (prow_tex);
       return FALSE;
     }
 
@@ -717,6 +1030,7 @@ cl_process (GeglOperation       *operation,
     {
       gegl_clReleaseMemObject (col_tex);
       gegl_clReleaseMemObject (row_tex);
+      gegl_clReleaseMemObject (prow_tex);
       return FALSE;
     }
 
@@ -752,6 +1066,8 @@ cl_process (GeglOperation       *operation,
                                         sizeof (cl_mem),   &col_tex,
                                         sizeof (cl_mem),   &row_tex,
                                         sizeof (cl_int),   &roi->x,
+                                        sizeof (cl_mem),   &prow_tex,
+                                        sizeof (cl_int),   &roi->y,
                                         sizeof (cl_int),   &unpremultiply,
                                         NULL);
       CL_CHECK;
@@ -766,6 +1082,7 @@ cl_process (GeglOperation       *operation,
   gegl_clReleaseMemObject (in_tex);
   gegl_clReleaseMemObject (col_tex);
   gegl_clReleaseMemObject (row_tex);
+  gegl_clReleaseMemObject (prow_tex);
 
   return TRUE;
 
@@ -775,6 +1092,7 @@ error_iter:
   gegl_clReleaseMemObject (in_tex);
   gegl_clReleaseMemObject (col_tex);
   gegl_clReleaseMemObject (row_tex);
+  gegl_clReleaseMemObject (prow_tex);
 
   return FALSE;
 }
