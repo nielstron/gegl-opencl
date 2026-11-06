@@ -184,9 +184,25 @@ process (GeglOperation       *op,
 }
 
 #include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
 #include "opencl/value-invert.cl.h"
 
 static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_build (void)
+{
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"gegl_value_invert",
+                                   "gegl_value_invert_u8",
+                                   "gegl_value_invert_u8_u8",
+                                   NULL};
+      cl_data = gegl_cl_compile_and_build (value_invert_cl_source, kernel_name);
+    }
+
+  return cl_data != NULL;
+}
 
 static gboolean
 cl_process (GeglOperation       *op,
@@ -200,15 +216,7 @@ cl_process (GeglOperation       *op,
   cl_kernel   kernel;
   cl_int      cl_err = 0;
 
-  if (!cl_data)
-    {
-      const char *kernel_name[] = {"gegl_value_invert",
-                                   "gegl_value_invert_u8",
-                                   NULL};
-      cl_data = gegl_cl_compile_and_build (value_invert_cl_source, kernel_name);
-    }
-
-  if (!cl_data)
+  if (!cl_build ())
     return TRUE;
 
   if (babl_format_get_type (format, 0) == babl_type ("u8"))
@@ -234,17 +242,98 @@ error:
   return TRUE;
 }
 
+/* When the output buffer is R'G'B'A u8 itself, for example when rendering
+ * straight into an 8-bit blit destination, the float result would only be
+ * rounded to u8 by another pass afterwards.  Round it in the kernel
+ * instead, the same way, which gives the same result without the float
+ * buffer.  What follows the operation still sees float data otherwise.
+ */
+static gboolean
+cl_process_u8 (GeglOperation       *op,
+               GeglBuffer          *input,
+               GeglBuffer          *output,
+               const GeglRectangle *result)
+{
+  const Babl           *format = gegl_operation_get_format (op, "input");
+  GeglBufferClIterator *iter;
+  cl_kernel             kernel;
+  cl_int                cl_err = 0;
+  gboolean              err;
+
+  if (!cl_build ())
+    return FALSE;
+
+  kernel = cl_data->kernel[2];
+
+  iter = gegl_buffer_cl_iterator_new (output, result, format,
+                                      GEGL_CL_BUFFER_WRITE);
+  gegl_buffer_cl_iterator_add (iter, input, result, format,
+                               GEGL_CL_BUFFER_READ, GEGL_ABYSS_NONE);
+
+  while (gegl_buffer_cl_iterator_next (iter, &err))
+    {
+      if (err)
+        return FALSE;
+
+      cl_err = gegl_cl_set_kernel_args (kernel,
+                                        sizeof (cl_mem), &iter->tex[1],
+                                        sizeof (cl_mem), &iter->tex[0],
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            kernel, 1,
+                                            NULL, &iter->size[0], NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  return TRUE;
+
+error:
+  gegl_buffer_cl_iterator_stop (iter);
+  return FALSE;
+}
+
+static gboolean
+filter_process (GeglOperation       *op,
+                GeglBuffer          *input,
+                GeglBuffer          *output,
+                const GeglRectangle *result,
+                gint                 level)
+{
+  GeglOperationFilterClass *parent_class;
+  const Babl               *format = gegl_operation_get_format (op, "input");
+
+  if (gegl_operation_use_opencl (op)                       &&
+      babl_format_get_type (format, 0) == babl_type ("u8") &&
+      gegl_buffer_get_format (output) == format            &&
+      input && input != output                             &&
+      result->width > 0 && result->height > 0)
+    {
+      if (cl_process_u8 (op, input, output, result))
+        return TRUE;
+    }
+
+  parent_class = GEGL_OPERATION_FILTER_CLASS (gegl_op_parent_class);
+
+  return parent_class->process (op, input, output, result, level);
+}
+
 static void
 gegl_op_class_init (GeglOpClass *klass)
 {
   GeglOperationClass            *operation_class;
+  GeglOperationFilterClass      *filter_class;
   GeglOperationPointFilterClass *point_filter_class;
 
   operation_class    = GEGL_OPERATION_CLASS (klass);
+  filter_class       = GEGL_OPERATION_FILTER_CLASS (klass);
   point_filter_class = GEGL_OPERATION_POINT_FILTER_CLASS (klass);
 
   point_filter_class->process    = process;
   point_filter_class->cl_process = cl_process;
+  filter_class->process          = filter_process;
   operation_class->prepare        = prepare;
   operation_class->opencl_support = TRUE;
 
