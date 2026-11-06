@@ -27,6 +27,7 @@ gegl_operations_opencl_sources = [
   'motion-blur-circular.cl',
   'motion-blur-linear.cl',
   'noise-cell.cl',
+  'noise-cie-lch.cl',
   'noise-hsv.cl',
   'noise-hurl.cl',
   'noise-reduction.cl',
