@@ -334,7 +334,7 @@ cl_process (GeglOperation       *operation,
   min_chroma = acc[0];
   delta      = -acc[1] - acc[0];
 
-  if (! delta)
+  if (delta < MIN_CHROMA_RANGE)
     {
       gegl_buffer_copy (input, NULL, GEGL_ABYSS_NONE, output, NULL);
       return TRUE;
