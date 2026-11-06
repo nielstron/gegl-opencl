@@ -29,6 +29,7 @@ gegl_operations_opencl_sources = [
   'noise-cell.cl',
   'noise-hsv.cl',
   'noise-hurl.cl',
+  'noise-pick.cl',
   'noise-reduction.cl',
   'noise-simplex.cl',
   'oilify.cl',

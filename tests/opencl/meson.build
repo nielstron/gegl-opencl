@@ -11,6 +11,7 @@ opencl_tests = [
   'levels',
   'mono-mixer',
   'motion-blur',
+  'noise-pick',
   'noise-reduction',
   'oilify',
   'opacity',
