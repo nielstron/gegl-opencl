@@ -759,6 +759,208 @@ get_abyss_policy (GeglOperation *operation,
   g_return_val_if_reached (GEGL_ABYSS_NONE);
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+
+#include "opencl/median-blur.cl.h"
+
+#define CL_MAX_RADIUS     20
+#define CL_LOCAL_SIZE     16
+
+static GeglClRunData *cl_data = NULL;
+static size_t         cl_local_ws[2];
+
+/* pick the largest work group of at most CL_LOCAL_SIZE x CL_LOCAL_SIZE
+ * that the kernel and device support; CL_KERNEL_WORK_GROUP_SIZE may be
+ * well below 256 on register-starved mobile GPUs.
+ */
+static void
+cl_choose_local_size (void)
+{
+  size_t max_wg = cl_data->work_group_size[0];
+  size_t max_item[3] = { CL_LOCAL_SIZE, CL_LOCAL_SIZE, 1 };
+  size_t lw = CL_LOCAL_SIZE;
+  size_t lh = CL_LOCAL_SIZE;
+
+  if (gegl_clGetDeviceInfo (gegl_cl_get_device (),
+                            CL_DEVICE_MAX_WORK_ITEM_SIZES,
+                            sizeof (max_item), max_item, NULL) != CL_SUCCESS)
+    {
+      max_item[0] = CL_LOCAL_SIZE;
+      max_item[1] = CL_LOCAL_SIZE;
+    }
+
+  max_wg = MAX (max_wg, 1);
+  lw     = MAX (MIN (lw, max_item[0]), 1);
+  lh     = MAX (MIN (lh, max_item[1]), 1);
+
+  while (lw * lh > max_wg)
+    {
+      if (lh >= lw && lh > 1)
+        lh /= 2;
+      else
+        lw /= 2;
+    }
+
+  cl_local_ws[0] = lw;
+  cl_local_ws[1] = lh;
+}
+
+/* represent a percentile p in [0, 1] as mantissa / 2^shift */
+static void
+cl_split_percentile (gdouble   p,
+                     cl_ulong *mantissa,
+                     cl_int   *shift)
+{
+  gint e;
+  gdouble f = frexp (p, &e);
+
+  if (p <= 0.0)
+    {
+      *mantissa = 0;
+      *shift    = 0;
+      return;
+    }
+
+  *mantissa = (cl_ulong) ldexp (f, 53);
+  *shift    = 53 - e;
+}
+
+static gboolean
+cl_median_blur (cl_mem               in_tex,
+                cl_mem               out_tex,
+                cl_mem               outline_tex,
+                const GeglRectangle *roi,
+                gint                 radius,
+                cl_ulong             color_mantissa,
+                cl_int               color_shift,
+                cl_int               alpha_target)
+{
+  cl_int cl_err = 0;
+  size_t global_ws[2];
+  size_t local_ws[2];
+  size_t cache_size;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "median_blur", NULL };
+      cl_data = gegl_cl_compile_and_build (median_blur_cl_source, kernel_name);
+
+      if (cl_data)
+        cl_choose_local_size ();
+    }
+
+  if (!cl_data)
+    return TRUE;
+
+  local_ws[0]  = cl_local_ws[0];
+  local_ws[1]  = cl_local_ws[1];
+  global_ws[0] = (roi->width  + local_ws[0] - 1) / local_ws[0] * local_ws[0];
+  global_ws[1] = (roi->height + local_ws[1] - 1) / local_ws[1] * local_ws[1];
+  cache_size   = (local_ws[0] + 2 * radius) * (local_ws[1] + 2 * radius) *
+                 sizeof (cl_uchar4);
+
+  if (cache_size > gegl_cl_get_local_mem_size ())
+    return TRUE;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem),   (void *) &in_tex,
+                                    sizeof (cl_mem),   (void *) &out_tex,
+                                    cache_size,        NULL,
+                                    sizeof (cl_mem),   (void *) &outline_tex,
+                                    sizeof (cl_int),   (void *) &roi->width,
+                                    sizeof (cl_int),   (void *) &roi->height,
+                                    sizeof (cl_int),   (void *) &radius,
+                                    sizeof (cl_ulong), (void *) &color_mantissa,
+                                    sizeof (cl_int),   (void *) &color_shift,
+                                    sizeof (cl_int),   (void *) &alpha_target,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 2,
+                                        NULL, global_ws, local_ws,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  return FALSE;
+
+error:
+  return TRUE;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi,
+            gdouble              percentile,
+            gdouble              alpha_percentile)
+{
+  GeglProperties *o      = GEGL_PROPERTIES (operation);
+  UserData       *data   = o->user_data;
+  const Babl     *format = gegl_operation_get_format (operation, "input");
+  gint            radius = abs (o->radius);
+
+  GeglBufferClIterator *i;
+  cl_mem                outline_tex = NULL;
+  cl_ulong              color_mantissa;
+  cl_int                color_shift;
+  cl_int                alpha_target;
+  cl_int                cl_err = 0;
+  gint                  size   = 0;
+  gint                  read;
+  gint                  err    = 0;
+  gint                  j;
+
+  /* only the quantized path for color + alpha formats is implemented */
+  if (! data->quantize                                 ||
+      babl_format_get_n_components (format) != 4       ||
+      ! babl_format_has_alpha (format)                 ||
+      radius > CL_MAX_RADIUS)
+    return FALSE;
+
+  for (j = -radius; j <= radius; j++)
+    size += 2 * data->neighborhood_outline[abs (j)] + 1;
+
+  /* the same computation as in histogram_get_median () */
+  alpha_target = (gint) ceil (size * alpha_percentile);
+  alpha_target = MAX (alpha_target, 1);
+
+  cl_split_percentile (percentile, &color_mantissa, &color_shift);
+
+  outline_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                     CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     (radius + 1) * sizeof (cl_int),
+                                     data->neighborhood_outline, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    return FALSE;
+
+  i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, roi, format,
+                                        GEGL_CL_BUFFER_READ,
+                                        radius, radius, radius, radius,
+                                        get_abyss_policy (operation, "input"));
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && ! err)
+    {
+      err = cl_median_blur (i->tex[read], i->tex[0], outline_tex,
+                            &i->roi[0], radius,
+                            color_mantissa, color_shift, alpha_target);
+
+      if (err)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          break;
+        }
+    }
+
+  gegl_clReleaseMemObject (outline_tex);
+
+  return ! err;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -803,6 +1005,11 @@ process (GeglOperation       *operation,
       percentile       = 1.0 - percentile;
       alpha_percentile = 1.0 - alpha_percentile;
     }
+
+  if (gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, roi,
+                    percentile, alpha_percentile))
+      return TRUE;
 
   if (! data->quantize &&
       (roi->width > MAX_CHUNK_WIDTH || roi->height > MAX_CHUNK_HEIGHT))
@@ -994,6 +1201,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->prepare          = prepare;
   operation_class->get_bounding_box = get_bounding_box;
   area_class->get_abyss_policy      = get_abyss_policy;
+  operation_class->opencl_support   = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",           "gegl:median-blur",
