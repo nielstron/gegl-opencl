@@ -14,6 +14,7 @@ opencl_tests = [
   'gaussian-blur-iir',
   'invert-linear',
   'lens-blur',
+  'lens-distortion',
   'levels',
   'mono-mixer',
   'motion-blur',

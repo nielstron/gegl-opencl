@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<gegl>
+  <node operation='gegl:lens-distortion'>
+    <params>
+      <param name='main'>40</param>
+      <param name='edge'>20</param>
+      <param name='zoom'>10</param>
+      <param name='brighten'>20</param>
+    </params>
+  </node>
+  <node operation='gegl:load'>
+    <params>
+      <param name='path'>../compositions/data/car-stack.png</param>
+    </params>
+  </node>
+</gegl>

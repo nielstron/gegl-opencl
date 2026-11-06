@@ -27,6 +27,7 @@ gegl_operations_opencl_sources = [
   'hue-chroma.cl',
   'invert-linear.cl',
   'lens-blur.cl',
+  'lens-distortion.cl',
   'levels.cl',
   'mono-mixer.cl',
   'motion-blur-circular.cl',
