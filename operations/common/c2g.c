@@ -245,7 +245,10 @@ cl_c2g (cl_mem                in_tex,
         gint                  radius,
         gint                  samples,
         gint                  iterations,
-        gdouble               rgamma)
+        gdouble               rgamma,
+        gboolean              enhance_shadows,
+        gint                  image_width,
+        gint                  image_height)
 {
   cl_int cl_err = 0;
   cl_mem cl_lut_cos = NULL;
@@ -282,6 +285,11 @@ cl_c2g (cl_mem                in_tex,
   cl_int cl_radius     = radius;
   cl_int cl_samples    = samples;
   cl_int cl_iterations = iterations;
+  cl_int cl_enhance_shadows = enhance_shadows;
+  cl_int cl_origin_x   = src_roi->x;
+  cl_int cl_origin_y   = src_roi->y;
+  cl_int cl_image_width  = image_width;
+  cl_int cl_image_height = image_height;
 
   cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 0, sizeof(cl_mem), (void*)&in_tex);
   CL_CHECK;
@@ -302,6 +310,16 @@ cl_c2g (cl_mem                in_tex,
   cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 8, sizeof(cl_int), (void*)&cl_samples);
   CL_CHECK;
   cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 9, sizeof(cl_int), (void*)&cl_iterations);
+  CL_CHECK;
+  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 10, sizeof(cl_int), (void*)&cl_enhance_shadows);
+  CL_CHECK;
+  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 11, sizeof(cl_int), (void*)&cl_origin_x);
+  CL_CHECK;
+  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 12, sizeof(cl_int), (void*)&cl_origin_y);
+  CL_CHECK;
+  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 13, sizeof(cl_int), (void*)&cl_image_width);
+  CL_CHECK;
+  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 14, sizeof(cl_int), (void*)&cl_image_height);
   CL_CHECK;
   }
 
@@ -372,7 +390,11 @@ cl_process (GeglOperation       *operation,
                    o->radius,
                    o->samples,
                    o->iterations,
-                   RGAMMA);
+                   RGAMMA,
+                   o->enhance_shadows,
+                   /* the CPU path's notion of the sampleable image area */
+                   gegl_buffer_get_width (input),
+                   gegl_buffer_get_height (input));
 
       if (err)
         {
