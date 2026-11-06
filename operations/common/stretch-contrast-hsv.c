@@ -113,17 +113,47 @@ clean_autostretch_data (AutostretchData *data)
     }
 }
 
+/* babl's HSV model is defined on the linear RGB of a space, encoded with
+ * the sRGB TRC regardless of the space's own TRC.  Returns a space with
+ * the primaries of @space and the sRGB TRC, whose R'G'B' is thus the base
+ * of HSV in @space, or NULL if there is none.
+ */
+static const Babl *
+hsv_base_space (const Babl *space)
+{
+  const Babl *srgb_trc = babl_trc ("sRGB");
+  const Babl *red_trc, *green_trc, *blue_trc;
+
+  if (! space)
+    space = babl_space ("sRGB");
+
+  if (! babl_space_is_rgb (space))
+    return NULL;
+
+  babl_space_get (space, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                  &red_trc, &green_trc, &blue_trc);
+
+  if (red_trc == srgb_trc &&
+      (! green_trc || green_trc == srgb_trc) &&
+      (! blue_trc  || blue_trc  == srgb_trc))
+    return space;
+
+  return babl_space_with_trc (space, srgb_trc);
+}
+
 static void
 prepare (GeglOperation *operation)
 {
   const Babl *space = gegl_operation_get_source_space (operation, "input");
+  const Babl *hsv_space;
   const Babl *format;
 
   /* The OpenCL path converts to and from HSV itself, so let it operate on
    * R'G'B'A, avoiding two costly HSV conversions on the CPU.
    */
-  if (gegl_operation_use_opencl (operation))
-    format = babl_format_with_space ("R'G'B'A float", space);
+  if (gegl_operation_use_opencl (operation) &&
+      (hsv_space = hsv_base_space (space)))
+    format = babl_format_with_space ("R'G'B'A float", hsv_space);
   else
     format = babl_format_with_space ("HSVA float", space);
 

@@ -15,8 +15,13 @@
  */
 
 /* The kernels work on R'G'B'A float and do the HSV conversion inline,
- * following babl's HSV model (which is defined on R'G'B').
+ * following babl's HSV model (which is defined on R'G'B', using the sRGB
+ * TRC).  Like babl, pixels whose value is below 1e-10 (including negative
+ * ones) get zero saturation and hue, and a channel within 1e-10 of the
+ * maximum selects the hue sector.
  */
+
+#define HSV_EPSILON 1e-10f
 
 static float2
 rgb_to_sv (float4 in)
@@ -24,7 +29,7 @@ rgb_to_sv (float4 in)
   float max_v  = fmax (in.x, fmax (in.y, in.z));
   float min_v  = fmin (in.x, fmin (in.y, in.z));
   float chroma = max_v - min_v;
-  float s      = (max_v == 0.0f) ? 0.0f : chroma / max_v;
+  float s      = (max_v < HSV_EPSILON) ? 0.0f : chroma / max_v;
 
   return (float2) (s, max_v);
 }
@@ -80,20 +85,20 @@ stretch_contrast_hsv (__global const float4 *in,
   float  min_v  = fmin (in_v.x, fmin (in_v.y, in_v.z));
   float  chroma = max_v - min_v;
   float  hue    = 0.0f;
-  float  sat    = (max_v == 0.0f) ? 0.0f : chroma / max_v;
+  float  sat    = (max_v < HSV_EPSILON) ? 0.0f : chroma / max_v;
   float  value  = max_v;
   float  h_tmp, x, m;
   float4 out_v;
 
-  if (chroma != 0.0f)
+  if (sat >= HSV_EPSILON)
     {
-      if (max_v == in_v.x)
+      if (fabs (in_v.x - max_v) < HSV_EPSILON)
         {
           hue = (in_v.y - in_v.z) / chroma;
           if (hue < 0.0f)
             hue += 6.0f;
         }
-      else if (max_v == in_v.y)
+      else if (fabs (in_v.y - max_v) < HSV_EPSILON)
         hue = 2.0f + (in_v.z - in_v.x) / chroma;
       else
         hue = 4.0f + (in_v.x - in_v.y) / chroma;
