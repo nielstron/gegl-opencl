@@ -56,9 +56,13 @@ mean_curvature_blur (__global const float4 *src,
   float4 dy   = bottom - top;
   float4 s    = fmax (fabs (dx), fabs (dy));
   int4   flat = s == 0.0f;
-  float4 inv  = 1.0f / select (s, (float4) (1.0f), flat);
-  float4 nx   = dx * inv;
-  float4 ny   = dy * inv;
+  float4 sd   = select (s, (float4) (1.0f), flat);
+  /* Divide directly instead of multiplying by 1 / s: with a subnormal s
+   * (on devices that keep denormals) 1 / s overflows to inf, giving NaN,
+   * while dx / s and dy / s are always within [-1, 1].
+   */
+  float4 nx   = dx / sd;
+  float4 ny   = dy / sd;
   float4 nx2  = nx * nx;
   float4 ny2  = ny * ny;
 
