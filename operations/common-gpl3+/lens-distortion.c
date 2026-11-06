@@ -391,6 +391,282 @@ lens_distort_func (gfloat              *src_buf,
     dst_buf[offset++] = temp[x];
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+
+#include "opencl/lens-distortion.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+/* Copies @rect of @buffer, converted to @format, into a new OpenCL buffer. */
+static cl_mem
+cl_upload_rect (GeglBuffer          *buffer,
+                const GeglRectangle *rect,
+                const Babl          *format)
+{
+  cl_int   cl_err = 0;
+  cl_mem   tex    = NULL;
+  size_t   size   = (size_t) rect->width * rect->height *
+                    babl_format_get_bytes_per_pixel (format);
+  gpointer data;
+
+  tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                             CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
+                             size, NULL, &cl_err);
+  CL_CHECK;
+
+  data = gegl_clEnqueueMapBuffer (gegl_cl_get_command_queue (), tex, CL_TRUE,
+                                  CL_MAP_WRITE, 0, size,
+                                  0, NULL, NULL, &cl_err);
+  CL_CHECK;
+
+  gegl_buffer_get (buffer, rect, 1.0, format, data,
+                   GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
+
+  cl_err = gegl_clEnqueueUnmapMemObject (gegl_cl_get_command_queue (), tex,
+                                         data, 0, NULL, NULL);
+  CL_CHECK;
+
+  return tex;
+
+error:
+  if (tex)
+    gegl_clReleaseMemObject (tex);
+
+  return NULL;
+}
+
+/* Computes the part of the input that has to be uploaded so that the
+ * kernel's fetch () can serve every pixel in @needed the way GeglSampler
+ * does, given the input's @abyss rectangle and abyss @policy.
+ */
+static gboolean
+cl_get_source_rect (const GeglRectangle *needed,
+                    const GeglRectangle *abyss,
+                    GeglAbyssPolicy      policy,
+                    GeglRectangle       *src_rect)
+{
+  if (gegl_rectangle_is_infinite_plane (abyss))
+    {
+      if (policy == GEGL_ABYSS_LOOP)
+        return FALSE;
+
+      *src_rect = *needed;
+    }
+  else if (abyss->width < 1 || abyss->height < 1)
+    {
+      return FALSE;
+    }
+  else if (policy == GEGL_ABYSS_LOOP)
+    {
+      if (gegl_rectangle_contains (abyss, needed))
+        *src_rect = *needed;
+      else
+        *src_rect = *abyss;
+    }
+  else if (policy == GEGL_ABYSS_CLAMP)
+    {
+      /* where @needed lands after clamping to @abyss */
+      gint x0 = CLAMP (needed->x, abyss->x, abyss->x + abyss->width - 1);
+      gint y0 = CLAMP (needed->y, abyss->y, abyss->y + abyss->height - 1);
+      gint x1 = CLAMP (needed->x + needed->width - 1,
+                       abyss->x, abyss->x + abyss->width - 1);
+      gint y1 = CLAMP (needed->y + needed->height - 1,
+                       abyss->y, abyss->y + abyss->height - 1);
+
+      *src_rect = *GEGL_RECTANGLE (x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+    }
+  else if (! gegl_rectangle_intersect (src_rect, needed, abyss))
+    {
+      /* everything is abyss, the uploaded pixel is never read */
+      *src_rect = *GEGL_RECTANGLE (abyss->x, abyss->y, 1, 1);
+    }
+
+  return (gdouble) src_rect->width * src_rect->height <= (1 << 26);
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *result,
+            const GeglRectangle *boundary,
+            LensValues          *lens,
+            const gfloat        *background)
+{
+  const Babl           *out_format = gegl_operation_get_format (operation, "output");
+  const Babl           *format     = babl_format_with_space ("RaGaBaA float",
+                                                             out_format);
+  const GeglRectangle  *abyss      = gegl_buffer_get_abyss (input);
+  GeglRectangle         needed     = *boundary;
+  GeglRectangle         src_rect;
+  GeglBufferClIterator *i;
+  cl_mem                in_tex     = NULL;
+  cl_mem                areas_tex  = NULL;
+  cl_int                cl_err     = 0;
+  gboolean              err;
+  cl_int4              *areas;
+  cl_int4               srect;
+  cl_int4               abyss4;
+  cl_int4               boundary4;
+  cl_float4             bg;
+  cl_int                chunks_x   = (result->width  + CHUNK_SIZE - 1) / CHUNK_SIZE;
+  cl_int                chunks_y   = (result->height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+  cl_int                unpremultiply;
+  cl_float              centre_x   = lens->centre_x;
+  cl_float              centre_y   = lens->centre_y;
+  cl_float              mult_sq    = lens->mult_sq;
+  cl_float              mult_qd    = lens->mult_qd;
+  cl_float              rescale    = lens->rescale;
+  cl_float              brighten   = lens->brighten;
+  cl_float              norm       = lens->norm;
+  gint                  j, k;
+
+  if (out_format == format)
+    unpremultiply = 0;
+  else if (out_format == babl_format_with_space ("RGBA float", out_format))
+    unpremultiply = 1;
+  else
+    return FALSE;
+
+  /* the source area of each chunk, as process () computes it */
+  areas = g_new (cl_int4, chunks_x * chunks_y);
+
+  for (k = 0; k < chunks_y; k++)
+    for (j = 0; j < chunks_x; j++)
+      {
+        GeglRectangle chunk;
+        GeglRectangle area;
+
+        chunk = *GEGL_RECTANGLE (result->x + j * CHUNK_SIZE,
+                                 result->y + k * CHUNK_SIZE,
+                                 CHUNK_SIZE, CHUNK_SIZE);
+        gegl_rectangle_intersect (&chunk, &chunk, result);
+
+        area = get_required ((GeglRectangle *) boundary, &chunk, operation);
+        clamp_area (&area, lens->centre_x, lens->centre_y);
+
+        areas[k * chunks_x + j].s[0] = area.x;
+        areas[k * chunks_x + j].s[1] = area.y;
+        areas[k * chunks_x + j].s[2] = area.width;
+        areas[k * chunks_x + j].s[3] = area.height;
+
+        gegl_rectangle_bounding_box (&needed, &needed, &area);
+      }
+
+  /* samples outside an area are averaged with their top-left neighbours */
+  needed.x      -= 1;
+  needed.y      -= 1;
+  needed.width  += 1;
+  needed.height += 1;
+
+  if (! cl_get_source_rect (&needed, abyss, GEGL_ABYSS_CLAMP, &src_rect))
+    {
+      g_free (areas);
+      return FALSE;
+    }
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"lens_distortion", NULL};
+      cl_data = gegl_cl_compile_and_build (lens_distortion_cl_source,
+                                           kernel_name);
+    }
+
+  if (!cl_data)
+    {
+      g_free (areas);
+      return FALSE;
+    }
+
+  srect.s[0]     = src_rect.x;
+  srect.s[1]     = src_rect.y;
+  srect.s[2]     = src_rect.width;
+  srect.s[3]     = src_rect.height;
+  abyss4.s[0]    = abyss->x;
+  abyss4.s[1]    = abyss->y;
+  abyss4.s[2]    = abyss->width;
+  abyss4.s[3]    = abyss->height;
+  boundary4.s[0] = boundary->x;
+  boundary4.s[1] = boundary->y;
+  boundary4.s[2] = boundary->width;
+  boundary4.s[3] = boundary->height;
+  for (j = 0; j < 4; j++)
+    bg.s[j] = background[j];
+
+  areas_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                   CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                   chunks_x * chunks_y * sizeof (cl_int4),
+                                   areas, &cl_err);
+  g_free (areas);
+  if (cl_err != CL_SUCCESS)
+    return FALSE;
+
+  in_tex = cl_upload_rect (input, &src_rect, format);
+  if (!in_tex)
+    {
+      gegl_clReleaseMemObject (areas_tex);
+      return FALSE;
+    }
+
+  i = gegl_buffer_cl_iterator_new (output, result, out_format,
+                                   GEGL_CL_BUFFER_WRITE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err))
+    {
+      size_t global_ws[2];
+
+      if (err)
+        goto error_iter;
+
+      global_ws[0] = i->roi[0].width;
+      global_ws[1] = i->roi[0].height;
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem),    &in_tex,
+                                        sizeof (cl_int4),   &srect,
+                                        sizeof (cl_int4),   &abyss4,
+                                        sizeof (cl_mem),    &i->tex[0],
+                                        sizeof (cl_int),    &i->roi[0].x,
+                                        sizeof (cl_int),    &i->roi[0].y,
+                                        sizeof (cl_int),    &result->x,
+                                        sizeof (cl_int),    &result->y,
+                                        sizeof (cl_mem),    &areas_tex,
+                                        sizeof (cl_int),    &chunks_x,
+                                        sizeof (cl_int4),   &boundary4,
+                                        sizeof (cl_float4), &bg,
+                                        sizeof (cl_float),  &centre_x,
+                                        sizeof (cl_float),  &centre_y,
+                                        sizeof (cl_float),  &mult_sq,
+                                        sizeof (cl_float),  &mult_qd,
+                                        sizeof (cl_float),  &rescale,
+                                        sizeof (cl_float),  &brighten,
+                                        sizeof (cl_float),  &norm,
+                                        sizeof (cl_int),    &unpremultiply,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2,
+                                            NULL, global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  gegl_clReleaseMemObject (in_tex);
+  gegl_clReleaseMemObject (areas_tex);
+
+  return TRUE;
+
+error:
+  gegl_buffer_cl_iterator_stop (i);
+error_iter:
+  gegl_clReleaseMemObject (in_tex);
+  gegl_clReleaseMemObject (areas_tex);
+
+  return FALSE;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -414,10 +690,18 @@ process (GeglOperation       *operation,
   boundary = *gegl_operation_source_get_bounding_box (operation, "input");
   lens     =  lens_setup_calc (o, boundary);
 
+  gegl_color_get_pixel (o->background, format, background);
+
+  if (level == 0 && gegl_operation_use_opencl (operation) &&
+      cl_process (operation, input, output, result, &boundary, &lens,
+                  background))
+    {
+      g_object_unref (sampler);
+      return TRUE;
+    }
+
   src_buf = g_new0 (gfloat, SQR (MAX_WH) * 4);
   dst_buf = g_new0 (gfloat, SQR (CHUNK_SIZE) * 4);
-
-  gegl_color_get_pixel (o->background, format, background);
 
   for (j = 0; (j-1) * CHUNK_SIZE < result->height; j++)
     for (i = 0; (i-1) * CHUNK_SIZE < result->width; i++)
@@ -491,6 +775,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->get_required_for_output = get_required_for_output;
 
   filter_class->process                    = process;
+  operation_class->opencl_support          = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",                  "gegl:lens-distortion",
