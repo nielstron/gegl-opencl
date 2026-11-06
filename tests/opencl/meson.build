@@ -18,6 +18,7 @@ opencl_tests = [
   'pixelize',
   'snn-mean',
   'svg-src-over',
+  'texturize-canvas',
   'threshold',
   'value-invert',
   'vignette',

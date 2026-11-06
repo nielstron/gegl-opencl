@@ -4191,7 +4191,8 @@ prepare (GeglOperation *operation)
 #include "opencl/gegl-cl.h"
 #include "opencl/texturize-canvas.cl.h"
 
-static GeglClRunData *cl_data = NULL;
+static GeglClRunData *cl_data   = NULL;
+static cl_mem         sdata_tex = NULL;
 
 static gboolean
 cl_process(GeglOperation *op,
@@ -4245,10 +4246,20 @@ cl_process(GeglOperation *op,
    {
       cl_int cl_err = 0;
 
-      cl_mem sdata_tex = gegl_clCreateBuffer(gegl_cl_get_context(),
-                                             CL_MEM_USE_HOST_PTR|CL_MEM_READ_ONLY,
-                                             sizeof(cl_float)*128*128,(void *)sdata , &cl_err);
-      CL_CHECK;
+      /* The canvas table is static const data in a read-only section.
+       * With CL_MEM_USE_HOST_PTR the implementation may use that memory
+       * directly as backing store and touch it as writable, which kills
+       * the process with SIGBUS on Apple's OpenCL.  Copy it once into a
+       * device buffer instead and keep that for the program's lifetime.
+       */
+      if (!sdata_tex)
+        {
+          sdata_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                           CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                           sizeof (cl_float) * 128 * 128,
+                                           (void *) sdata, &cl_err);
+          CL_CHECK;
+        }
 
       cl_err = gegl_cl_set_kernel_args(cl_data->kernel[0],
                                        sizeof(cl_mem), (void *)&in_tex,
@@ -4268,12 +4279,6 @@ cl_process(GeglOperation *op,
                                            cl_data->kernel[0], 2, NULL,
                                            global_ws, NULL, 0, NULL, NULL);
       CL_CHECK;
-
-      cl_err = gegl_clFinish(gegl_cl_get_command_queue());
-      CL_CHECK;
-
-      cl_err = gegl_clReleaseMemObject(sdata_tex);
-      CL_CHECK_ONLY(cl_err);
 
       return FALSE;
 
