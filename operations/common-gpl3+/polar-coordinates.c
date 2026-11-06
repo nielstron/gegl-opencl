@@ -352,6 +352,100 @@ error:
   return NULL;
 }
 
+/* In "to polar" = FALSE mode, everything calc_undistorted_coords () computes
+ * except the radius depends only on the column, and the result is
+ *
+ *   x = xm + rmax * sin (phi2) * f,  y = ym + rmax * cos (phi2) * f
+ *
+ * (with signs depending on the quadrant), f being the row's relative
+ * distance from the top or bottom.  The angle is too sensitive for single
+ * precision, e.g. 4097 pixels wide its rounding moves the sampled position
+ * by up to 0.015 pixels, so the per column factors are computed here in
+ * double precision, the same way calc_undistorted_coords () does.
+ */
+static void
+polar_column_factors (GeglProperties      *o,
+                      const GeglRectangle *boundary,
+                      gint                 wx,
+                      cl_float            *fx,
+                      cl_float            *fy)
+{
+  const gint    x1 = 0, y1 = 0;
+  const gint    x2 = boundary->width, y2 = boundary->height;
+  const gint    xdiff = x2 - x1, ydiff = y2 - y1;
+  const gdouble xm = xdiff / 2.0, ym = ydiff / 2.0;
+  const gdouble circle = o->depth;
+  const gdouble angl = (gdouble) o->angle / 180.0 * G_PI;
+  gdouble       phi, phi2, xx, m, xmax, ymax, rmax, t, sx, sy;
+
+  if (o->bw)
+    phi = (2 * G_PI) * (x2 - wx) / xdiff;
+  else
+    phi = (2 * G_PI) * (wx - x1) / xdiff;
+
+  phi = fmod (phi + angl, 2 * G_PI);
+
+  if (phi >= 1.5 * G_PI)
+    phi2 = 2 * G_PI - phi;
+  else if (phi >= G_PI)
+    phi2 = phi - G_PI;
+  else if (phi >= 0.5 * G_PI)
+    phi2 = G_PI - phi;
+  else
+    phi2 = phi;
+
+  xx = tan (phi2);
+  if (xx != 0)
+    m = (double) 1.0 / xx;
+  else
+    m = 0;
+
+  if (m <= ((double)(ydiff) / (double)(xdiff)))
+    {
+      if (phi2 == 0)
+        {
+          xmax = 0;
+          ymax = ym - y1;
+        }
+      else
+        {
+          xmax = xm - x1;
+          ymax = m * xmax;
+        }
+    }
+  else
+    {
+      ymax = ym - y1;
+      xmax = ymax / m;
+    }
+
+  rmax = sqrt ((double)(SQR (xmax) + SQR (ymax)));
+
+  t = ((ym - y1) < (xm - x1)) ? (ym - y1) : (xm - x1);
+
+  rmax = (rmax - t) / 100.0 * (100 - circle) + t;
+
+  sx = rmax * sin (phi2);
+  sy = rmax * cos (phi2);
+
+  if (phi >= 1.5 * G_PI)
+    {
+      sx = -sx;
+      sy = -sy;
+    }
+  else if (phi >= G_PI)
+    {
+      sx = -sx;
+    }
+  else if (phi < 0.5 * G_PI)
+    {
+      sy = -sy;
+    }
+
+  *fx = sx;
+  *fy = sy;
+}
+
 /* Implements process () with the NoHalo sampler on the GPU.  Samples are
  * only taken at positions that round to a pixel inside the input's bounding
  * box, so only the part of the abyss rectangle that NoHalo's stencil can
@@ -374,6 +468,9 @@ cl_process (GeglOperation       *operation,
   GeglRectangle         src_rect;
   GeglBufferClIterator *i;
   cl_mem                in_tex = NULL;
+  cl_mem                col_tex = NULL;
+  cl_float2            *cols;
+  cl_int                n_cols;
   cl_int                cl_err = 0;
   gboolean              err;
   cl_int4               srect;
@@ -426,9 +523,32 @@ cl_process (GeglOperation       *operation,
   abyss4.s[2] = abyss->width;
   abyss4.s[3] = abyss->height;
 
+  /* per column factors for polar == FALSE; a dummy entry otherwise */
+  n_cols = polar ? 1 : roi->width;
+  cols   = g_new0 (cl_float2, n_cols);
+
+  if (! polar)
+    {
+      gint x;
+
+      for (x = 0; x < roi->width; x++)
+        polar_column_factors (o, boundary, roi->x + x,
+                              &cols[x].s[0], &cols[x].s[1]);
+    }
+
+  col_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                 CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                 n_cols * sizeof (cl_float2), cols, &cl_err);
+  g_free (cols);
+  if (cl_err != CL_SUCCESS)
+    return FALSE;
+
   in_tex = cl_upload_rect (input, &src_rect, interpolate_format);
   if (!in_tex)
-    return FALSE;
+    {
+      gegl_clReleaseMemObject (col_tex);
+      return FALSE;
+    }
 
   i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
 
@@ -459,6 +579,8 @@ cl_process (GeglOperation       *operation,
                                         sizeof (cl_int),   &bw,
                                         sizeof (cl_int),   &top,
                                         sizeof (cl_int),   &polar,
+                                        sizeof (cl_mem),   &col_tex,
+                                        sizeof (cl_int),   &roi->x,
                                         sizeof (cl_int),   &unpremultiply,
                                         NULL);
       CL_CHECK;
@@ -471,6 +593,7 @@ cl_process (GeglOperation       *operation,
     }
 
   gegl_clReleaseMemObject (in_tex);
+  gegl_clReleaseMemObject (col_tex);
 
   return TRUE;
 
@@ -478,6 +601,7 @@ error:
   gegl_buffer_cl_iterator_stop (i);
 error_iter:
   gegl_clReleaseMemObject (in_tex);
+  gegl_clReleaseMemObject (col_tex);
 
   return FALSE;
 }

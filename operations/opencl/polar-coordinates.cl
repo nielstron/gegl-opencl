@@ -829,11 +829,12 @@ polar_unmap (float  wx,
              int    bw,
              int    top,
              int    polar,
+             float2 col,
              float *x,
              float *y)
 {
-  float phi = 0.0f, phi2;
-  float xx, yy, r = 0.0f, m;
+  float phi = 0.0f;
+  float r = 0.0f, m;
   float xmax, ymax, rmax, t;
   float x_calc, y_calc;
   const int   x1 = 0, y1 = 0, x2 = width, y2 = height;
@@ -907,81 +908,16 @@ polar_unmap (float  wx,
     }
   else
     {
-      if (bw)
-        phi = (2 * M_PI_F) * (x2 - wx) / xdiff;
-      else
-        phi = (2 * M_PI_F) * (wx - x1) / xdiff;
-
-      phi = gegl_fmod (phi + angl, 2 * M_PI_F);
-
-      if (phi >= 1.5f * M_PI_F)
-        phi2 = 2 * M_PI_F - phi;
-      else if (phi >= M_PI_F)
-        phi2 = phi - M_PI_F;
-      else if (phi >= 0.5f * M_PI_F)
-        phi2 = M_PI_F - phi;
-      else
-        phi2 = phi;
-
-      xx = tan (phi2);
-      if (xx != 0)
-        m = 1.0f / xx;
-      else
-        m = 0;
-
-      if (m <= ((float) ydiff / (float) xdiff))
-        {
-          if (phi2 == 0)
-            {
-              xmax = 0;
-              ymax = ym - y1;
-            }
-          else
-            {
-              xmax = xm - x1;
-              ymax = m * xmax;
-            }
-        }
-      else
-        {
-          ymax = ym - y1;
-          xmax = ymax / m;
-        }
-
-      rmax = sqrt (xmax * xmax + ymax * ymax);
-
-      t = ((ym - y1) < (xm - x1)) ? (ym - y1) : (xm - x1);
-
-      rmax = (rmax - t) / 100.0f * (100 - circle) + t;
-
+      /* col holds the column's +-rmax * sin (phi2) and +-rmax * cos (phi2),
+       * computed on the host in double precision
+       */
       if (top)
-        r = rmax * ((wy - y1) / (float) ydiff);
+        r = (wy - y1) / (float) ydiff;
       else
-        r = rmax * ((y2 - wy) / (float) ydiff);
+        r = (y2 - wy) / (float) ydiff;
 
-      xx = r * sin (phi2);
-      yy = r * cos (phi2);
-
-      if (phi >= 1.5f * M_PI_F)
-        {
-          x_calc = xm - xx;
-          y_calc = ym - yy;
-        }
-      else if (phi >= M_PI_F)
-        {
-          x_calc = xm - xx;
-          y_calc = ym + yy;
-        }
-      else if (phi >= 0.5f * M_PI_F)
-        {
-          x_calc = xm + xx;
-          y_calc = ym + yy;
-        }
-      else
-        {
-          x_calc = xm + xx;
-          y_calc = ym - yy;
-        }
+      x_calc = xm + col.x * r;
+      y_calc = ym + col.y * r;
     }
 
   /* With rmax == 0 (the pole on the top or left edge) the coordinates
@@ -1015,6 +951,8 @@ polar_coordinates (__global const float4 *src,
                    int                    bw,
                    int                    top,
                    int                    polar,
+                   __global const float2 *cols,
+                   int                    cols_x,
                    int                    unpremultiply_output)
 {
   const int gidx = get_global_id (0);
@@ -1023,7 +961,8 @@ polar_coordinates (__global const float4 *src,
   float     px, py;
 
   if (polar_unmap (roi_x + gidx, roi_y + gidy, cen_x, cen_y, width, height,
-                   circle, angl, bw, top, polar, &px, &py))
+                   circle, angl, bw, top, polar,
+                   cols[polar ? 0 : roi_x + gidx - cols_x], &px, &py))
     {
       /* the CPU code passes an all-zero scale matrix, which disables
        * NoHalo's EWA path */
