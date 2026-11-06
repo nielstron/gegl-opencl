@@ -2,6 +2,7 @@ gegl_operations_opencl_sources = [
   'alien-map.cl',
   'bilateral-filter-fast.cl',
   'bilateral-filter.cl',
+  'bloom.cl',
   'box-blur.cl',
   'box-max.cl',
   'box-min.cl',
