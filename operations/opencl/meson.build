@@ -35,6 +35,7 @@ gegl_operations_opencl_sources = [
   'noise-simplex.cl',
   'oilify.cl',
   'opacity.cl',
+  'photocopy.cl',
   'pixelize.cl',
   'posterize.cl',
   'random.cl',
