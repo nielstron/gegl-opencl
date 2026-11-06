@@ -54,6 +54,7 @@ property_boolean (limit_exposure, _("Limit exposure"), FALSE)
 #define GEGL_OP_C_SOURCE bloom.c
 
 #include "gegl-op.h"
+#include "process/gegl-eval-manager-private.h"
 
 /* The bloom is computed by the graph below. With OpenCL the whole graph
  * runs in one go on the GPU instead, see cl_process ().
@@ -339,6 +340,48 @@ cleanup:
   return ok;
 }
 
+/* Clips the input to its bounding box, which is where the blur clamps */
+static GeglBuffer *
+clip_input (GeglOperation *operation,
+            GeglBuffer    *input)
+{
+  const GeglRectangle *in_rect =
+    gegl_operation_source_get_bounding_box (operation, "input");
+
+  if (input && in_rect && ! gegl_rectangle_is_infinite_plane (in_rect))
+    return gegl_buffer_create_sub_buffer (input, in_rect);
+
+  return input ? g_object_ref (input) : NULL;
+}
+
+/* Renders result of the graph at level, as the meta-operation did */
+static GeglBuffer *
+process_graph (GeglOperation       *operation,
+               GeglBuffer          *source,
+               const GeglRectangle *result,
+               gint                 level)
+{
+  GeglProperties  *o = GEGL_PROPERTIES (operation);
+  GeglEvalManager *eval;
+  GeglBuffer      *output;
+  GeglNode        *gegl;
+  GeglNode        *sink;
+
+  gegl = gegl_node_new ();
+  g_object_set (gegl, "use-opencl", gegl_operation_use_opencl (operation),
+                NULL);
+
+  sink = build_graph (gegl, source, o);
+
+  eval   = gegl_eval_manager_new (sink, "output");
+  output = gegl_eval_manager_apply (eval, result, level);
+
+  g_object_unref (eval);
+  g_object_unref (gegl);
+
+  return output;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -346,35 +389,59 @@ process (GeglOperation       *operation,
          const GeglRectangle *result,
          gint                 level)
 {
-  GeglProperties      *o       = GEGL_PROPERTIES (operation);
-  const GeglRectangle *in_rect =
-    gegl_operation_source_get_bounding_box (operation, "input");
-  GeglBuffer          *source;
-  GeglNode            *gegl;
-  GeglNode            *sink;
+  GeglBuffer *source = clip_input (operation, input);
+  GeglBuffer *buffer;
 
-  /* Clip the input to its bounding box, which is where the blur clamps */
-  if (in_rect && ! gegl_rectangle_is_infinite_plane (in_rect))
-    source = gegl_buffer_create_sub_buffer (input, in_rect);
-  else
-    source = g_object_ref (input);
-
-  if (level == 0 && gegl_operation_use_opencl (operation) &&
-      cl_process (operation, source, output, result))
+  /* operation_process () only gets here at level 0 with OpenCL */
+  if (! cl_process (operation, source, output, result))
     {
-      g_object_unref (source);
-      return TRUE;
+      buffer = process_graph (operation, source, result, level);
+
+      if (buffer)
+        {
+          gegl_buffer_copy (buffer, result, GEGL_ABYSS_NONE, output, result);
+          g_object_unref (buffer);
+        }
     }
 
-  gegl = gegl_node_new ();
-  g_object_set (gegl, "use-opencl", gegl_operation_use_opencl (operation),
-                NULL);
-
-  sink = build_graph (gegl, source, o);
-  gegl_node_blit_buffer (sink, output, result, level, GEGL_ABYSS_NONE);
-
-  g_object_unref (gegl);
   g_object_unref (source);
+
+  return TRUE;
+}
+
+/* Without OpenCL, and at mipmap levels, the output is the buffer the graph
+ * renders, as when this was a meta-operation; copying it to the output
+ * with gegl_buffer_copy () would only copy its level 0.
+ */
+static gboolean
+operation_process (GeglOperation        *operation,
+                   GeglOperationContext *context,
+                   const gchar          *output_prop,
+                   const GeglRectangle  *result,
+                   gint                  level)
+{
+  GeglOperationClass *operation_class;
+  GeglBuffer         *input;
+  GeglBuffer         *source;
+  GeglBuffer         *output;
+
+  if (level == 0 && gegl_operation_use_opencl (operation))
+    {
+      operation_class = GEGL_OPERATION_CLASS (gegl_op_parent_class);
+
+      return operation_class->process (operation, context, output_prop,
+                                       result, level);
+    }
+
+  input  = GEGL_BUFFER (gegl_operation_context_dup_object (context, "input"));
+  source = clip_input (operation, input);
+  output = process_graph (operation, source, result, level);
+
+  if (output)
+    gegl_operation_context_take_object (context, "output", G_OBJECT (output));
+
+  g_clear_object (&source);
+  g_clear_object (&input);
 
   return TRUE;
 }
@@ -393,6 +460,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->get_cached_region       = get_cached_region;
   operation_class->threaded                = FALSE;
   operation_class->opencl_support          = TRUE;
+  operation_class->process                 = operation_process;
   filter_class->process                    = process;
 
   gegl_operation_class_set_keys (operation_class,
