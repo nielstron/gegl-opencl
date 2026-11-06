@@ -40,6 +40,9 @@ property_double (contrast, _("Contrast"), 1.0)
 
 #include "gegl-op.h"
 
+/* The largest std-dev of gegl:gaussian-blur, which clamps std_dev to it */
+#define MAX_STD_DEV 1500.0
+
 /* The high-pass is computed by the graph below. With OpenCL the whole
  * graph runs in one go on the GPU instead, see cl_process ().
  */
@@ -49,13 +52,14 @@ build_graph (GeglNode       *gegl,
              GeglProperties *o)
 {
   GeglNode *image, *invert, *blur, *opacity, *over, *sub, *mul, *add, *gam0, *gam1;
+  gdouble   std_dev = MIN (o->std_dev, MAX_STD_DEV);
 
   image = gegl_node_new_child (gegl, "operation", "gegl:buffer-source",
                                "buffer", input, NULL);
   invert = gegl_node_new_child (gegl, "operation", "gegl:invert-gamma", NULL);
   blur = gegl_node_new_child (gegl, "operation", "gegl:gaussian-blur",
-                              "std-dev-x", o->std_dev,
-                              "std-dev-y", o->std_dev,
+                              "std-dev-x", std_dev,
+                              "std-dev-y", std_dev,
                               NULL);
   opacity = gegl_node_new_child (gegl, "operation", "gegl:opacity",
                                  "value", 0.5, NULL);
@@ -170,7 +174,7 @@ cl_process (GeglOperation       *operation,
   /* gegl:gaussian-blur works in RaGaBaA float */
   if (! gblur_mem_cl_read (input, extent, ragaba, image, FALSE) ||
       ! gblur_mem_cl_blur (image, blur, extent->width, extent->height, 4,
-                           o->std_dev, TRUE))
+                           MIN (o->std_dev, MAX_STD_DEV), TRUE))
     goto cleanup;
 
   stride   = extent->width;
