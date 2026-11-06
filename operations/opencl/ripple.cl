@@ -1061,8 +1061,33 @@ add_df (float  x,
  * cosine (.zw) of the column and the row phase instead, as hi/lo pairs,
  * and the kernel adds the two angles.  This way the kernel needs neither
  * the large products and remainders of nx, nor fp64.
-
+ *
+ * The host also computes the CPU's result where it is decided by the
+ * rounding of its double precision arithmetic, into the three planes of
+ * mask_plane bytes of mask, with bit (iy - phase_y0) * mask_width +
+ * (ix - phase_x0) for each pixel:
+ *
+ *  - MASK_SAWTOOTH, where the sawtooth wave's lambda is within mask_eps of
+ *    its discontinuity (e.g. at angle = 180, where sin (angle) is 1.2e-16
+ *    rather than 0): set when the CPU's lambda is close to the period
+ *    rather than to 0;
+ *  - MASK_X and MASK_Y, if mask_coords, for the nearest sampler where the
+ *    x or y coordinate is within 1/4 of 0, where float has its full
+ *    precision: set when the CPU samples column or row -1 rather than 0.
  */
+#define MASK_SAWTOOTH 0
+#define MASK_X        1
+#define MASK_Y        2
+
+static inline int
+mask_bit (__global const uchar *mask,
+          int                   mask_plane,
+          int                   plane,
+          int                   i)
+{
+  return (mask[plane * mask_plane + (i >> 3)] >> (i & 7)) & 1;
+}
+
 static inline void
 ripple (__global const float4 *src,
         int4                   srect,
@@ -1077,6 +1102,11 @@ ripple (__global const float4 *src,
         __global const float4 *phase_y,
         int                    phase_x0,
         int                    phase_y0,
+        __global const uchar  *mask,
+        int                    mask_width,
+        int                    mask_plane,
+        float                  mask_eps,
+        int                    mask_coords,
         float2                 amplitude,
         float2                 period,
         float2                 cos_angle,
@@ -1091,6 +1121,7 @@ ripple (__global const float4 *src,
   const float y    = iy;
   float2      w;
   float2      shift;
+  float2      coords;
   float4      out;
 
   if (wave_type == WAVE_TYPE_SINE)
@@ -1113,6 +1144,16 @@ ripple (__global const float4 *src,
       else if (! df_less (lambda, period))
         lambda = df_add (lambda, -period);
 
+      if (wave_type == WAVE_TYPE_SAWTOOTH &&
+          (lambda.x < mask_eps ||
+           df_less (df_add_f (period, -mask_eps), lambda)))
+        {
+          const int i = (iy - phase_y0) * mask_width + (ix - phase_x0);
+
+          lambda = mask_bit (mask, mask_plane, MASK_SAWTOOTH, i) ?
+                   period : (float2) (0.0f);
+        }
+
       q = df_div (lambda, period);
 
       if (wave_type == WAVE_TYPE_SAWTOOTH)
@@ -1133,9 +1174,21 @@ ripple (__global const float4 *src,
   shift = df_mul (amplitude, w);
 
   /* x + shift * sin (angle) and y + shift * cos (angle), rounded once */
-  out = sampler_get (src, srect, abyss, policy, sampler_type,
-                     add_df (x, df_mul (shift, sin_angle)),
+  coords = (float2) (add_df (x, df_mul (shift, sin_angle)),
                      add_df (y, df_mul (shift, cos_angle)));
+
+  if (sampler_type == SAMPLER_NEAREST && mask_coords)
+    {
+      const int i = (iy - phase_y0) * mask_width + (ix - phase_x0);
+
+      if (fabs (coords.x) < 0.25f)
+        coords.x = mask_bit (mask, mask_plane, MASK_X, i) ? -0.5f : 0.0f;
+      if (fabs (coords.y) < 0.25f)
+        coords.y = mask_bit (mask, mask_plane, MASK_Y, i) ? -0.5f : 0.0f;
+    }
+
+  out = sampler_get (src, srect, abyss, policy, sampler_type,
+                     coords.x, coords.y);
 
   if (unpremultiply_output)
     out = unpremultiply (out);
@@ -1157,6 +1210,11 @@ ripple_nearest (__global const float4 *src,
                 __global const float4 *phase_y,
                 int                    phase_x0,
                 int                    phase_y0,
+                __global const uchar  *mask,
+                int                    mask_width,
+                int                    mask_plane,
+                float                  mask_eps,
+                int                    mask_coords,
                 float2                 amplitude,
                 float2                 period,
                 float2                 cos_angle,
@@ -1164,7 +1222,9 @@ ripple_nearest (__global const float4 *src,
 {
   ripple (src, srect, abyss, policy, dst, roi_x, roi_y,
           unpremultiply_output, wave_type, phase_x, phase_y,
-          phase_x0, phase_y0, amplitude, period, cos_angle, sin_angle,
+          phase_x0, phase_y0, mask, mask_width, mask_plane,
+          mask_eps, mask_coords,
+          amplitude, period, cos_angle, sin_angle,
           SAMPLER_NEAREST);
 }
 
@@ -1182,6 +1242,11 @@ ripple_linear (__global const float4 *src,
                __global const float4 *phase_y,
                int                    phase_x0,
                int                    phase_y0,
+               __global const uchar  *mask,
+               int                    mask_width,
+               int                    mask_plane,
+               float                  mask_eps,
+               int                    mask_coords,
                float2                 amplitude,
                float2                 period,
                float2                 cos_angle,
@@ -1189,7 +1254,9 @@ ripple_linear (__global const float4 *src,
 {
   ripple (src, srect, abyss, policy, dst, roi_x, roi_y,
           unpremultiply_output, wave_type, phase_x, phase_y,
-          phase_x0, phase_y0, amplitude, period, cos_angle, sin_angle,
+          phase_x0, phase_y0, mask, mask_width, mask_plane,
+          mask_eps, mask_coords,
+          amplitude, period, cos_angle, sin_angle,
           SAMPLER_LINEAR);
 }
 
@@ -1207,6 +1274,11 @@ ripple_cubic (__global const float4 *src,
               __global const float4 *phase_y,
               int                    phase_x0,
               int                    phase_y0,
+              __global const uchar  *mask,
+              int                    mask_width,
+              int                    mask_plane,
+              float                  mask_eps,
+              int                    mask_coords,
               float2                 amplitude,
               float2                 period,
               float2                 cos_angle,
@@ -1214,7 +1286,9 @@ ripple_cubic (__global const float4 *src,
 {
   ripple (src, srect, abyss, policy, dst, roi_x, roi_y,
           unpremultiply_output, wave_type, phase_x, phase_y,
-          phase_x0, phase_y0, amplitude, period, cos_angle, sin_angle,
+          phase_x0, phase_y0, mask, mask_width, mask_plane,
+          mask_eps, mask_coords,
+          amplitude, period, cos_angle, sin_angle,
           SAMPLER_CUBIC);
 }
 
@@ -1232,6 +1306,11 @@ ripple_nohalo (__global const float4 *src,
                __global const float4 *phase_y,
                int                    phase_x0,
                int                    phase_y0,
+               __global const uchar  *mask,
+               int                    mask_width,
+               int                    mask_plane,
+               float                  mask_eps,
+               int                    mask_coords,
                float2                 amplitude,
                float2                 period,
                float2                 cos_angle,
@@ -1239,6 +1318,8 @@ ripple_nohalo (__global const float4 *src,
 {
   ripple (src, srect, abyss, policy, dst, roi_x, roi_y,
           unpremultiply_output, wave_type, phase_x, phase_y,
-          phase_x0, phase_y0, amplitude, period, cos_angle, sin_angle,
+          phase_x0, phase_y0, mask, mask_width, mask_plane,
+          mask_eps, mask_coords,
+          amplitude, period, cos_angle, sin_angle,
           SAMPLER_NOHALO);
 }

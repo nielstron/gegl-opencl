@@ -294,7 +294,7 @@ cl_sincos_cycles (gdouble  v,
 }
 
 /* Computes the phase table of the kernel: for i in [0, n), the phase of
- * (origin + i) * step + offset reduced modulo @period.  If
+ * (origin + i) * step + offset reduced modulo @period, into @phase.  If
  * @cycles, it is converted to units of the period, plus @cycles_offset,
  * and the table holds its sine and cosine as hi/lo pairs; else it holds
  * the phase, in pixels, in [-period / 2, period / 2], as a hi/lo pair.
@@ -306,7 +306,8 @@ cl_phase_table (gint      origin,
                 gdouble   offset,
                 gdouble   period,
                 gboolean  cycles,
-                gdouble   cycles_offset)
+                gdouble   cycles_offset,
+                gdouble  *phase)
 {
   cl_int     cl_err = 0;
   cl_mem     tex;
@@ -317,6 +318,8 @@ cl_phase_table (gint      origin,
     {
       gdouble   v = remainder ((origin + i) * step + offset, period);
       cl_float2 hi_lo;
+
+      phase[i] = v;
 
       if (cycles)
         {
@@ -351,6 +354,164 @@ cl_phase_table (gint      origin,
   return tex;
 }
 
+typedef struct
+{
+  gdouble phase;
+  gint    index;
+} ClRowPhase;
+
+static gint
+cl_row_phase_cmp (gconstpointer a,
+                  gconstpointer b)
+{
+  gdouble pa = ((const ClRowPhase *) a)->phase;
+  gdouble pb = ((const ClRowPhase *) b)->phase;
+
+  return (pa > pb) - (pa < pb);
+}
+
+/* The mask of the kernel (see ripple.cl): three planes of one bit per
+ * pixel of the roi, allocated when the first bit is set.
+ */
+typedef struct
+{
+  const GeglRectangle *roi;
+  gsize                plane;
+  guchar              *data;
+} ClMask;
+
+#define CL_MASK_SAWTOOTH 0
+#define CL_MASK_X        1
+#define CL_MASK_Y        2
+
+static void
+cl_mask_set (ClMask   *mask,
+             gint      plane,
+             gint      i,
+             gint      j,
+             gboolean  value)
+{
+  gsize bit = (gsize) j * mask->roi->width + i;
+
+  if (! mask->data)
+    {
+      mask->plane = ((gsize) mask->roi->width * mask->roi->height + 7) / 8;
+      mask->data  = g_malloc0 (3 * mask->plane);
+    }
+
+  if (value)
+    mask->data[plane * mask->plane + (bit >> 3)] |= 1 << (bit & 7);
+}
+
+/* Fills the sawtooth plane of @mask: for the pixels of the roi whose
+ * phase phase_x + phase_y is within @eps of a multiple of the period,
+ * sets the bit when the CPU's lambda, computed by the very same code as
+ * in process (), is closer to the period than to 0.
+ */
+static void
+cl_sawtooth_mask (ClMask        *mask,
+                  const gdouble *phase_x,
+                  const gdouble *phase_y,
+                  gdouble        eps,
+                  gdouble        angle_rad,
+                  gdouble        period,
+                  gdouble        phi)
+{
+  const GeglRectangle *roi  = mask->roi;
+  ClRowPhase          *rows = g_new (ClRowPhase, roi->height);
+  gint                 i, j, k;
+
+  for (j = 0; j < roi->height; j++)
+    {
+      rows[j].phase = phase_y[j];
+      rows[j].index = j;
+    }
+
+  qsort (rows, roi->height, sizeof (ClRowPhase), cl_row_phase_cmp);
+
+  for (i = 0; i < roi->width; i++)
+    {
+      /* phase_x + phase_y is in [-period, period] */
+      for (k = -1; k <= 1; k++)
+        {
+          gdouble lo = k * period - phase_x[i] - eps;
+          gdouble hi = k * period - phase_x[i] + eps;
+          gint    first = 0;
+          gint    last  = roi->height;
+
+          /* the first row whose phase is > lo */
+          while (first < last)
+            {
+              gint mid = (first + last) / 2;
+
+              if (rows[mid].phase > lo)
+                last = mid;
+              else
+                first = mid + 1;
+            }
+
+          for (j = first; j < roi->height && rows[j].phase < hi; j++)
+            {
+              gint    x  = roi->x + i;
+              gint    y  = roi->y + rows[j].index;
+              gdouble nx = ripple_nx (angle_rad, x, y);
+
+              cl_mask_set (mask, CL_MASK_SAWTOOTH, i, rows[j].index,
+                           ripple_sawtooth_lambda (nx, period, phi) >
+                           period / 2);
+            }
+        }
+    }
+
+  g_free (rows);
+}
+
+/* Fills the coordinate planes of @mask, for the nearest sampler: for the
+ * pixels of the roi whose x coordinate can be within 1/4 of 0, which are
+ * the columns with |x| <= amplitude * |sin (angle)| + 1, sets the bit of
+ * the x plane when the CPU's coordinate, computed by the very same code as
+ * in process (), rounds to a negative float, i.e. when the sampler reads
+ * column -1 rather than 0; likewise for y.  Float has its full precision
+ * near 0, so the rounding errors of the coordinates decide there.
+ */
+static void
+cl_coords_mask (ClMask             *mask,
+                GeglRippleWaveType  wave_type,
+                gdouble             amplitude,
+                gdouble             period,
+                gdouble             phi,
+                gdouble             angle_rad)
+{
+  const GeglRectangle *roi = mask->roi;
+  gdouble              rx  = fabs (amplitude * sin (angle_rad)) + 1.0;
+  gdouble              ry  = fabs (amplitude * cos (angle_rad)) + 1.0;
+  /* the columns of the band */
+  gint                 i0  = MAX (ceil (-rx) - roi->x, 0);
+  gint                 i1  = MIN (floor (rx) - roi->x, roi->width - 1);
+  gint                 i, j;
+
+  for (j = 0; j < roi->height; j++)
+    {
+      gint     y      = roi->y + j;
+      gboolean y_band = fabs (y) <= ry;
+
+      for (i = y_band ? 0 : i0; i <= (y_band ? roi->width - 1 : i1); i++)
+        {
+          gint    x = roi->x + i;
+          gdouble coordsx;
+          gdouble coordsy;
+
+          ripple_coords (wave_type, amplitude, period, phi, angle_rad,
+                         x, y, &coordsx, &coordsy);
+
+          if (fabs (x) <= rx)
+            cl_mask_set (mask, CL_MASK_X, i, j, (gfloat) coordsx < 0.0f);
+          if (y_band)
+            cl_mask_set (mask, CL_MASK_Y, i, j, (gfloat) coordsy < 0.0f);
+        }
+    }
+}
+
 static gboolean
 cl_process (GeglOperation       *operation,
             GeglBuffer          *input,
@@ -380,6 +541,14 @@ cl_process (GeglOperation       *operation,
   cl_int                wave_type   = o->wave_type;
   cl_mem                phase_x     = NULL;
   cl_mem                phase_y     = NULL;
+  cl_mem                mask        = NULL;
+  gdouble              *phase_xd    = NULL;
+  gdouble              *phase_yd    = NULL;
+  ClMask                cl_mask     = { NULL, 0, NULL };
+  cl_int                mask_width  = roi->width;
+  cl_int                mask_plane  = 0;
+  cl_float              mask_eps    = 0.0f;
+  cl_int                mask_coords = 0;
   cl_int                phase_x0    = roi->x;
   cl_int                phase_y0    = roi->y;
   gdouble               cos_a       = cos (angle_rad);
@@ -479,12 +648,61 @@ cl_process (GeglOperation       *operation,
 
   /* nx = x * cos (angle) - y * sin (angle), split into a column and a row
    * term, each reduced on the host in double precision */
+  phase_xd = g_new (gdouble, roi->width);
+  phase_yd = g_new (gdouble, roi->height);
   phase_x = cl_phase_table (roi->x, roi->width, cos_a, offset, period,
-                            cycles, o->phi);
+                            cycles, o->phi, phase_xd);
   phase_y = cl_phase_table (roi->y, roi->height, -sin_a, 0.0, period,
-                            cycles, 0.0);
+                            cycles, 0.0, phase_yd);
   if (!phase_x || !phase_y)
     goto error_iter;
+
+  cl_mask.roi = roi;
+
+  if (o->wave_type == GEGL_RIPPLE_WAVE_TYPE_SAWTOOTH)
+    {
+      /* a bound on the difference between the phase of the tables and the
+       * CPU's, both of which are within a few ulps of the exact phase, and
+       * the kernel's, which is within about 2^-44 period of the tables' */
+      gdouble max_x = MAX (abs (roi->x), abs (roi->x + roi->width - 1));
+      gdouble max_y = MAX (abs (roi->y), abs (roi->y + roi->height - 1));
+      gdouble eps   = ldexp (max_x * fabs (cos_a) + max_y * fabs (sin_a) +
+                             fabs (offset) + period, -36);
+
+      cl_sawtooth_mask (&cl_mask, phase_xd, phase_yd, eps,
+                        angle_rad, period, o->phi);
+      /* the kernel looks up the pixels within eps / 2 of the discontinuity,
+       * which the mask has, if there are any */
+      if (cl_mask.data)
+        mask_eps = eps / 2;
+    }
+
+  if (o->sampler_type == GEGL_SAMPLER_NEAREST)
+    {
+      cl_coords_mask (&cl_mask, o->wave_type, amplitude, period, o->phi,
+                      angle_rad);
+      /* the kernel looks up the pixels whose coordinate is within 1/4 of 0,
+       * which the mask has, if there are any */
+      if (cl_mask.data)
+        mask_coords = 1;
+    }
+
+  mask_plane = cl_mask.plane;
+  mask = gegl_clCreateBuffer (gegl_cl_get_context (),
+                              CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                              cl_mask.data ? 3 * cl_mask.plane : 1,
+                              cl_mask.data ? (gpointer) cl_mask.data
+                                           : (gpointer) &mask_eps,
+                              &cl_err);
+  if (cl_err != CL_SUCCESS)
+    {
+      mask = NULL;
+      goto error_iter;
+    }
+
+  g_clear_pointer (&phase_xd, g_free);
+  g_clear_pointer (&phase_yd, g_free);
+  g_clear_pointer (&cl_mask.data, g_free);
 
   i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
 
@@ -512,6 +730,11 @@ cl_process (GeglOperation       *operation,
                                         sizeof (cl_mem),   &phase_y,
                                         sizeof (cl_int),   &phase_x0,
                                         sizeof (cl_int),   &phase_y0,
+                                        sizeof (cl_mem),   &mask,
+                                        sizeof (cl_int),   &mask_width,
+                                        sizeof (cl_int),   &mask_plane,
+                                        sizeof (cl_float), &mask_eps,
+                                        sizeof (cl_int),   &mask_coords,
                                         sizeof (cl_float2), &f_amplitude,
                                         sizeof (cl_float2), &f_period,
                                         sizeof (cl_float2), &cos_angle,
@@ -529,6 +752,7 @@ cl_process (GeglOperation       *operation,
   gegl_clReleaseMemObject (in_tex);
   gegl_clReleaseMemObject (phase_x);
   gegl_clReleaseMemObject (phase_y);
+  gegl_clReleaseMemObject (mask);
 
   return TRUE;
 
@@ -540,6 +764,11 @@ error_iter:
     gegl_clReleaseMemObject (phase_x);
   if (phase_y)
     gegl_clReleaseMemObject (phase_y);
+  if (mask)
+    gegl_clReleaseMemObject (mask);
+  g_free (phase_xd);
+  g_free (phase_yd);
+  g_free (cl_mask.data);
 
   return FALSE;
 }
