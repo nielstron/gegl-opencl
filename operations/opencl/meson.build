@@ -9,6 +9,7 @@ gegl_operations_opencl_sources = [
   'brightness-contrast.cl',
   'c2g.cl',
   'checkerboard.cl',
+  'color-enhance.cl',
   'color-exchange.cl',
   'color-temperature.cl',
   'color-to-alpha.cl',
