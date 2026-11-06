@@ -507,7 +507,12 @@ with multi-threading - and should be added back later.
                 skip = 0;
               rows-=skip;
 #endif
-              if (rows==1)
+              /* the span can be entirely outside the abyss, don't hand
+               * babl an empty conversion, its reference paths assert on it
+               */
+              if (pixels <= 0)
+                ;
+              else if (rows==1)
                 babl_process (fish,bp + lskip * bpx_size + skip * buf_stride, tp + lskip * px_size + skip * tile_stride, pixels);
               else if (rows>0)
                 babl_process_rows (fish,
