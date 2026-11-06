@@ -383,12 +383,12 @@ cl_process (GeglOperation       *operation,
 }
 
 static gboolean
-process (GeglOperation       *operation,
-         GeglBuffer          *input,
-         GeglBuffer          *aux,
-         GeglBuffer          *output,
-         const GeglRectangle *roi,
-         gint                 level)
+cpu_process (GeglOperation       *operation,
+             GeglBuffer          *input,
+             GeglBuffer          *aux,
+             GeglBuffer          *output,
+             const GeglRectangle *roi,
+             gint                 level)
 {
   GeglProperties *o           = GEGL_PROPERTIES (operation);
   const Babl     *format      = gegl_operation_get_format (operation, "input");
@@ -409,11 +409,6 @@ process (GeglOperation       *operation,
   gint            iradius     = floorf (radius + 0.5f);
   gint            size        = 2 * iradius + 1;
   gint            y;
-
-  /* the OpenCL implementation does not support masks */
-  if (! aux && gegl_operation_use_opencl (operation))
-    if (cl_process (operation, input, output, roi))
-      return TRUE;
 
   highlight_threshold_low  = o->highlight_threshold_low;
   highlight_threshold_high = o->highlight_threshold_high;
@@ -723,6 +718,39 @@ process (GeglOperation       *operation,
   gegl_free (in);
 
   return TRUE;
+}
+
+static gboolean
+process (GeglOperation       *operation,
+         GeglBuffer          *input,
+         GeglBuffer          *aux,
+         GeglBuffer          *output,
+         const GeglRectangle *roi,
+         gint                 level)
+{
+  /* the OpenCL implementation does not support masks */
+  if (! aux && gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, roi))
+      return TRUE;
+
+  /* GEGL does not thread operations with OpenCL support while OpenCL is
+   * active, but the mask path and the fallback run on the CPU, so
+   * distribute them here.  When the operation is already being processed
+   * in parallel, this runs serially.
+   */
+  if (gegl_cl_is_accelerated ())
+    {
+      gegl_parallel_distribute_area (
+        roi, gegl_operation_get_pixels_per_thread (operation),
+        [=] (const GeglRectangle *area)
+        {
+          cpu_process (operation, input, aux, output, area, level);
+        });
+
+      return TRUE;
+    }
+
+  return cpu_process (operation, input, aux, output, roi, level);
 }
 
 static void
