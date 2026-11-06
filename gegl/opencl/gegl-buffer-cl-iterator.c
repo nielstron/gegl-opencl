@@ -139,10 +139,17 @@ gegl_buffer_cl_iterator_add_2 (GeglBufferClIterator  *iterator,
       gegl_cl_color_babl (buffer_format, &i->buf_cl_format_size[self]);
       gegl_cl_color_babl (format,        &i->op_cl_format_size [self]);
 
-      /* alpha, non-alpha & GEGL_ABYSS_NONE */
+      /* alpha, non-alpha & GEGL_ABYSS_NONE, taking the area around
+       * the result that is read into account
+       */
+      GeglRectangle read_rect = {result->x - left,
+                                 result->y - top,
+                                 result->width  + left + right,
+                                 result->height + top  + bottom};
+
       if (babl_format_has_alpha(buffer_format) != babl_format_has_alpha(format) &&
           abyss_policy == GEGL_ABYSS_NONE &&
-          !gegl_rectangle_contains (gegl_buffer_get_extent (buffer), result))
+          !gegl_rectangle_contains (gegl_buffer_get_extent (buffer), &read_rect))
         {
           i->conv[self] = GEGL_CL_COLOR_NOT_SUPPORTED;
           GEGL_NOTE (GEGL_DEBUG_OPENCL, "Performance warning: not using color conversion "
