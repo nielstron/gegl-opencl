@@ -15,6 +15,7 @@ gegl_operations_opencl_sources = [
   'colors-8bit-lut.cl',
   'colors.cl',
   'contrast-curve.cl',
+  'deinterlace.cl',
   'diffraction-patterns.cl',
   'edge-laplace.cl',
   'edge-sobel.cl',

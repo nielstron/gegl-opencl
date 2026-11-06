@@ -4,6 +4,7 @@ opencl_tests = [
   'box-blur',
   'brightness-contrast',
   'color-temperature',
+  'deinterlace',
   'edge-sobel',
   'focus-blur',
   'gaussian-blur',

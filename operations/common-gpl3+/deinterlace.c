@@ -75,8 +75,18 @@ prepare (GeglOperation *operation)
 
   gegl_operation_set_format (operation, "input",
                              babl_format_with_space ("RGBA float", space));
-  gegl_operation_set_format (operation, "output",
-                             babl_format_with_space ("RGBA float", space));
+
+  /* The OpenCL path applies the sRGB TRC itself, since R'G'B'A float is
+   * much cheaper to convert to the usual 8-bit formats on the CPU.
+   */
+  if (gegl_operation_use_opencl (operation) &&
+      babl_format_get_space (babl_format_with_space ("RGBA float", space)) ==
+      babl_space ("sRGB"))
+    gegl_operation_set_format (operation, "output",
+                               babl_format ("R'G'B'A float"));
+  else
+    gegl_operation_set_format (operation, "output",
+                               babl_format_with_space ("RGBA float", space));
 }
 
 static GeglRectangle
@@ -230,6 +240,163 @@ deinterlace_vertical (gfloat              *src_buf,
     }
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+#include "opencl/deinterlace.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *result,
+            const GeglRectangle *boundary)
+{
+  GeglProperties          *o          = GEGL_PROPERTIES (operation);
+  GeglOperationAreaFilter *op_area    = GEGL_OPERATION_AREA_FILTER (operation);
+  const Babl              *in_format  = gegl_operation_get_format (operation, "input");
+  const Babl              *out_format = gegl_operation_get_format (operation, "output");
+  GeglBufferClIterator    *i;
+  cl_int                   horizontal = o->orientation == GEGL_ORIENTATION_HORIZONTAL;
+  cl_int                   keep       = o->keep;
+  cl_int                   size       = o->size;
+  cl_int                   to_gamma;
+  cl_int                   extent;
+  cl_int                   rect_origin;
+  cl_int                   rect_x;
+  cl_int                   rect_width;
+  cl_int                   wrap_y     = result->y;
+  cl_mem                   wrap       = NULL;
+  cl_int                   cl_err     = 0;
+  gboolean                 err        = FALSE;
+  gint                     read;
+
+  /* The CPU code mixes absolute and relative coordinates in a way that
+   * only works for an input at the origin; size 0 divides by zero.
+   */
+  if (boundary->x != 0 || boundary->y != 0 || size < 1)
+    return FALSE;
+
+  if (out_format == in_format)
+    to_gamma = FALSE;
+  else if (babl_format_get_space (in_format) == babl_space ("sRGB") &&
+           babl_model_is (babl_format_get_model (out_format), "R'G'B'A"))
+    to_gamma = TRUE;
+  else
+    return FALSE;
+
+  /* The source rectangle of process () */
+  rect_x     = CLAMP (result->x - op_area->left, boundary->x,
+                      boundary->x + boundary->width);
+  rect_width = CLAMP (result->width + op_area->left + op_area->right, 0,
+                      boundary->width);
+
+  if (horizontal)
+    {
+      extent      = boundary->height;
+      rect_origin = CLAMP (result->y - op_area->top, boundary->y,
+                           boundary->y + boundary->height);
+    }
+  else
+    {
+      extent      = boundary->width;
+      rect_origin = rect_x;
+    }
+
+  if (rect_width < 1)
+    return FALSE;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "deinterlace", NULL };
+      cl_data = gegl_cl_compile_and_build (deinterlace_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return FALSE;
+
+  /* In the vertical orientation, the CPU code reads columns past the end
+   * of a row of its source rectangle from the start of the next row; the
+   * OpenCL chunks need not contain these, so upload them separately (one
+   * row more than the CPU has, where it reads past its buffer).
+   */
+  {
+    GeglRectangle  wrap_rect = { rect_x, result->y, size, result->height + 1 };
+    gint           n         = horizontal ? 1 : wrap_rect.width * wrap_rect.height;
+    gfloat        *wrap_buf  = g_new0 (gfloat, n * 4);
+
+    if (!horizontal)
+      gegl_buffer_get (input, &wrap_rect, 1.0, in_format, wrap_buf,
+                       GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
+
+    wrap = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                n * 4 * sizeof (gfloat), wrap_buf, &cl_err);
+    g_free (wrap_buf);
+
+    if (cl_err != CL_SUCCESS)
+      return FALSE;
+  }
+
+  i = gegl_buffer_cl_iterator_new (output, result, out_format,
+                                   GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, result, in_format,
+                                        GEGL_CL_BUFFER_READ,
+                                        op_area->left, op_area->right,
+                                        op_area->top,  op_area->bottom,
+                                        GEGL_ABYSS_NONE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && !err)
+    {
+      const GeglRectangle *roi = &i->roi[0];
+      size_t  global_ws[2] = { roi->width, roi->height };
+      cl_int  roi_x        = roi->x;
+      cl_int  roi_y        = roi->y;
+      cl_int  in_width     = i->roi[read].width;
+      cl_int  in_x         = i->roi[read].x;
+      cl_int  in_y         = i->roi[read].y;
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem), &i->tex[read],
+                                        sizeof (cl_mem), &wrap,
+                                        sizeof (cl_mem), &i->tex[0],
+                                        sizeof (cl_int), &horizontal,
+                                        sizeof (cl_int), &keep,
+                                        sizeof (cl_int), &size,
+                                        sizeof (cl_int), &roi_x,
+                                        sizeof (cl_int), &roi_y,
+                                        sizeof (cl_int), &in_width,
+                                        sizeof (cl_int), &in_x,
+                                        sizeof (cl_int), &in_y,
+                                        sizeof (cl_int), &extent,
+                                        sizeof (cl_int), &rect_origin,
+                                        sizeof (cl_int), &rect_x,
+                                        sizeof (cl_int), &rect_width,
+                                        sizeof (cl_int), &wrap_y,
+                                        sizeof (cl_int), &to_gamma,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2,
+                                            NULL, global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  gegl_clReleaseMemObject (wrap);
+
+  return !err;
+
+error:
+  gegl_buffer_cl_iterator_stop (i);
+  gegl_clReleaseMemObject (wrap);
+
+  return FALSE;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -239,11 +406,15 @@ process (GeglOperation       *operation,
 {
   GeglProperties          *o        = GEGL_PROPERTIES (operation);
   GeglOperationAreaFilter *op_area  = GEGL_OPERATION_AREA_FILTER (operation);
-  const Babl              *format   = gegl_operation_get_format (operation, "output");
+  const Babl              *format   = gegl_operation_get_format (operation, "input");
   GeglRectangle            rect;
   GeglRectangle            boundary = get_bounding_box (operation);
   gint                     x, y;
   gfloat                  *dst_buf, *src_buf;
+
+  if (gegl_operation_use_opencl (operation) &&
+      cl_process (operation, input, output, result, &boundary))
+    return TRUE;
 
   rect.x      = CLAMP (result->x - op_area->left, boundary.x, boundary.x +
                        boundary.width);
@@ -305,6 +476,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->prepare           = prepare;
   operation_class->get_bounding_box  = get_bounding_box;
   filter_class->process              = process;
+  operation_class->opencl_support    = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",               "gegl:deinterlace",
