@@ -16,6 +16,7 @@ opencl_tests = [
   'opacity',
   'pixelize',
   'snn-mean',
+  'stretch-contrast-hsv',
   'svg-src-over',
   'threshold',
   'value-invert',
