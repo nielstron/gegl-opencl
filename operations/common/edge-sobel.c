@@ -39,6 +39,7 @@ property_boolean (keep_sign,  _("Keep sign"), TRUE)
 
 #include "gegl-op.h"
 #include <stdio.h>
+#include <string.h>
 
 #define SOBEL_RADIUS 1
 
@@ -75,25 +76,153 @@ static void prepare (GeglOperation *operation)
 
 static GeglClRunData *cl_data = NULL;
 
+/* Tables for converting between "R'G'B'A u8" and "RGBA float" in the
+ * kernel, see edge-sobel.cl.
+ */
+#define LUT_SIZE 1024
+
+/* Fills lut[1..255] with the smallest non-negative float that babl
+ * converts to k or more, for the color channels or for the alpha.
+ */
+static void
+make_quantization_lut (const Babl *fish,
+                       gboolean    alpha,
+                       gfloat     *lut)
+{
+  gfloat  src[255 * 4];
+  guint8  dst[255 * 4];
+  guint32 lo[256];
+  guint32 hi[256];
+  gint    k, c;
+  gint    channel = alpha ? 3 : 0;
+
+  /* the bit patterns of non-negative floats are in the same order as the
+   * floats; invariant: babl (lo[k]) < k <= babl (hi[k])
+   */
+  for (k = 1; k < 256; k++)
+    {
+      gfloat zero = 0.0f;
+      gfloat two  = 2.0f;
+
+      memcpy (&lo[k], &zero, sizeof (gfloat));
+      memcpy (&hi[k], &two, sizeof (gfloat));
+    }
+
+  for (gint iteration = 0; iteration < 32; iteration++)
+    {
+      for (k = 1; k < 256; k++)
+        {
+          guint32 mid = lo[k] + (hi[k] - lo[k]) / 2;
+          gfloat  value;
+
+          memcpy (&value, &mid, sizeof (gfloat));
+
+          for (c = 0; c < 3; c++)
+            src[(k - 1) * 4 + c] = alpha ? 0.0f : value;
+          src[(k - 1) * 4 + 3] = alpha ? value : 1.0f;
+        }
+
+      babl_process (fish, src, dst, 255);
+
+      for (k = 1; k < 256; k++)
+        {
+          guint32 mid = lo[k] + (hi[k] - lo[k]) / 2;
+
+          if (dst[(k - 1) * 4 + channel] >= k)
+            hi[k] = mid;
+          else
+            lo[k] = mid;
+        }
+    }
+
+  lut[0] = -G_MAXFLOAT; /* never read */
+  for (k = 1; k < 256; k++)
+    memcpy (&lut[k], &hi[k], sizeof (gfloat));
+}
+
+static cl_mem
+get_lut (const Babl *u8_format,
+         const Babl *float_format)
+{
+  static cl_mem lut_mem = NULL;
+  static GMutex mutex;
+  gfloat        lut[LUT_SIZE];
+  guint8        src[256 * 4];
+  gfloat        dst[256 * 4];
+  const Babl   *fish;
+  cl_int        cl_err = 0;
+  gint          k;
+
+  g_mutex_lock (&mutex);
+
+  if (lut_mem)
+    {
+      g_mutex_unlock (&mutex);
+      return lut_mem;
+    }
+
+  fish = babl_fish (u8_format, float_format);
+
+  for (k = 0; k < 256; k++)
+    {
+      src[4 * k + 0] = src[4 * k + 1] = src[4 * k + 2] = k;
+      src[4 * k + 3] = 255;
+    }
+  babl_process (fish, src, dst, 256);
+  for (k = 0; k < 256; k++)
+    lut[k] = dst[4 * k];
+
+  for (k = 0; k < 256; k++)
+    {
+      src[4 * k + 0] = src[4 * k + 1] = src[4 * k + 2] = 0;
+      src[4 * k + 3] = k;
+    }
+  babl_process (fish, src, dst, 256);
+  for (k = 0; k < 256; k++)
+    lut[256 + k] = dst[4 * k + 3];
+
+  fish = babl_fish (float_format, u8_format);
+
+  make_quantization_lut (fish, FALSE, lut + 512);
+  make_quantization_lut (fish, TRUE,  lut + 768);
+
+  lut_mem = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                 CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                 sizeof (lut), lut, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    lut_mem = NULL;
+
+  g_mutex_unlock (&mutex);
+
+  return lut_mem;
+}
+
 static gboolean
 cl_edge_sobel (cl_mem              in_tex,
                cl_mem              out_tex,
-               size_t              global_worksize,
+               cl_mem              lut,
                const GeglRectangle *roi,
                gboolean            horizontal,
                gboolean            vertical,
                gboolean            keep_sign,
                gboolean            has_alpha,
                gboolean            at_left_edge,
-               gboolean            at_top_edge)
+               gboolean            at_top_edge,
+               gboolean            in_u8,
+               gboolean            out_u8)
 {
-  const size_t gbl_size[2] = {roi->width, roi->height};
+  static size_t local_size[2] = {0, 0};
+  size_t gbl_size[2];
+  cl_int n_width       = roi->width;
+  cl_int n_height      = roi->height;
   cl_int n_horizontal  = horizontal;
   cl_int n_vertical    = vertical;
   cl_int n_keep_sign   = keep_sign;
   cl_int n_has_alpha   = has_alpha;
   cl_int min_x         = at_left_edge ? 1 : 0;
   cl_int min_y         = at_top_edge  ? 1 : 0;
+  cl_int n_in_u8       = in_u8;
+  cl_int n_out_u8      = out_u8;
   cl_int cl_err = 0;
 
   if (!cl_data)
@@ -103,26 +232,57 @@ cl_edge_sobel (cl_mem              in_tex,
     }
   if (!cl_data) return TRUE;
 
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 0, sizeof(cl_mem), (void*)&in_tex);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 1, sizeof(cl_mem), (void*)&out_tex);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 2, sizeof(cl_int), (void*)&n_horizontal);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 3, sizeof(cl_int), (void*)&n_vertical);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 4, sizeof(cl_int), (void*)&n_keep_sign);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 5, sizeof(cl_int), (void*)&n_has_alpha);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 6, sizeof(cl_int), (void*)&min_x);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 7, sizeof(cl_int), (void*)&min_y);
+  if (! local_size[0])
+    {
+      size_t work_group_size;
+
+      cl_err = gegl_clGetKernelWorkGroupInfo (cl_data->kernel[0],
+                                              gegl_cl_get_device (),
+                                              CL_KERNEL_WORK_GROUP_SIZE,
+                                              sizeof (size_t),
+                                              &work_group_size,
+                                              NULL);
+      CL_CHECK;
+
+      /* 16x16 work-items, or fewer where the device allows less */
+      local_size[0] = 16;
+      local_size[1] = 16;
+      while (local_size[0] * local_size[1] > work_group_size &&
+             local_size[1] > 1)
+        {
+          if (local_size[1] >= local_size[0])
+            local_size[1] /= 2;
+          else
+            local_size[0] /= 2;
+        }
+    }
+
+  gbl_size[0] = (roi->width  + local_size[0] - 1) / local_size[0] * local_size[0];
+  gbl_size[1] = (roi->height + local_size[1] - 1) / local_size[1] * local_size[1];
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem), &in_tex,
+                                    sizeof (cl_mem), &out_tex,
+                                    sizeof (cl_mem), &lut,
+                                    (local_size[0] + 2) * (local_size[1] + 2) *
+                                    sizeof (cl_float4), NULL,
+                                    512 * sizeof (cl_float), NULL,
+                                    sizeof (cl_int), &n_width,
+                                    sizeof (cl_int), &n_height,
+                                    sizeof (cl_int), &n_horizontal,
+                                    sizeof (cl_int), &n_vertical,
+                                    sizeof (cl_int), &n_keep_sign,
+                                    sizeof (cl_int), &n_has_alpha,
+                                    sizeof (cl_int), &min_x,
+                                    sizeof (cl_int), &min_y,
+                                    sizeof (cl_int), &n_in_u8,
+                                    sizeof (cl_int), &n_out_u8,
+                                    NULL);
   CL_CHECK;
 
   cl_err = gegl_clEnqueueNDRangeKernel(gegl_cl_get_command_queue(),
                                        cl_data->kernel[0], 2,
-                                       NULL, gbl_size, NULL,
+                                       NULL, gbl_size, local_size,
                                        0, NULL, NULL);
   CL_CHECK;
 
@@ -139,12 +299,35 @@ cl_process (GeglOperation       *operation,
             const GeglRectangle *result,
             gboolean             has_alpha)
 {
-  const Babl *in_format  = babl_format ("RGBA float");
-  const Babl *out_format = babl_format ("RGBA float");
+  const Babl *float_format = babl_format ("RGBA float");
+  const Babl *u8_format    = babl_format ("R'G'B'A u8");
+  const Babl *in_format    = float_format;
+  const Babl *out_format   = float_format;
+  cl_mem      lut          = NULL;
   gint err;
 
   GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
   GeglProperties *o = GEGL_PROPERTIES (operation);
+
+  /* Read and write 8-bit buffers as they are and convert in the kernel,
+   * instead of converting them to and from float in separate passes,
+   * which also moves four times the data.  This needs the operation to
+   * work in "RGBA float" of the same space as the 8-bit format.
+   */
+  if (gegl_operation_get_format (operation, "output") == float_format &&
+      (gegl_buffer_get_format (input)  == u8_format ||
+       gegl_buffer_get_format (output) == u8_format))
+    {
+      lut = get_lut (u8_format, float_format);
+
+      if (lut)
+        {
+          if (gegl_buffer_get_format (input) == u8_format)
+            in_format = u8_format;
+          if (gegl_buffer_get_format (output) == u8_format)
+            out_format = u8_format;
+        }
+    }
 
   /* The CPU code centres output pixel (x, y) on input pixel (x - 1, y - 1),
    * see the kernel; request the matching asymmetric halo.
@@ -169,18 +352,27 @@ cl_process (GeglOperation       *operation,
     {
       if (err) return FALSE;
 
+      /* the kernel does not read the table for float formats, but it
+       * still needs a valid buffer
+       */
       err = cl_edge_sobel(i->tex[read],
                           i->tex[0],
-                          i->size[0],
+                          lut ? lut : i->tex[read],
                           &i->roi[0],
                           o->horizontal,
                           o->vertical,
                           o->keep_sign,
                           has_alpha,
                           i->roi[0].x == result->x,
-                          i->roi[0].y == result->y);
+                          i->roi[0].y == result->y,
+                          in_format == u8_format,
+                          out_format == u8_format);
 
-      if (err) return FALSE;
+      if (err)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          return FALSE;
+        }
     }
 
   return TRUE;
