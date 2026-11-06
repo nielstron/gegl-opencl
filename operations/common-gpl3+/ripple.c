@@ -230,10 +230,32 @@ cl_split (gdouble    v,
   out->s[1] = v - out->s[0];
 }
 
-/* Uploads the phase table of the kernel: for i in [0, n), the phase of
- * (origin + i) * step + offset reduced modulo @period, as hi/lo pairs; in
- * units of the period, plus @cycles_offset, reduced to [-1/2, 1/2] if
- * @cycles, else in pixels, in [-period / 2, period / 2].
+/* sin (2 pi v) and cos (2 pi v) for v in [-1/2, 1/2], exact where they
+ * are 0 or +-1 */
+static void
+cl_sincos_cycles (gdouble  v,
+                  gdouble *s,
+                  gdouble *c)
+{
+  gdouble n  = rint (4.0 * v);
+  gdouble r  = v - n / 4.0; /* exact */
+  gdouble sr = sin (2.0 * G_PI * r);
+  gdouble cr = cos (2.0 * G_PI * r);
+
+  switch ((gint) n & 3)
+    {
+    case 0:  *s =  sr; *c =  cr; break;
+    case 1:  *s =  cr; *c = -sr; break;
+    case 2:  *s = -sr; *c = -cr; break;
+    default: *s = -cr; *c =  sr; break;
+    }
+}
+
+/* Computes the phase table of the kernel: for i in [0, n), the phase of
+ * (origin + i) * step + offset reduced modulo @period.  If
+ * @cycles, it is converted to units of the period, plus @cycles_offset,
+ * and the table holds its sine and cosine as hi/lo pairs; else it holds
+ * the phase, in pixels, in [-period / 2, period / 2], as a hi/lo pair.
  */
 static cl_mem
 cl_phase_table (gint      origin,
@@ -246,22 +268,39 @@ cl_phase_table (gint      origin,
 {
   cl_int     cl_err = 0;
   cl_mem     tex;
-  cl_float2 *table  = g_new (cl_float2, n);
+  cl_float4 *table  = g_new0 (cl_float4, n);
   gint       i;
 
   for (i = 0; i < n; i++)
     {
-      gdouble v = remainder ((origin + i) * step + offset, period);
+      gdouble   v = remainder ((origin + i) * step + offset, period);
+      cl_float2 hi_lo;
 
       if (cycles)
-        v = remainder (v / period + cycles_offset, 1.0);
+        {
+          gdouble s, c;
 
-      cl_split (v, &table[i]);
+          cl_sincos_cycles (remainder (v / period + cycles_offset, 1.0),
+                            &s, &c);
+
+          cl_split (s, &hi_lo);
+          table[i].s[0] = hi_lo.s[0];
+          table[i].s[1] = hi_lo.s[1];
+          cl_split (c, &hi_lo);
+          table[i].s[2] = hi_lo.s[0];
+          table[i].s[3] = hi_lo.s[1];
+        }
+      else
+        {
+          cl_split (v, &hi_lo);
+          table[i].s[0] = hi_lo.s[0];
+          table[i].s[1] = hi_lo.s[1];
+        }
     }
 
   tex = gegl_clCreateBuffer (gegl_cl_get_context (),
                              CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
-                             n * sizeof (cl_float2), table, &cl_err);
+                             n * sizeof (cl_float4), table, &cl_err);
   g_free (table);
 
   if (cl_err != CL_SUCCESS)

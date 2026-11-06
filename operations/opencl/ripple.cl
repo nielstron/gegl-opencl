@@ -1057,9 +1057,11 @@ add_df (float  x,
  * modulo the period.  It is computed on the host in double precision, per
  * column (phase_x, which includes the wave's phase offset) and per row
  * (phase_y), each reduced to [-period / 2, period / 2] and given as hi/lo
- * pairs; for the sine wave they are in units of the period instead, and
- * reduced to [-1/2, 1/2].  This way the kernel needs neither the large
- * products and remainders of nx, nor fp64.
+ * pairs in .xy.  For the sine wave the tables hold the sine (.xy) and the
+ * cosine (.zw) of the column and the row phase instead, as hi/lo pairs,
+ * and the kernel adds the two angles.  This way the kernel needs neither
+ * the large products and remainders of nx, nor fp64.
+
  */
 static inline void
 ripple (__global const float4 *src,
@@ -1071,8 +1073,8 @@ ripple (__global const float4 *src,
         int                    roi_y,
         int                    unpremultiply_output,
         int                    wave_type,
-        __global const float2 *phase_x,
-        __global const float2 *phase_y,
+        __global const float4 *phase_x,
+        __global const float4 *phase_y,
         int                    phase_x0,
         int                    phase_y0,
         float2                 amplitude,
@@ -1087,37 +1089,23 @@ ripple (__global const float4 *src,
   const int   iy   = roi_y + gidy;
   const float x    = ix;
   const float y    = iy;
-  float2      phase;
   float2      w;
   float2      shift;
   float4      out;
 
-  phase = df_add (phase_x[ix - phase_x0], phase_y[iy - phase_y0]);
-
   if (wave_type == WAVE_TYPE_SINE)
     {
-      /* sin (2 pi phase), with phase reduced to [-1/4, 1/4] so that the
-       * zeros of the wave come out exactly */
-      float u;
+      /* sin (a + b) = sin a cos b + cos a sin b */
+      const float4 a = phase_x[ix - phase_x0];
+      const float4 b = phase_y[iy - phase_y0];
 
-      if (phase.x > 0.5f)
-        phase = df_add_f (phase, -1.0f);
-      else if (phase.x < -0.5f)
-        phase = df_add_f (phase, 1.0f);
-
-      if (phase.x > 0.25f)
-        phase = df_add_f (-phase, 0.5f);
-      else if (phase.x < -0.25f)
-        phase = df_add_f (-phase, -0.5f);
-
-      u = phase.x + phase.y;
-
-      w = (float2) (sinpi (2.0f * u), 0.0f);
+      w = df_add (df_mul (a.xy, b.zw), df_mul (a.zw, b.xy));
     }
   else
     {
       /* lambda = remainder (nx + offset, period), moved to [0, period) */
-      float2 lambda = phase;
+      float2 lambda = df_add (phase_x[ix - phase_x0].xy,
+                              phase_y[iy - phase_y0].xy);
       float2 q;
 
       if (df_is_negative (lambda))
@@ -1165,8 +1153,8 @@ ripple_nearest (__global const float4 *src,
                 int                    roi_y,
                 int                    unpremultiply_output,
                 int                    wave_type,
-                __global const float2 *phase_x,
-                __global const float2 *phase_y,
+                __global const float4 *phase_x,
+                __global const float4 *phase_y,
                 int                    phase_x0,
                 int                    phase_y0,
                 float2                 amplitude,
@@ -1190,8 +1178,8 @@ ripple_linear (__global const float4 *src,
                int                    roi_y,
                int                    unpremultiply_output,
                int                    wave_type,
-               __global const float2 *phase_x,
-               __global const float2 *phase_y,
+               __global const float4 *phase_x,
+               __global const float4 *phase_y,
                int                    phase_x0,
                int                    phase_y0,
                float2                 amplitude,
@@ -1215,8 +1203,8 @@ ripple_cubic (__global const float4 *src,
               int                    roi_y,
               int                    unpremultiply_output,
               int                    wave_type,
-              __global const float2 *phase_x,
-              __global const float2 *phase_y,
+              __global const float4 *phase_x,
+              __global const float4 *phase_y,
               int                    phase_x0,
               int                    phase_y0,
               float2                 amplitude,
@@ -1240,8 +1228,8 @@ ripple_nohalo (__global const float4 *src,
                int                    roi_y,
                int                    unpremultiply_output,
                int                    wave_type,
-               __global const float2 *phase_x,
-               __global const float2 *phase_y,
+               __global const float4 *phase_x,
+               __global const float4 *phase_y,
                int                    phase_x0,
                int                    phase_y0,
                float2                 amplitude,
