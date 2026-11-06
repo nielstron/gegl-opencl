@@ -317,6 +317,7 @@ process (GeglOperation       *operation,
   GeglProperties          *o       = GEGL_PROPERTIES (operation);
   GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
   const Babl              *space   = gegl_operation_get_source_space (operation, "input");
+  const Babl              *out_format = gegl_operation_get_format (operation, "output");
 
   GeglRectangle  rect;
   gfloat        *src_buf;
@@ -324,6 +325,7 @@ process (GeglOperation       *operation,
   const Babl    *format;
   gint           y;
   gint           floats_per_pixel;
+  gint           n_pixels;
   float          factor = 1.0f / (1<<level);
 
   /*blur-map or emboss*/
@@ -355,6 +357,8 @@ process (GeglOperation       *operation,
     rect.height *= factor;
   }
 
+  n_pixels = rect.width * rect.height;
+
   src_buf = g_new0 (gfloat, rect.width * rect.height * floats_per_pixel);
   dst_buf = g_new0 (gfloat, rect.width * rect.height * floats_per_pixel);
 
@@ -366,8 +370,23 @@ process (GeglOperation       *operation,
     emboss (src_buf, &rect, dst_buf, &rect, o->type, y, floats_per_pixel,
             DEG_TO_RAD (o->azimuth), DEG_TO_RAD (o->elevation), o->depth * factor);
 
-  gegl_buffer_set (output, &rect, level, format,
-                   dst_buf, GEGL_AUTO_ROWSTRIDE);
+  /* prepare () may have chosen the nonlinear counterpart of format for the
+   * output when OpenCL is enabled; convert here instead of letting
+   * gegl_buffer_set () do it, so the CPU fallback writes exactly what
+   * the output format asks for.
+   */
+  if (out_format != format && n_pixels > 0)
+    {
+      babl_process (babl_fish (format, out_format),
+                    dst_buf, src_buf, n_pixels);
+      gegl_buffer_set (output, &rect, level, out_format,
+                       src_buf, GEGL_AUTO_ROWSTRIDE);
+    }
+  else
+    {
+      gegl_buffer_set (output, &rect, level, format,
+                       dst_buf, GEGL_AUTO_ROWSTRIDE);
+    }
 
   g_free (src_buf);
   g_free (dst_buf);
