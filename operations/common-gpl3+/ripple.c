@@ -118,6 +118,48 @@ ripple_sawtooth_lambda (gdouble nx,
   return lambda;
 }
 
+/* The coordinates process () samples the input at for output pixel
+ * (x, y). */
+static inline void
+ripple_coords (GeglRippleWaveType  wave_type,
+               gdouble             amplitude,
+               gdouble             period,
+               gdouble             phi,
+               gdouble             angle_rad,
+               gint                x,
+               gint                y,
+               gdouble            *coordsx,
+               gdouble            *coordsy)
+{
+  gdouble shift;
+  gdouble lambda;
+
+  gdouble nx = ripple_nx (angle_rad, x, y);
+
+  switch (wave_type)
+    {
+    case GEGL_RIPPLE_WAVE_TYPE_SAWTOOTH:
+      lambda = ripple_sawtooth_lambda (nx, period, phi);
+      shift = amplitude * (((lambda / period) * 2) - 1);
+      break;
+
+    case GEGL_RIPPLE_WAVE_TYPE_TRIANGLE:
+      lambda = remainder (nx + period * 3 / 4 - phi * period, period);
+      if (lambda < 0)
+        lambda += period;
+      shift = amplitude * (fabs (((lambda / period) * 4) - 2) - 1);
+      break;
+
+    case GEGL_RIPPLE_WAVE_TYPE_SINE:
+    default:
+      shift = amplitude * sin (2.0 * G_PI * nx / period + 2.0 * G_PI * phi);
+      break;
+    }
+
+  *coordsx = x + shift * sin (angle_rad);
+  *coordsy = y + shift * cos (angle_rad);
+}
+
 static GeglAbyssPolicy
 get_abyss_policy (GeglOperation *operation,
                   const gchar   *input_pad)
@@ -599,35 +641,11 @@ process (GeglOperation       *operation,
       for (y = iter->items[0].roi.y; y < iter->items[0].roi.y + iter->items[0].roi.height; ++y)
         for (x = iter->items[0].roi.x; x < iter->items[0].roi.x + iter->items[0].roi.width; ++x)
           {
-            gdouble shift;
             gdouble coordsx;
             gdouble coordsy;
-            gdouble lambda;
 
-            gdouble nx = ripple_nx (angle_rad, x, y);
-
-            switch (o->wave_type)
-              {
-                case GEGL_RIPPLE_WAVE_TYPE_SAWTOOTH:
-                  lambda = ripple_sawtooth_lambda (nx, period, phi);
-                  shift = amplitude * (((lambda / period) * 2) - 1);
-                  break;
-
-                case GEGL_RIPPLE_WAVE_TYPE_TRIANGLE:
-                  lambda = remainder (nx + period * 3 / 4 - phi * period, period);
-                  if (lambda < 0)
-                    lambda += period;
-                  shift = amplitude * (fabs (((lambda / period) * 4) - 2) - 1);
-                  break;
-
-                case GEGL_RIPPLE_WAVE_TYPE_SINE:
-                default:
-                  shift = amplitude * sin (2.0 * G_PI * nx / period + 2.0 * G_PI * phi);
-                  break;
-              }
-
-            coordsx = x + shift * sin (angle_rad);
-            coordsy = y + shift * cos (angle_rad);
+            ripple_coords (o->wave_type, amplitude, period, phi, angle_rad,
+                           x, y, &coordsx, &coordsy);
 
             gegl_sampler_get (sampler,
                               coordsx,
