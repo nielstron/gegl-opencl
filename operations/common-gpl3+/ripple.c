@@ -92,6 +92,32 @@ prepare (GeglOperation *operation)
                              babl_format_with_space ("RGBA float", space));
 }
 
+/* The phase of the wave at (x, y), before the phase offset of the wave
+ * type and the remainder modulo the period.  The OpenCL path uses the
+ * same functions where it needs the exact CPU result, keep them shared.
+ */
+static inline gdouble
+ripple_nx (gdouble angle_rad,
+           gint    x,
+           gint    y)
+{
+  return x * cos (angle_rad) - y * sin (angle_rad);
+}
+
+/* lambda of the sawtooth wave, in [0, period] */
+static inline gdouble
+ripple_sawtooth_lambda (gdouble nx,
+                        gdouble period,
+                        gdouble phi)
+{
+  gdouble lambda = remainder (nx + period / 2 - phi * period, period);
+
+  if (lambda < 0)
+    lambda += period;
+
+  return lambda;
+}
+
 static GeglAbyssPolicy
 get_abyss_policy (GeglOperation *operation,
                   const gchar   *input_pad)
@@ -539,14 +565,12 @@ process (GeglOperation       *operation,
             gdouble coordsy;
             gdouble lambda;
 
-            gdouble nx = x * cos (angle_rad) - y * sin (angle_rad);
+            gdouble nx = ripple_nx (angle_rad, x, y);
 
             switch (o->wave_type)
               {
                 case GEGL_RIPPLE_WAVE_TYPE_SAWTOOTH:
-                  lambda = remainder (nx + period / 2 - phi * period, period);
-                  if (lambda < 0)
-                    lambda += period;
+                  lambda = ripple_sawtooth_lambda (nx, period, phi);
                   shift = amplitude * (((lambda / period) * 2) - 1);
                   break;
 
