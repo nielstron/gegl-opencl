@@ -435,6 +435,8 @@ cl_pixelize (cl_mem               in_tex,
              const GeglRectangle *roi,
              gint                 xsize,
              gint                 ysize,
+             gint                 align_x,
+             gint                 align_y,
              gfloat               xratio,
              gfloat               yratio,
              gfloat               bg_color[4],
@@ -444,13 +446,20 @@ cl_pixelize (cl_mem               in_tex,
   cl_int cl_err = 0;
   const size_t gbl_size[2]= {roi->width, roi->height};
 
-  gint cx0 = block_index (roi->x, xsize);
-  gint cy0 = block_index (roi->y, ysize);
-  gint block_count_x = block_index (roi->x + roi->width  + xsize - 1, xsize) - cx0;
-  gint block_count_y = block_index (roi->y + roi->height + ysize - 1, ysize) - cy0;
-  cl_int4 bbox = {{ image_extent->x, image_extent->y,
-                    image_extent->x + image_extent->width,
-                    image_extent->y + image_extent->height }};
+  /* The kernels place blocks at multiples of the block size, so shift
+   * all coordinates by the block offset.
+   */
+  cl_int roi_x = roi->x + align_x;
+  cl_int roi_y = roi->y + align_y;
+
+  gint cx0 = block_index (roi_x, xsize);
+  gint cy0 = block_index (roi_y, ysize);
+  gint block_count_x = block_index (roi_x + roi->width  + xsize - 1, xsize) - cx0;
+  gint block_count_y = block_index (roi_y + roi->height + ysize - 1, ysize) - cy0;
+  cl_int4 bbox = {{ image_extent->x + align_x,
+                    image_extent->y + align_y,
+                    image_extent->x + image_extent->width  + align_x,
+                    image_extent->y + image_extent->height + align_y }};
 
   cl_int line_width = roi->width + 2 * xsize;
 
@@ -469,8 +478,8 @@ cl_pixelize (cl_mem               in_tex,
                                     sizeof(cl_mem), (void*)&aux_tex,
                                     sizeof(cl_int), (void*)&xsize,
                                     sizeof(cl_int), (void*)&ysize,
-                                    sizeof(cl_int), (void*)&roi->x,
-                                    sizeof(cl_int), (void*)&roi->y,
+                                    sizeof(cl_int), (void*)&roi_x,
+                                    sizeof(cl_int), (void*)&roi_y,
                                     sizeof(cl_int4), &bbox,
                                     sizeof(cl_int), (void*)&line_width,
                                     sizeof(cl_int), (void*)&block_count_x,
@@ -490,8 +499,8 @@ cl_pixelize (cl_mem               in_tex,
                                     sizeof(cl_int),   (void*)&ysize,
                                     sizeof(cl_float), (void*)&xratio,
                                     sizeof(cl_float), (void*)&yratio,
-                                    sizeof(cl_int),   (void*)&roi->x,
-                                    sizeof(cl_int),   (void*)&roi->y,
+                                    sizeof(cl_int),   (void*)&roi_x,
+                                    sizeof(cl_int),   (void*)&roi_y,
                                     sizeof(cl_float4),(void*)bg_color,
                                     sizeof(cl_int),   (void*)&norm,
                                     sizeof(cl_int),   (void*)&block_count_x,
@@ -569,6 +578,8 @@ cl_process (GeglOperation       *operation,
                         &i->roi[0],
                         o->size_x,
                         o->size_y,
+                        align_offset (o->offset_x, o->size_x),
+                        align_offset (o->offset_y, o->size_y),
                         o->ratio_x,
                         o->ratio_y,
                         bg_color,
