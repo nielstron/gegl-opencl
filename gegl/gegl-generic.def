@@ -137,6 +137,9 @@ EXPORTS
   gegl_cl_init
   gegl_cl_is_accelerated
   gegl_cl_load_random_data
+  gegl_cl_mem_pool_clear
+  gegl_cl_mem_pool_get
+  gegl_cl_mem_pool_put
   gegl_cl_random_cleanup
   gegl_cl_random_get_ushort4
   gegl_cl_set_default_device_type
