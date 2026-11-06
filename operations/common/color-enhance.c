@@ -33,6 +33,12 @@
 
 #include "gegl-op.h"
 
+/* Achromatic input has a chroma range made only of the rounding noise of
+ * the CIE LCH(ab) conversion (about 1e-4), which stretching would amplify
+ * into random colors. Leave input with a smaller range unchanged.
+ */
+#define MIN_CHROMA_RANGE 0.01
+
 static void
 buffer_get_min_max (GeglOperation       *operation,
                     GeglBuffer          *buffer,
@@ -413,7 +419,7 @@ process (GeglOperation       *operation,
 
   delta = max - min;
 
-  if (! delta)
+  if (delta < MIN_CHROMA_RANGE)
     {
       gegl_buffer_copy (input, NULL, GEGL_ABYSS_NONE,
                         output, NULL);
