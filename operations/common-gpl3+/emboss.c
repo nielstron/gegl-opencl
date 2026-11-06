@@ -189,12 +189,122 @@ prepare (GeglOperation *operation)
 
   op_area->left = op_area->right = op_area->top = op_area->bottom = 3;
 
-  if (o->type == GEGL_EMBOSS_TYPE_BUMPMAP)
+  /* The OpenCL path applies the sRGB TRC itself, since nonlinear float is
+   * much cheaper to convert to the usual 8-bit formats on the CPU.
+   */
+  if (gegl_operation_use_opencl (operation) &&
+      babl_format_get_space (babl_format_with_space ("RGBA float", space)) ==
+      babl_space ("sRGB"))
+    {
+      if (o->type == GEGL_EMBOSS_TYPE_BUMPMAP)
+        gegl_operation_set_format (operation, "output",
+                                   babl_format ("R'G'B'A float"));
+      else
+        gegl_operation_set_format (operation, "output",
+                                   babl_format ("Y'A float"));
+    }
+  else if (o->type == GEGL_EMBOSS_TYPE_BUMPMAP)
     gegl_operation_set_format (operation, "output",
                                babl_format_with_space ("RGBA float", space));
   else
     gegl_operation_set_format (operation, "output",
                                babl_format_with_space ("YA float", space));
+}
+
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+#include "opencl/emboss.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *result,
+            const Babl          *format)
+{
+  GeglProperties          *o       = GEGL_PROPERTIES (operation);
+  GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
+  const Babl              *out_format = gegl_operation_get_format (operation, "output");
+  GeglBufferClIterator    *i;
+  cl_kernel                kernel;
+  cl_int                   to_gamma;
+  gdouble                  azimuth   = DEG_TO_RAD (o->azimuth);
+  gdouble                  elevation = DEG_TO_RAD (o->elevation);
+  gdouble                  Nz        = 1.0 / o->depth;
+  cl_float                 Lx        = cos (azimuth) * cos (elevation);
+  cl_float                 Ly        = sin (azimuth) * cos (elevation);
+  cl_float                 Lz        = sin (elevation);
+  cl_float                 Nz2       = Nz * Nz;
+  cl_float                 NzLz      = Nz * sin (elevation);
+  cl_int                   cl_err    = 0;
+  gboolean                 err       = FALSE;
+  gint                     read;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "emboss_ya", "emboss_rgba", NULL };
+      cl_data = gegl_cl_compile_and_build (emboss_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return FALSE;
+
+  kernel = cl_data->kernel[o->type == GEGL_EMBOSS_TYPE_BUMPMAP ? 1 : 0];
+
+  /* Either the linear format of process (), or its sRGB nonlinear
+   * counterpart chosen by prepare ().
+   */
+  if (out_format == format)
+    to_gamma = FALSE;
+  else if (babl_format_get_space (format) == babl_space ("sRGB") &&
+           babl_format_get_n_components (out_format) ==
+           babl_format_get_n_components (format) &&
+           (babl_model_is (babl_format_get_model (out_format), "R'G'B'A") ||
+            babl_model_is (babl_format_get_model (out_format), "Y'A")))
+    to_gamma = TRUE;
+  else
+    return FALSE;
+
+  i = gegl_buffer_cl_iterator_new (output, result, out_format,
+                                   GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, result, format,
+                                        GEGL_CL_BUFFER_READ,
+                                        op_area->left, op_area->right,
+                                        op_area->top,  op_area->bottom,
+                                        GEGL_ABYSS_NONE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && !err)
+    {
+      size_t global_ws[2] = { i->roi[0].width, i->roi[0].height };
+
+      cl_err = gegl_cl_set_kernel_args (kernel,
+                                        sizeof (cl_mem),   &i->tex[read],
+                                        sizeof (cl_mem),   &i->tex[0],
+                                        sizeof (cl_float), &Lx,
+                                        sizeof (cl_float), &Ly,
+                                        sizeof (cl_float), &Lz,
+                                        sizeof (cl_float), &Nz2,
+                                        sizeof (cl_float), &NzLz,
+                                        sizeof (cl_int),   &to_gamma,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            kernel, 2,
+                                            NULL, global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  return !err;
+
+error:
+  gegl_buffer_cl_iterator_stop (i);
+
+  return FALSE;
 }
 
 static gboolean
@@ -227,6 +337,10 @@ process (GeglOperation       *operation,
       format = babl_format_with_space ("YA float", space);
       floats_per_pixel = 2;
     }
+
+  if (level == 0 && gegl_operation_use_opencl (operation) &&
+      cl_process (operation, input, output, result, format))
+    return TRUE;
 
   rect.x      = result->x - op_area->left;
   rect.width  = result->width + op_area->left + op_area->right;
@@ -273,6 +387,7 @@ gegl_op_class_init (GeglOpClass *klass)
   filter_class->process    = process;
   operation_class->prepare = prepare;
   operation_class->threaded = FALSE; // XXX: docs operation test yields horizontal stripe on division
+  operation_class->opencl_support = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:emboss",
