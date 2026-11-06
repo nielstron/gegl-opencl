@@ -225,7 +225,8 @@ gegl_operation_point_composer3_cl_process (GeglOperation       *operation,
         }
     }
 
-  return TRUE;
+  /* the iterator also stops on errors */
+  return ! err;
 }
 
 static void prepare (GeglOperation *operation)

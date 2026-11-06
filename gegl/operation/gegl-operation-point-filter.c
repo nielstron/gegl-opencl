@@ -182,9 +182,6 @@ gegl_operation_point_filter_cl_process (GeglOperation       *operation,
 
   while (gegl_buffer_cl_iterator_next (iter, &err))
     {
-      if (err)
-        return FALSE;
-
       if (point_filter_class->cl_process)
         {
           err = point_filter_class->cl_process (operation, iter->tex[1], iter->tex[0],
@@ -223,7 +220,8 @@ gegl_operation_point_filter_cl_process (GeglOperation       *operation,
         }
     }
 
-  return TRUE;
+  /* the iterator also stops on errors */
+  return ! err;
 
 error:
   GEGL_NOTE (GEGL_DEBUG_OPENCL, "Error: %s", gegl_cl_errstring (cl_err));

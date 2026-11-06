@@ -194,9 +194,6 @@ gegl_operation_point_composer_cl_process (GeglOperation       *operation,
 
   while (gegl_buffer_cl_iterator_next (iter, &err))
     {
-      if (err)
-        return FALSE;
-
       if (point_composer_class->cl_process)
         {
           err = point_composer_class->cl_process (operation,
@@ -242,7 +239,8 @@ gegl_operation_point_composer_cl_process (GeglOperation       *operation,
         }
     }
 
-  return TRUE;
+  /* the iterator also stops on errors */
+  return ! err;
 
 error:
   GEGL_NOTE (GEGL_DEBUG_OPENCL, "Error: %s", gegl_cl_errstring (cl_err));
