@@ -1,26 +1,33 @@
-#define SOBEL_RADIUS 1
-/* FIXME: There are issues while horizontal and vertical are enabled together or
-          if keep_sign is disabled and either of horizontal or vertical is enabled. */
-#define FIXME 1
+/* The CPU implementation reads the source rectangle (result grown by one
+   pixel on each side) into a buffer and takes the output pixel (x, y) as
+   centred on source pixel (x, y), i.e. on image pixel (x - 1, y - 1).
+   Neighbours to the left of / above that buffer are clamped into it.
 
-/* Boundary check function which clamps pixels similar to the
-   non OpenCL version */
-static inline float4 clamp_pixel (global float4 *in,
-                                         int     x,
-                                         int     y,
-                                         int     width,
-                                         int     height) {
-    x = (x < 0) ? 0 : ((x < width)  ? x : (width - 1));
-    y = (y < 0) ? 0 : ((y < height) ? y : (height - 1));
+   To give the same result for every chunk the iterator hands us, the input
+   is requested with a halo of 2 pixels on the left and top and none on the
+   right and bottom, and min_x / min_y say whether this chunk touches the
+   left / top edge of the processed rectangle, where the CPU code clamps.  */
+
+static inline float4 get_pixel (global const float4 *in,
+                                int                  x,
+                                int                  y,
+                                int                  min_x,
+                                int                  min_y,
+                                int                  width)
+{
+    x = max (x, min_x);
+    y = max (y, min_y);
     return in[x + y * width];
 }
 
-kernel void kernel_edgesobel (global float4 *in,
-                              global float4 *out,
+kernel void kernel_edgesobel (global const float4 *in,
+                              global       float4 *out,
                               const int horizontal,
                               const int vertical,
                               const int keep_sign,
-                              const int has_alpha)
+                              const int has_alpha,
+                              const int min_x,
+                              const int min_y)
 {
     const int gidx = get_global_id (0);
     const int gidy = get_global_id (1);
@@ -29,21 +36,21 @@ kernel void kernel_edgesobel (global float4 *in,
     float4 ver_grad = 0.0f;
     float4 gradient = 0.0f;
 
-    const int dst_width  = get_global_size (0);
-    const int dst_height = get_global_size (1);
-    const int src_width  = dst_width  + (SOBEL_RADIUS << 1);
-    const int src_ht     = dst_height + (SOBEL_RADIUS << 1);
+    const int dst_width = get_global_size (0);
+    const int src_width = dst_width + 2;
 
-    const float4 pix_fl = clamp_pixel (in, gidx - 1, gidy - 1, src_width, src_ht);
-    const float4 pix_fm = clamp_pixel (in, gidx,     gidy - 1, src_width, src_ht);
-    const float4 pix_fr = clamp_pixel (in, gidx + 1, gidy - 1, src_width, src_ht);
-    const float4 pix_ml = clamp_pixel (in, gidx - 1, gidy,     src_width, src_ht);
-    const float4 pix_mm = clamp_pixel (in, gidx,     gidy,     src_width, src_ht);
-    const float4 pix_mr = clamp_pixel (in, gidx + 1, gidy,     src_width, src_ht);
-    const float4 pix_bl = clamp_pixel (in, gidx - 1, gidy + 1, src_width, src_ht);
-    const float4 pix_bm = clamp_pixel (in, gidx,     gidy + 1, src_width, src_ht);
-    const float4 pix_br = clamp_pixel (in, gidx + 1, gidy + 1, src_width, src_ht);
+    const int x = gidx + 1;
+    const int y = gidy + 1;
 
+    const float4 pix_fl = get_pixel (in, x - 1, y - 1, min_x, min_y, src_width);
+    const float4 pix_fm = get_pixel (in, x,     y - 1, min_x, min_y, src_width);
+    const float4 pix_fr = get_pixel (in, x + 1, y - 1, min_x, min_y, src_width);
+    const float4 pix_ml = get_pixel (in, x - 1, y,     min_x, min_y, src_width);
+    const float4 pix_mm = in[x + y * src_width];
+    const float4 pix_mr = get_pixel (in, x + 1, y,     min_x, min_y, src_width);
+    const float4 pix_bl = get_pixel (in, x - 1, y + 1, min_x, min_y, src_width);
+    const float4 pix_bm = get_pixel (in, x,     y + 1, min_x, min_y, src_width);
+    const float4 pix_br = get_pixel (in, x + 1, y + 1, min_x, min_y, src_width);
     if (horizontal)
       {
         hor_grad +=
@@ -58,22 +65,20 @@ kernel void kernel_edgesobel (global float4 *in,
             (-1.0f * pix_bl) + (-2.0f * pix_bm) + (-1.0f * pix_br);
       }
 
-#ifndef FIXME
     if (horizontal && vertical)
       {
         /* sqrt(32.0) = 5.656854 */
-        gradient = hypot (hor_grad, ver_grad) / (float4) 5.656854f;
+        gradient = sqrt (hor_grad * hor_grad + ver_grad * ver_grad) / 5.656854f;
+      }
+    else if (keep_sign)
+      {
+        gradient = 0.5f + (hor_grad + ver_grad) / 8.0f;
       }
     else
       {
-        if (keep_sign)
-#endif
-          gradient = (float4) 0.5f + (hor_grad + ver_grad) / (float4) 8.0f;
-#ifndef FIXME
-        else
-          gradient = fabs (hor_grad + ver_grad) / (float4) 4.0f;
+        gradient = fabs (hor_grad + ver_grad) / 4.0f;
       }
-#endif
+
     if (has_alpha)
       gradient.w = pix_mm.w;
     else

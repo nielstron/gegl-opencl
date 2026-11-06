@@ -83,13 +83,17 @@ cl_edge_sobel (cl_mem              in_tex,
                gboolean            horizontal,
                gboolean            vertical,
                gboolean            keep_sign,
-               gboolean            has_alpha)
+               gboolean            has_alpha,
+               gboolean            at_left_edge,
+               gboolean            at_top_edge)
 {
   const size_t gbl_size[2] = {roi->width, roi->height};
   cl_int n_horizontal  = horizontal;
   cl_int n_vertical    = vertical;
-  cl_int n_keep_sign = keep_sign;
+  cl_int n_keep_sign   = keep_sign;
   cl_int n_has_alpha   = has_alpha;
+  cl_int min_x         = at_left_edge ? 1 : 0;
+  cl_int min_y         = at_top_edge  ? 1 : 0;
   cl_int cl_err = 0;
 
   if (!cl_data)
@@ -110,6 +114,10 @@ cl_edge_sobel (cl_mem              in_tex,
   cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 4, sizeof(cl_int), (void*)&n_keep_sign);
   CL_CHECK;
   cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 5, sizeof(cl_int), (void*)&n_has_alpha);
+  CL_CHECK;
+  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 6, sizeof(cl_int), (void*)&min_x);
+  CL_CHECK;
+  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 7, sizeof(cl_int), (void*)&min_y);
   CL_CHECK;
 
   cl_err = gegl_clEnqueueNDRangeKernel(gegl_cl_get_command_queue(),
@@ -138,6 +146,9 @@ cl_process (GeglOperation       *operation,
   GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
   GeglProperties *o = GEGL_PROPERTIES (operation);
 
+  /* The CPU code centres output pixel (x, y) on input pixel (x - 1, y - 1),
+   * see the kernel; request the matching asymmetric halo.
+   */
   GeglBufferClIterator *i = gegl_buffer_cl_iterator_new (output,
                                                          result,
                                                          out_format,
@@ -148,10 +159,10 @@ cl_process (GeglOperation       *operation,
                                              result,
                                              in_format,
                                              GEGL_CL_BUFFER_READ,
-                                             op_area->left,
-                                             op_area->right,
-                                             op_area->top,
-                                             op_area->bottom,
+                                             op_area->left + op_area->right,
+                                             0,
+                                             op_area->top + op_area->bottom,
+                                             0,
                                              GEGL_ABYSS_NONE);
 
   while (gegl_buffer_cl_iterator_next (i, &err))
@@ -165,7 +176,9 @@ cl_process (GeglOperation       *operation,
                           o->horizontal,
                           o->vertical,
                           o->keep_sign,
-                          has_alpha);
+                          has_alpha,
+                          i->roi[0].x == result->x,
+                          i->roi[0].y == result->y);
 
       if (err) return FALSE;
     }
@@ -183,19 +196,12 @@ process (GeglOperation       *operation,
   GeglProperties   *o = GEGL_PROPERTIES (operation);
   GeglRectangle compute;
   gboolean has_alpha;
-  gboolean keep_sign  = o->keep_sign;
-  gboolean horizontal = o->horizontal;
-  gboolean vertical   = o->vertical;
 
   compute = gegl_operation_get_required_for_output (operation, "input", result);
   has_alpha = babl_format_has_alpha (gegl_operation_get_format (operation, "output"));
-/*
-  FIXME: Incorrect results generated when both horizontal and vertical are enabled
-         Incorrect results generated when either horizontal or vertical are enabled
-         and keep_sign is disabled.
-*/
+
   if (gegl_operation_use_opencl (operation))
-    if ((!(horizontal && vertical) && keep_sign) && cl_process (operation, input, output, result, has_alpha))
+    if (cl_process (operation, input, output, result, has_alpha))
       return TRUE;
 
   edge_sobel (input, &compute, output, result,
