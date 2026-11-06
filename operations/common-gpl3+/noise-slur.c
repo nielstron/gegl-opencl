@@ -70,6 +70,128 @@ prepare (GeglOperation *operation)
  * see gegl/gegl-random.c for details */
 #define RAND_UINT_TO_FLOAT(x) (((x) & 0xffff) * 0.00001525902189669642175)
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+#include "opencl/noise-slur.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+/* largest (rand & 0xffff) for which the CPU path moves the pixel, -1 if
+ * there is none; computed with the same expression as the CPU path */
+static gint
+compute_max_k (gdouble pct_random)
+{
+  gint k;
+
+  for (k = 0xffff; k >= 0; k--)
+    {
+      gfloat pct = RAND_UINT_TO_FLOAT ((guint) k) * 100.0;
+
+      if (pct <= pct_random)
+        break;
+    }
+
+  return k;
+}
+
+static gboolean
+cl_noise_slur (cl_mem               in_tex,
+               cl_mem               out_tex,
+               const GeglRectangle *roi,
+               gint                 in_width,
+               gint                 area,
+               gint                 repeat,
+               gint                 max_k,
+               gint                 bpp,
+               GeglRandom          *rand)
+{
+  cl_int     cl_err = 0;
+  cl_mem     cl_random_data;
+  cl_ushort4 cl_rand;
+  size_t     global_ws = (size_t) roi->width * roi->height;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "cl_noise_slur", NULL };
+      cl_data = gegl_cl_compile_and_build (noise_slur_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return TRUE;
+
+  gegl_cl_random_get_ushort4 (rand, &cl_rand);
+
+  cl_random_data = gegl_cl_load_random_data (&cl_err);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem),     &in_tex,
+                                    sizeof (cl_mem),     &out_tex,
+                                    sizeof (cl_mem),     &cl_random_data,
+                                    sizeof (cl_ushort4), &cl_rand,
+                                    sizeof (cl_int),     &roi->x,
+                                    sizeof (cl_int),     &roi->y,
+                                    sizeof (cl_int),     &roi->width,
+                                    sizeof (cl_int),     &in_width,
+                                    sizeof (cl_int),     &area,
+                                    sizeof (cl_int),     &repeat,
+                                    sizeof (cl_int),     &max_k,
+                                    sizeof (cl_int),     &bpp,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 1,
+                                        NULL, &global_ws, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  return FALSE;
+
+error:
+  return TRUE;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *result,
+            const Babl          *format)
+{
+  GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
+  GeglProperties          *o       = GEGL_PROPERTIES (operation);
+  gint                     bpp     = babl_format_get_bytes_per_pixel (format);
+  gint                     max_k   = compute_max_k (o->pct_random);
+  GeglBufferClIterator    *i;
+  gint                     read;
+  gint                     err = 0;
+
+  i = gegl_buffer_cl_iterator_new (output, result, format,
+                                   GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, result, format,
+                                        GEGL_CL_BUFFER_READ,
+                                        op_area->left, op_area->right,
+                                        op_area->top,  op_area->bottom,
+                                        GEGL_ABYSS_CLAMP);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && !err)
+    {
+      err = cl_noise_slur (i->tex[read], i->tex[0], &i->roi[0],
+                           i->roi[read].width, op_area->left,
+                           o->repeat, max_k, bpp, o->rand);
+
+      if (err)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          break;
+        }
+    }
+
+  return !err;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -87,6 +209,10 @@ process (GeglOperation       *operation,
 
   format = gegl_operation_get_source_format (operation, "input");
   bpp = babl_format_get_bytes_per_pixel (format);
+
+  if (level == 0 && gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, result, format))
+      return TRUE;
 
   gi = gegl_buffer_iterator_new (output, result, 0, format,
                                  GEGL_ACCESS_WRITE, GEGL_ABYSS_CLAMP, 1);
@@ -149,8 +275,9 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class = GEGL_OPERATION_CLASS (klass);
   filter_class    = GEGL_OPERATION_FILTER_CLASS (klass);
 
-  operation_class->prepare = prepare;
-  filter_class->process    = process;
+  operation_class->prepare        = prepare;
+  operation_class->opencl_support = TRUE;
+  filter_class->process           = process;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:noise-slur",
