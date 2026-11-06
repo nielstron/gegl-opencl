@@ -37,6 +37,7 @@ gegl_operations_opencl_sources = [
   'posterize.cl',
   'random.cl',
   'red-eye-removal.cl',
+  'ripple.cl',
   'shadows-highlights-correction.cl',
   'snn-mean.cl',
   'stretch-contrast.cl',

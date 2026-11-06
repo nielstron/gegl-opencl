@@ -101,6 +101,253 @@ get_abyss_policy (GeglOperation *operation,
   return o->abyss_policy;
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+
+#include "opencl/ripple.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+/* Copies @rect of @buffer, converted to @format, into a new OpenCL buffer. */
+static cl_mem
+cl_upload_rect (GeglBuffer          *buffer,
+                const GeglRectangle *rect,
+                const Babl          *format)
+{
+  cl_int   cl_err = 0;
+  cl_mem   tex    = NULL;
+  size_t   size   = (size_t) rect->width * rect->height *
+                    babl_format_get_bytes_per_pixel (format);
+  gpointer data;
+
+  tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                             CL_MEM_ALLOC_HOST_PTR | CL_MEM_READ_ONLY,
+                             size, NULL, &cl_err);
+  CL_CHECK;
+
+  data = gegl_clEnqueueMapBuffer (gegl_cl_get_command_queue (), tex, CL_TRUE,
+                                  CL_MAP_WRITE, 0, size,
+                                  0, NULL, NULL, &cl_err);
+  CL_CHECK;
+
+  gegl_buffer_get (buffer, rect, 1.0, format, data,
+                   GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
+
+  cl_err = gegl_clEnqueueUnmapMemObject (gegl_cl_get_command_queue (), tex,
+                                         data, 0, NULL, NULL);
+  CL_CHECK;
+
+  return tex;
+
+error:
+  if (tex)
+    gegl_clReleaseMemObject (tex);
+
+  return NULL;
+}
+
+/* Computes the part of the input that has to be uploaded so that the
+ * kernel's fetch () can serve every pixel in @needed the way GeglSampler
+ * does, given the input's @abyss rectangle and abyss @policy.
+ */
+static gboolean
+cl_get_source_rect (const GeglRectangle *needed,
+                    const GeglRectangle *abyss,
+                    GeglAbyssPolicy      policy,
+                    GeglRectangle       *src_rect)
+{
+  if (gegl_rectangle_is_infinite_plane (abyss))
+    {
+      if (policy == GEGL_ABYSS_LOOP)
+        return FALSE;
+
+      *src_rect = *needed;
+    }
+  else if (abyss->width < 1 || abyss->height < 1)
+    {
+      return FALSE;
+    }
+  else if (policy == GEGL_ABYSS_LOOP)
+    {
+      if (gegl_rectangle_contains (abyss, needed))
+        *src_rect = *needed;
+      else
+        *src_rect = *abyss;
+    }
+  else if (policy == GEGL_ABYSS_CLAMP)
+    {
+      /* where @needed lands after clamping to @abyss */
+      gint x0 = CLAMP (needed->x, abyss->x, abyss->x + abyss->width - 1);
+      gint y0 = CLAMP (needed->y, abyss->y, abyss->y + abyss->height - 1);
+      gint x1 = CLAMP (needed->x + needed->width - 1,
+                       abyss->x, abyss->x + abyss->width - 1);
+      gint y1 = CLAMP (needed->y + needed->height - 1,
+                       abyss->y, abyss->y + abyss->height - 1);
+
+      *src_rect = *GEGL_RECTANGLE (x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+    }
+  else if (! gegl_rectangle_intersect (src_rect, needed, abyss))
+    {
+      /* everything is abyss, the uploaded pixel is never read */
+      *src_rect = *GEGL_RECTANGLE (abyss->x, abyss->y, 1, 1);
+    }
+
+  return (gdouble) src_rect->width * src_rect->height <= (1 << 26);
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi,
+            gdouble              amplitude,
+            gdouble              period,
+            gdouble              angle_rad)
+{
+  GeglProperties       *o      = GEGL_PROPERTIES (operation);
+  const Babl           *format = gegl_operation_get_format (operation, "output");
+  const Babl           *space  = babl_format_get_space (format);
+  const Babl           *src_format;
+  const GeglRectangle  *abyss  = gegl_buffer_get_abyss (input);
+  GeglRectangle         needed;
+  GeglRectangle         src_rect;
+  GeglBufferClIterator *i;
+  cl_kernel             kernel;
+  cl_mem                in_tex = NULL;
+  cl_int                cl_err = 0;
+  gboolean              err;
+  gint                  margin;
+  cl_int4               srect;
+  cl_int4               abyss4;
+  cl_int                policy      = o->abyss_policy;
+  cl_int                unpremultiply;
+  cl_int                wave_type   = o->wave_type;
+  cl_float              f_amplitude = amplitude;
+  cl_float              f_period    = period;
+  cl_float              f_phi       = o->phi;
+  gdouble               cos_a       = cos (angle_rad);
+  gdouble               sin_a       = sin (angle_rad);
+  cl_float2             cos_angle;
+  cl_float2             sin_angle;
+
+  if (format != babl_format_with_space ("RGBA float", space))
+    return FALSE;
+
+  /* as hi/lo pairs, for the kernel to compute the phase precisely */
+  cos_angle.s[0] = cos_a;
+  cos_angle.s[1] = cos_a - cos_angle.s[0];
+  sin_angle.s[0] = sin_a;
+  sin_angle.s[1] = sin_a - sin_angle.s[0];
+
+  switch (o->sampler_type)
+    {
+    case GEGL_SAMPLER_NEAREST:
+      /* the nearest sampler converts pixels straight to the op's format */
+      src_format    = format;
+      unpremultiply = 0;
+      break;
+    case GEGL_SAMPLER_LINEAR:
+    case GEGL_SAMPLER_CUBIC:
+    case GEGL_SAMPLER_NOHALO:
+      src_format    = babl_format_with_space ("RaGaBaA float", space);
+      unpremultiply = 1;
+      break;
+    default:
+      return FALSE;
+    }
+
+  /* samples are at most amplitude pixels away, and the samplers read up
+   * to two pixels beyond the sampled one */
+  margin = ceil (fabs (amplitude)) + 3;
+  needed = *roi;
+  needed.x      -= margin;
+  needed.y      -= margin;
+  needed.width  += 2 * margin;
+  needed.height += 2 * margin;
+
+  if (! cl_get_source_rect (&needed, abyss, policy, &src_rect))
+    return FALSE;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"ripple_nearest", "ripple_linear",
+                                   "ripple_cubic", "ripple_nohalo", NULL};
+      cl_data = gegl_cl_compile_and_build (ripple_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return FALSE;
+
+  switch (o->sampler_type)
+    {
+    case GEGL_SAMPLER_NEAREST: kernel = cl_data->kernel[0]; break;
+    case GEGL_SAMPLER_LINEAR:  kernel = cl_data->kernel[1]; break;
+    case GEGL_SAMPLER_CUBIC:   kernel = cl_data->kernel[2]; break;
+    default:                   kernel = cl_data->kernel[3]; break;
+    }
+
+  srect.s[0]  = src_rect.x;
+  srect.s[1]  = src_rect.y;
+  srect.s[2]  = src_rect.width;
+  srect.s[3]  = src_rect.height;
+  abyss4.s[0] = abyss->x;
+  abyss4.s[1] = abyss->y;
+  abyss4.s[2] = abyss->width;
+  abyss4.s[3] = abyss->height;
+
+  in_tex = cl_upload_rect (input, &src_rect, src_format);
+  if (!in_tex)
+    return FALSE;
+
+  i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err))
+    {
+      size_t global_ws[2];
+
+      if (err)
+        goto error_iter;
+
+      global_ws[0] = i->roi[0].width;
+      global_ws[1] = i->roi[0].height;
+
+      cl_err = gegl_cl_set_kernel_args (kernel,
+                                        sizeof (cl_mem),   &in_tex,
+                                        sizeof (cl_int4),  &srect,
+                                        sizeof (cl_int4),  &abyss4,
+                                        sizeof (cl_int),   &policy,
+                                        sizeof (cl_mem),   &i->tex[0],
+                                        sizeof (cl_int),   &i->roi[0].x,
+                                        sizeof (cl_int),   &i->roi[0].y,
+                                        sizeof (cl_int),   &unpremultiply,
+                                        sizeof (cl_int),   &wave_type,
+                                        sizeof (cl_float), &f_amplitude,
+                                        sizeof (cl_float), &f_period,
+                                        sizeof (cl_float), &f_phi,
+                                        sizeof (cl_float2), &cos_angle,
+                                        sizeof (cl_float2), &sin_angle,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            kernel, 2,
+                                            NULL, global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  gegl_clReleaseMemObject (in_tex);
+
+  return TRUE;
+
+error:
+  gegl_buffer_cl_iterator_stop (i);
+error_iter:
+  gegl_clReleaseMemObject (in_tex);
+
+  return FALSE;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -178,6 +425,14 @@ process (GeglOperation       *operation,
        */
     }
 
+  if (level == 0 && gegl_operation_use_opencl (operation) &&
+      cl_process (operation, input, output, result,
+                  amplitude, period, angle_rad))
+    {
+      g_object_unref (sampler);
+      return TRUE;
+    }
+
   iter = gegl_buffer_iterator_new (output, result, 0, format,
                                    GEGL_ACCESS_WRITE, GEGL_ABYSS_NONE, 1);
 
@@ -252,6 +507,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->prepare     = prepare;
   filter_class->process        = process;
   area_class->get_abyss_policy = get_abyss_policy;
+  operation_class->opencl_support = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",               "gegl:ripple",
