@@ -43,6 +43,7 @@ gegl_operations_opencl_sources = [
   'noise-pick.cl',
   'noise-reduction.cl',
   'noise-rgb.cl',
+  'noise-slur.cl',
   'noise-simplex.cl',
   'oilify.cl',
   'opacity.cl',
