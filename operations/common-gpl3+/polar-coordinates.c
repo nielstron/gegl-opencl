@@ -367,8 +367,8 @@ static void
 polar_column_factors (GeglProperties      *o,
                       const GeglRectangle *boundary,
                       gint                 wx,
-                      cl_float            *fx,
-                      cl_float            *fy)
+                      gdouble             *fx,
+                      gdouble             *fy)
 {
   const gint    x1 = 0, y1 = 0;
   const gint    x2 = boundary->width, y2 = boundary->height;
@@ -446,6 +446,149 @@ polar_column_factors (GeglProperties      *o,
   *fy = sy;
 }
 
+/* For a fixed column in "to polar" = FALSE mode, x_calc and y_calc are
+ * monotone functions of the row, so the rows calc_undistorted_coords ()
+ * reports as inside form one interval.  The decision is too sensitive for
+ * single precision near the half-pixel threshold (the margin can be ~1e-5
+ * pixels), so the column's first and last inside rows within
+ * [y_lo, y_hi] are found here: estimate them from the column factors, then
+ * settle them with calc_undistorted_coords () itself.  Returns lo > hi if
+ * there are none.
+ */
+static gboolean
+polar_row_inside (GeglProperties      *o,
+                  const GeglRectangle *boundary,
+                  gdouble              cen_x,
+                  gdouble              cen_y,
+                  gint                 wx,
+                  gint                 wy)
+{
+  gdouble x, y;
+
+  return calc_undistorted_coords (wx, wy, cen_x, cen_y, &x, &y,
+                                  o, *boundary);
+}
+
+/* the rows wy for which lo < c0 + c1 * wy < hi, intersected with *a, *b */
+static void
+polar_limit_rows (gdouble  c0,
+                  gdouble  c1,
+                  gdouble  lo,
+                  gdouble  hi,
+                  gdouble *a,
+                  gdouble *b)
+{
+  if (c1 == 0)
+    {
+      if (! (lo < c0 && c0 < hi))
+        {
+          *a = 1;
+          *b = 0;
+        }
+    }
+  else
+    {
+      gdouble t0 = (lo - c0) / c1;
+      gdouble t1 = (hi - c0) / c1;
+
+      *a = MAX (*a, MIN (t0, t1));
+      *b = MIN (*b, MAX (t0, t1));
+    }
+}
+
+static void
+polar_column_rows (GeglProperties      *o,
+                   const GeglRectangle *boundary,
+                   gdouble              cen_x,
+                   gdouble              cen_y,
+                   gint                 wx,
+                   gdouble              sx,
+                   gdouble              sy,
+                   gint                 y_lo,
+                   gint                 y_hi,
+                   cl_int              *row_lo,
+                   cl_int              *row_hi)
+{
+  const gdouble w = boundary->width, h = boundary->height;
+  gdouble       r0, r1, a, b;
+  gint          lo = 1, hi = 0, k, start;
+  gboolean      found_lo = FALSE, found_hi = FALSE;
+
+  /* r = r0 + r1 * wy */
+  if (o->top)
+    {
+      r0 = 0;
+      r1 = 1 / h;
+    }
+  else
+    {
+      r0 = 1;
+      r1 = -1 / h;
+    }
+
+  /* (int) (v + 0.5) truncates towards zero, so v is inside for
+   * -1.5 < v < size - 0.5
+   */
+  a = y_lo;
+  b = y_hi;
+  polar_limit_rows (w / 2 + sx * r0, sx * r1, -1.5, w - 0.5, &a, &b);
+  polar_limit_rows (h / 2 + sy * r0, sy * r1, -1.5, h - 0.5, &a, &b);
+
+  if (a <= b + 4)
+    {
+      start = CLAMP (floor (a) - 2, y_lo, y_hi + 1);
+      for (k = start; k <= y_hi && k <= start + 5; k++)
+        if (polar_row_inside (o, boundary, cen_x, cen_y, wx, k))
+          {
+            lo       = k;
+            found_lo = TRUE;
+            break;
+          }
+
+      start = CLAMP (ceil (b) + 2, y_lo - 1, y_hi);
+      for (k = start; k >= y_lo && k >= start - 5; k--)
+        if (polar_row_inside (o, boundary, cen_x, cen_y, wx, k))
+          {
+            hi       = k;
+            found_hi = TRUE;
+            break;
+          }
+    }
+
+  /* the rows just outside must be outside; otherwise, or if only one end
+   * was found, the estimate was off and all rows are checked
+   */
+  if (found_lo != found_hi ||
+      (found_lo &&
+       ((lo > y_lo &&
+         polar_row_inside (o, boundary, cen_x, cen_y, wx, lo - 1)) ||
+        (hi < y_hi &&
+         polar_row_inside (o, boundary, cen_x, cen_y, wx, hi + 1)))))
+    {
+      lo = 1;
+      hi = 0;
+      found_lo = FALSE;
+
+      for (k = y_lo; k <= y_hi; k++)
+        if (polar_row_inside (o, boundary, cen_x, cen_y, wx, k))
+          {
+            if (! found_lo)
+              lo = k;
+            found_lo = TRUE;
+            hi = k;
+          }
+    }
+
+  if (! found_lo)
+    {
+      lo = 1;
+      hi = 0;
+    }
+
+  *row_lo = lo;
+  *row_hi = hi;
+}
+
 /* Implements process () with the NoHalo sampler on the GPU.  Samples are
  * only taken at positions that round to a pixel inside the input's bounding
  * box, so only the part of the abyss rectangle that NoHalo's stencil can
@@ -469,7 +612,9 @@ cl_process (GeglOperation       *operation,
   GeglBufferClIterator *i;
   cl_mem                in_tex = NULL;
   cl_mem                col_tex = NULL;
+  cl_mem                row_tex = NULL;
   cl_float2            *cols;
+  cl_int2              *rows;
   cl_int                n_cols;
   cl_int                cl_err = 0;
   gboolean              err;
@@ -523,17 +668,28 @@ cl_process (GeglOperation       *operation,
   abyss4.s[2] = abyss->width;
   abyss4.s[3] = abyss->height;
 
-  /* per column factors for polar == FALSE; a dummy entry otherwise */
+  /* per column factors and inside rows for polar == FALSE; a dummy entry
+   * otherwise
+   */
   n_cols = polar ? 1 : roi->width;
   cols   = g_new0 (cl_float2, n_cols);
+  rows   = g_new0 (cl_int2, n_cols);
 
   if (! polar)
     {
       gint x;
 
       for (x = 0; x < roi->width; x++)
-        polar_column_factors (o, boundary, roi->x + x,
-                              &cols[x].s[0], &cols[x].s[1]);
+        {
+          gdouble sx, sy;
+
+          polar_column_factors (o, boundary, roi->x + x, &sx, &sy);
+          cols[x].s[0] = sx;
+          cols[x].s[1] = sy;
+          polar_column_rows (o, boundary, cen_x, cen_y, roi->x + x, sx, sy,
+                             roi->y, roi->y + roi->height - 1,
+                             &rows[x].s[0], &rows[x].s[1]);
+        }
     }
 
   col_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
@@ -541,12 +697,26 @@ cl_process (GeglOperation       *operation,
                                  n_cols * sizeof (cl_float2), cols, &cl_err);
   g_free (cols);
   if (cl_err != CL_SUCCESS)
-    return FALSE;
+    {
+      g_free (rows);
+      return FALSE;
+    }
+
+  row_tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                 CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                 n_cols * sizeof (cl_int2), rows, &cl_err);
+  g_free (rows);
+  if (cl_err != CL_SUCCESS)
+    {
+      gegl_clReleaseMemObject (col_tex);
+      return FALSE;
+    }
 
   in_tex = cl_upload_rect (input, &src_rect, interpolate_format);
   if (!in_tex)
     {
       gegl_clReleaseMemObject (col_tex);
+      gegl_clReleaseMemObject (row_tex);
       return FALSE;
     }
 
@@ -580,6 +750,7 @@ cl_process (GeglOperation       *operation,
                                         sizeof (cl_int),   &top,
                                         sizeof (cl_int),   &polar,
                                         sizeof (cl_mem),   &col_tex,
+                                        sizeof (cl_mem),   &row_tex,
                                         sizeof (cl_int),   &roi->x,
                                         sizeof (cl_int),   &unpremultiply,
                                         NULL);
@@ -594,6 +765,7 @@ cl_process (GeglOperation       *operation,
 
   gegl_clReleaseMemObject (in_tex);
   gegl_clReleaseMemObject (col_tex);
+  gegl_clReleaseMemObject (row_tex);
 
   return TRUE;
 
@@ -602,6 +774,7 @@ error:
 error_iter:
   gegl_clReleaseMemObject (in_tex);
   gegl_clReleaseMemObject (col_tex);
+  gegl_clReleaseMemObject (row_tex);
 
   return FALSE;
 }

@@ -830,6 +830,7 @@ polar_unmap (float  wx,
              int    top,
              int    polar,
              float2 col,
+             int2   rows,
              float *x,
              float *y)
 {
@@ -918,6 +919,15 @@ polar_unmap (float  wx,
 
       x_calc = xm + col.x * r;
       y_calc = ym + col.y * r;
+
+      /* whether the row is inside is decided on the host in double
+       * precision, being too close to the threshold for single precision
+       * at times
+       */
+      *x = x_calc;
+      *y = y_calc;
+
+      return rows.x <= (int) wy && (int) wy <= rows.y;
     }
 
   /* With rmax == 0 (the pole on the top or left edge) the coordinates
@@ -952,6 +962,7 @@ polar_coordinates (__global const float4 *src,
                    int                    top,
                    int                    polar,
                    __global const float2 *cols,
+                   __global const int2   *rows,
                    int                    cols_x,
                    int                    unpremultiply_output)
 {
@@ -962,7 +973,8 @@ polar_coordinates (__global const float4 *src,
 
   if (polar_unmap (roi_x + gidx, roi_y + gidy, cen_x, cen_y, width, height,
                    circle, angl, bw, top, polar,
-                   cols[polar ? 0 : roi_x + gidx - cols_x], &px, &py))
+                   cols[polar ? 0 : roi_x + gidx - cols_x],
+                   rows[polar ? 0 : roi_x + gidx - cols_x], &px, &py))
     {
       /* the CPU code passes an all-zero scale matrix, which disables
        * NoHalo's EWA path */
