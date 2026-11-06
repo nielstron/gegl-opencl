@@ -32,7 +32,7 @@
  * abyss policy, everything else is read from the uploaded source
  * rectangle 'srect' (x, y, width, height).
  */
-inline float4
+static inline float4
 fetch (__global const float4 *src,
        int4                   srect,
        int4                   abyss,
@@ -74,7 +74,7 @@ fetch (__global const float4 *src,
 #define NOHALO_MAX(x,y)  select (y, x, (x) >= (y))
 #define NOHALO_ABS(x)    fabs (x)
 #define NOHALO_SIGN(x)   select ((float4) -1.0f, (float4) 1.0f, (x) >= 0.0f)
-inline void
+static inline void
 nohalo_subdivision (const float4 uno_two,
                     const float4 uno_thr,
                     const float4 uno_fou,
@@ -324,7 +324,7 @@ nohalo_subdivision (const float4 uno_two,
   *qua_thr_1 = newval_qua_thr;
   *qua_fou_1 =        qua_fou;
 }
-inline float4
+static inline float4
 lbb (const float  c00,
      const float  c10,
      const float  c01,
@@ -540,7 +540,7 @@ lbb (const float  c00,
 
 #define NOHALO_OFFSET_0 13
 
-inline float
+static inline float
 nohalo_teepee (const float c_major_x,
                const float c_major_y,
                const float c_minor_x,
@@ -559,7 +559,7 @@ nohalo_teepee (const float c_major_x,
  * computing all four channels at once.  The 2x2 matrix (a b; c d) is
  * the inverse Jacobian as computed by gegl_sampler_compute_scale.
  */
-inline float4
+static inline float4
 nohalo_get (__global const float4 *src,
             int4                   srect,
             int4                   abyss,
@@ -795,7 +795,7 @@ nohalo_get (__global const float4 *src,
 /* "RaGaBaA float" to "RGBA float", like babl does it */
 #define ALPHA_FLOOR (1.0f / 65536.0f)
 
-inline float4
+static inline float4
 unpremultiply (float4 v)
 {
   const float alpha = v.w;
@@ -806,8 +806,18 @@ unpremultiply (float4 v)
   return (float4) (v.xyz * recip, alpha);
 }
 
+/* GEGL's fmod () (gegl-math.h) is floored, so unlike OpenCL's fmod ()
+ * its result has the sign of y, not of x.
+ */
+static float
+gegl_fmod (float x,
+           float y)
+{
+  return x - y * floor (x / y);
+}
+
 /* Port of calc_undistorted_coords () in polar-coordinates.c */
-inline int
+static inline int
 polar_unmap (float  wx,
              float  wy,
              float  cen_x,
@@ -883,7 +893,7 @@ polar_unmap (float  wx,
       t = ((cen_y - y1) < (cen_x - x1)) ? (cen_y - y1) : (cen_x - x1);
       rmax = (rmax - t) / 100 * (100 - circle) + t;
 
-      phi = fmod (phi + angl, 2 * M_PI_F);
+      phi = gegl_fmod (phi + angl, 2 * M_PI_F);
 
       if (bw)
         x_calc = x2 - 1 - (x2 - x1 - 1) / (2 * M_PI_F) * phi;
@@ -902,7 +912,7 @@ polar_unmap (float  wx,
       else
         phi = (2 * M_PI_F) * (wx - x1) / xdiff;
 
-      phi = fmod (phi + angl, 2 * M_PI_F);
+      phi = gegl_fmod (phi + angl, 2 * M_PI_F);
 
       if (phi >= 1.5f * M_PI_F)
         phi2 = 2 * M_PI_F - phi;
@@ -974,11 +984,16 @@ polar_unmap (float  wx,
         }
     }
 
-  xi = (int) (x_calc + 0.5f);
-  yi = (int) (y_calc + 0.5f);
+  /* With rmax == 0 (the pole on the top or left edge) the coordinates
+   * can be NaN or infinite.  Convert them with saturation, NaN going to
+   * 0, as the CPU's (int) cast does on ARM; the sampler then reads
+   * non-finite coordinates as 0, like gegl_sampler_get () does.
+   */
+  xi = convert_int_sat (x_calc + 0.5f);
+  yi = convert_int_sat (y_calc + 0.5f);
 
-  *x = x_calc;
-  *y = y_calc;
+  *x = isfinite (x_calc) ? x_calc : 0.0f;
+  *y = isfinite (y_calc) ? y_calc : 0.0f;
 
   return 0 <= xi && xi <= width - 1 && 0 <= yi && yi <= height - 1;
 }
