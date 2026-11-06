@@ -110,17 +110,18 @@ prepare (GeglOperation *operation)
 }
 
 
-/* Computes how far the samples of a pixel inside the input extent can
- * be from it.  The samples of a pixel are its offset from the center
- * rotated by theta, |theta| <= angle / 2, which moves it by
+/* Computes how far the samples of the pixels in @rect can be from them.
+ * The samples of a pixel are its offset from the center rotated by theta,
+ * |theta| <= angle / 2, which moves it by
  * (xr * (cos (theta) - 1) - yr * sin (theta),
  *  xr * sin (theta) + yr * (cos (theta) - 1)).
  * One pixel is added for the bilinear interpolation.
  */
 static gboolean
-get_sample_distance (GeglOperation *operation,
-                     gint          *dx,
-                     gint          *dy)
+get_sample_distance (GeglOperation       *operation,
+                     const GeglRectangle *rect,
+                     gint                *dx,
+                     gint                *dy)
 {
   GeglProperties *o = GEGL_PROPERTIES (operation);
   GeglRectangle  *whole_region;
@@ -141,30 +142,31 @@ get_sample_distance (GeglOperation *operation,
                                                 whole_region->width);
   center_y = gegl_coordinate_relative_to_pixel (o->center_y,
                                                 whole_region->height);
-  maxr_x = MAX (fabs (center_x - whole_region->x),
-                fabs (center_x - whole_region->x - whole_region->width));
-  maxr_y = MAX (fabs (center_y - whole_region->y),
-                fabs (center_y - whole_region->y - whole_region->height));
+  maxr_x = MAX (fabs (center_x - rect->x),
+                fabs (center_x - rect->x - rect->width));
+  maxr_y = MAX (fabs (center_y - rect->y),
+                fabs (center_y - rect->y - rect->height));
 
   half    = MIN (angle / 2.0, G_PI);
   max_sin = half >= G_PI_2 ? 1.0 : sin (half);
   max_cos = 1.0 - cos (half);
 
-  *dx = MIN (ceil (maxr_x * max_cos + maxr_y * max_sin),
-             whole_region->width) + 1;
-  *dy = MIN (ceil (maxr_y * max_cos + maxr_x * max_sin),
-             whole_region->height) + 1;
+  *dx = ceil (maxr_x * max_cos + maxr_y * max_sin) + 1;
+  *dy = ceil (maxr_y * max_cos + maxr_x * max_sin) + 1;
 
   return TRUE;
 }
 
 /* Computes the area around @rect that its samples can come from, so that
  * no sample is clamped to the edge of the input rectangle, which would
- * make the result depend on how the output is split in chunks.  Samples
- * outside the input extent are skipped, so the area is clipped to it (plus
- * one pixel for the bilinear interpolation).  The clipping uses the far
- * edge of @rect, so that the area is also large enough for any part of
- * @rect.
+ * make the result depend on how the output is split in chunks.  The
+ * sampling distance is computed for @rect itself, which matters for parts
+ * of the bounding box outside the input extent: their pixels are farther
+ * from the center than any input pixel.  Samples outside the input extent
+ * are skipped, so the area is clipped to it (plus one pixel for the
+ * bilinear interpolation).  The clipping uses the far edge of @rect, so
+ * that the area is also large enough for any part of @rect, which the
+ * OpenCL iterator relies on.
  */
 static void
 get_sample_area (GeglOperation       *operation,
@@ -177,7 +179,7 @@ get_sample_area (GeglOperation       *operation,
   GeglRectangle *whole_region;
   gint           dx, dy;
 
-  if (! get_sample_distance (operation, &dx, &dy))
+  if (! get_sample_distance (operation, rect, &dx, &dy))
     {
       *left = *right = *top = *bottom = 0;
       return;
@@ -215,10 +217,11 @@ get_invalidated_by_change (GeglOperation       *operation,
                            const GeglRectangle *input_region)
 {
   GeglRectangle rect = *input_region;
+  GeglRectangle bbox = gegl_operation_get_bounding_box (operation);
   gint          dx, dy;
 
-  if (! get_sample_distance (operation, &dx, &dy))
-    return gegl_operation_get_bounding_box (operation);
+  if (! get_sample_distance (operation, &bbox, &dx, &dy))
+    return bbox;
 
   rect.x      -= dx;
   rect.y      -= dy;

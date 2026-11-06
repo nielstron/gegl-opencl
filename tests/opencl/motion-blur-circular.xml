@@ -1,13 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <gegl>
-  <!-- outside the input extent the result depends on how the output
-       is split into chunks, also on the CPU, so compare inside only -->
-  <node operation='gegl:crop'>
-    <params>
-      <param name='width'>512</param>
-      <param name='height'>384</param>
-    </params>
-  </node>
   <node operation='gegl:motion-blur-circular'>
     <params>
       <param name='angle'>30</param>
