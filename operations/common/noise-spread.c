@@ -90,6 +90,162 @@ prepare (GeglOperation *operation)
   gegl_operation_set_format (operation, "output", format);
 }
 
+#include "opencl/gegl-cl.h"
+#include "gegl-buffer-cl-iterator.h"
+#include "opencl/noise-spread.cl.h"
+
+static GeglClRunData *cl_data     = NULL;
+static cl_mem         angle_table = NULL;
+
+/* sin and cos of every angle gegl_random_float_range() can return in
+ * calc_sample_coords(), indexed by the low 16 bits of the random number,
+ * each split into a high and a low float so the kernel can reproduce the
+ * double precision floor () of the CPU version.
+ */
+static cl_mem
+get_angle_table (cl_int *cl_err)
+{
+  if (! angle_table)
+    {
+      const gfloat  min = -G_PI;
+      const gfloat  max =  G_PI;
+      cl_float4    *table;
+      gint          k;
+
+      table = g_new (cl_float4, 65536);
+
+      for (k = 0; k < 65536; k++)
+        {
+          /* same expressions as gegl_random_float_range () */
+          gfloat  f     = k * 0.00001525902189669642175;
+          gfloat  angle = f * (max - min) + min;
+          gdouble s     = sin (angle);
+          gdouble c     = cos (angle);
+
+          table[k].s[0] = s;
+          table[k].s[1] = s - (gfloat) s;
+          table[k].s[2] = c;
+          table[k].s[3] = c - (gfloat) c;
+        }
+
+      angle_table = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                         CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                                         65536 * sizeof (cl_float4),
+                                         table, cl_err);
+      g_free (table);
+
+      if (*cl_err != CL_SUCCESS)
+        angle_table = NULL;
+    }
+  else
+    {
+      *cl_err = CL_SUCCESS;
+    }
+
+  return angle_table;
+}
+
+static gboolean
+cl_noise_spread (cl_mem               in_tex,
+                 cl_mem               out_tex,
+                 const GeglRectangle *roi,
+                 gint                 in_width,
+                 gint                 area_x,
+                 gint                 area_y,
+                 gint                 bpp,
+                 GeglRandom          *rand)
+{
+  cl_int     cl_err = 0;
+  cl_mem     cl_random_data;
+  cl_mem     cl_angle_table;
+  cl_ushort4 cl_rand;
+  size_t     global_ws = (size_t) roi->width * roi->height;
+
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "cl_noise_spread", NULL };
+      cl_data = gegl_cl_compile_and_build (noise_spread_cl_source, kernel_name);
+    }
+
+  if (!cl_data)
+    return TRUE;
+
+  gegl_cl_random_get_ushort4 (rand, &cl_rand);
+
+  cl_random_data = gegl_cl_load_random_data (&cl_err);
+  CL_CHECK;
+
+  cl_angle_table = get_angle_table (&cl_err);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem),     &in_tex,
+                                    sizeof (cl_mem),     &out_tex,
+                                    sizeof (cl_mem),     &cl_random_data,
+                                    sizeof (cl_mem),     &cl_angle_table,
+                                    sizeof (cl_ushort4), &cl_rand,
+                                    sizeof (cl_int),     &roi->x,
+                                    sizeof (cl_int),     &roi->y,
+                                    sizeof (cl_int),     &roi->width,
+                                    sizeof (cl_int),     &in_width,
+                                    sizeof (cl_int),     &area_x,
+                                    sizeof (cl_int),     &area_y,
+                                    sizeof (cl_int),     &bpp,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 1,
+                                        NULL, &global_ws, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  return FALSE;
+
+error:
+  return TRUE;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *result,
+            const Babl          *format,
+            gint                 amount_x,
+            gint                 amount_y)
+{
+  GeglProperties       *o   = GEGL_PROPERTIES (operation);
+  gint                  bpp = babl_format_get_bytes_per_pixel (format);
+  GeglBufferClIterator *i;
+  gint                  read;
+  gint                  err = 0;
+
+  i = gegl_buffer_cl_iterator_new (output, result, format,
+                                   GEGL_CL_BUFFER_WRITE);
+
+  read = gegl_buffer_cl_iterator_add_2 (i, input, result, format,
+                                        GEGL_CL_BUFFER_READ,
+                                        amount_x, amount_x,
+                                        amount_y, amount_y,
+                                        GEGL_ABYSS_CLAMP);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && !err)
+    {
+      err = cl_noise_spread (i->tex[read], i->tex[0], &i->roi[0],
+                             i->roi[read].width, amount_x, amount_y,
+                             bpp, o->rand);
+
+      if (err)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          break;
+        }
+    }
+
+  return !err;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -112,6 +268,11 @@ process (GeglOperation       *operation,
 
   format = gegl_operation_get_source_format (operation, "input");
   bpp = babl_format_get_bytes_per_pixel (format);
+
+  if (level == 0 && gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, result, format,
+                    amount_x, amount_y))
+      return TRUE;
 
   gi = gegl_buffer_iterator_new (output, result, 0, format,
                                  GEGL_ACCESS_WRITE, GEGL_ABYSS_CLAMP, 1);
@@ -174,9 +335,10 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class = GEGL_OPERATION_CLASS (klass);
   filter_class    = GEGL_OPERATION_FILTER_CLASS (klass);
 
-  operation_class->prepare = prepare;
-  operation_class->process = operation_process;
-  filter_class->process    = process;
+  operation_class->prepare        = prepare;
+  operation_class->process        = operation_process;
+  operation_class->opencl_support = TRUE;
+  filter_class->process           = process;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:noise-spread",
