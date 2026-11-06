@@ -397,8 +397,9 @@ process (GeglOperation       *operation,
   GeglRectangle   rect;
   gfloat         *in;
   gfloat         *in_w;
-  gfloat         *out;
-  gfloat         *out_w;
+  gdouble        *out;
+  gdouble        *out_w;
+  gfloat         *out_f;
   gfloat         *mask        = NULL;
   gfloat          highlight_threshold_low;
   gfloat          highlight_threshold_high;
@@ -436,8 +437,9 @@ process (GeglOperation       *operation,
 
   in    = (gfloat *) gegl_malloc (4 * sizeof (gfloat) * rect.width * size);
   in_w  = (gfloat *) gegl_malloc (    sizeof (gfloat) * rect.width * size);
-  out   = (gfloat *) gegl_malloc (4 * sizeof (gfloat) * roi->width);
-  out_w = (gfloat *) gegl_malloc (    sizeof (gfloat) * roi->width);
+  out   = (gdouble *) gegl_malloc (4 * sizeof (gdouble) * roi->width);
+  out_w = (gdouble *) gegl_malloc (    sizeof (gdouble) * roi->width);
+  out_f = (gfloat *)  gegl_malloc (4 * sizeof (gfloat)  * roi->width);
 
   if (aux)
     mask = (gfloat *) gegl_malloc (sizeof (gfloat) * rect.width * size);
@@ -536,8 +538,8 @@ process (GeglOperation       *operation,
       gint r1, r2;
       gint x;
 
-      memset (out,   0, 4 * sizeof (gfloat) * roi->width);
-      memset (out_w, 0,     sizeof (gfloat) * roi->width);
+      memset (out,   0, 4 * sizeof (gdouble) * roi->width);
+      memset (out_w, 0,     sizeof (gdouble) * roi->width);
 
       r1 = MAX (-iradius,                   - (y - rect.y));
       r2 = MIN (+iradius, (rect.height - 1) - (y - rect.y));
@@ -548,12 +550,12 @@ process (GeglOperation       *operation,
 
           for (r = r1; r <= r2; r++)
             {
-              gfloat       *o        = out;
-              gfloat       *o_w      = out_w;
+              gdouble      *o        = out;
+              gdouble      *o_w      = out_w;
               const gfloat *row;
               const gfloat *row_w;
-              gfloat        accum[4] = {};
-              gfloat        accum_w  = 0.0f;
+              gdouble       accum[4] = {};
+              gdouble       accum_w  = 0.0;
               gint          r_i;
               gint          s;
               gint          x1, x2;
@@ -694,9 +696,9 @@ process (GeglOperation       *operation,
           gint c;
 
           for (c = 0; c < 3; c++)
-            out[4 * x + c] /= out[4 * x + 3];
+            out_f[4 * x + c] = out[4 * x + c] / out[4 * x + 3];
 
-          out[4 * x + 3] /= out_w[x];
+          out_f[4 * x + 3] = out[4 * x + 3] / out_w[x];
         }
 
       gegl_buffer_set (output,
@@ -706,7 +708,7 @@ process (GeglOperation       *operation,
                                        1),
                        0,
                        format,
-                       out,
+                       out_f,
                        GEGL_AUTO_ROWSTRIDE);
 
       if ((y + 1) + iradius < rect.y + rect.height)
@@ -714,6 +716,7 @@ process (GeglOperation       *operation,
     }
 
   gegl_free (mask);
+  gegl_free (out_f);
   gegl_free (out_w);
   gegl_free (out);
   gegl_free (in_w);
