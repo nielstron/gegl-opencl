@@ -95,6 +95,9 @@ randomize_value (gfloat      now,
   return new_val;
 }
 
+static gboolean lch_kernel_matches_babl (const Babl *space,
+                                         gboolean   *contract);
+
 static void
 prepare (GeglOperation *operation)
 {
@@ -108,9 +111,12 @@ prepare (GeglOperation *operation)
    * input formats the OpenCL kernel converts from and to RGB itself, with
    * the same math as babl.  8-bit input is passed through untouched, so
    * that the kernel can linearize it with the exact values babl uses.
+   * For float input, gray pixels can have any value, so this is only done
+   * if the kernel's conversion reproduces babl's for this babl build.
    */
   if (gegl_operation_use_opencl (operation) &&
-      (source == rgbaf ||
+      ((source == rgbaf &&
+        lch_kernel_matches_babl (babl_format_get_space (rgbaf), NULL)) ||
        source == babl_format_with_space ("R'G'B'A u8", space) ||
        source == babl_format_with_space ("R'G'B' u8", space)))
     {
@@ -231,6 +237,23 @@ process (GeglOperation       *operation,
 
 static GeglClRunData *cl_data = NULL;
 
+static GeglClRunData *
+get_cl_data (void)
+{
+  if (!cl_data)
+    {
+      const char *kernel_name[] = { "cl_noise_cie_lch_lch",
+                                    "cl_noise_cie_lch",
+                                    "cl_noise_cie_lch_u8",
+                                    "cl_noise_cie_lch_probe",
+                                    NULL };
+      cl_data = gegl_cl_compile_and_build (noise_cie_lch_cl_source,
+                                           kernel_name);
+    }
+
+  return cl_data;
+}
+
 /* The matrices babl's "RGBA float" <-> "CIE Lab alpha float" conversions
  * use for the space of format.  The RGB to XYZ matrix is read back from
  * babl by converting the three primaries.
@@ -283,6 +306,197 @@ get_lab_matrices (const Babl *format,
     rgb_to_lab[i] = lab_to_rgb[i] = 0.0f;
 }
 
+#define N_PROBES 4096
+
+/* The probe colors: all 8-bit and many other gray levels, including out of
+ * range ones and slightly off gray ones, whose chroma and hue are rounding
+ * noise, and some arbitrary colors.
+ */
+static void
+make_probes (gfloat *rgba)
+{
+  guint32 r = 1;
+  gint    i;
+
+  for (i = 0; i < N_PROBES; i++)
+    {
+      gfloat *p = rgba + 4 * i;
+      gfloat  v;
+
+      r = r * 1664525u + 1013904223u;
+
+      if (i < 256)
+        v = i / 255.0f;
+      else if (i < 512)
+        v = (i - 256) / 1023.0f;
+      else
+        v = (r >> 8) / (gfloat) (1 << 24) * 1.25f - 0.05f;
+
+      p[0] = p[1] = p[2] = v;
+      p[3] = 1.0f;
+
+      if (i >= 3072 && i < 3584)
+        {
+          p[(i / 4) % 3] = nextafterf (v, (i & 1) ? 2.0f : -2.0f);
+        }
+      else if (i >= 3584)
+        {
+          p[1] = (r & 0xff) / 255.0f;
+          p[2] = ((r >> 24) & 0xff) / 255.0f;
+        }
+    }
+}
+
+static gboolean
+lch_probes_match (const gfloat *gpu,
+                  const gfloat *cpu)
+{
+  gint i;
+
+  for (i = 0; i < N_PROBES; i++)
+    {
+      const gfloat *g = gpu + 4 * i;
+      const gfloat *c = cpu + 4 * i;
+      gfloat        dh;
+
+      if (fabsf (g[0] - c[0]) > 1e-4f ||
+          fabsf (g[1] - c[1]) > 1e-4f ||
+          (g[1] == 0.0f) != (c[1] == 0.0f))
+        return FALSE;
+
+      dh = fabsf (g[2] - c[2]);
+      if (dh > 180.0f)
+        dh = 360.0f - dh;
+
+      if (c[1] > 0.0f && dh > 0.01f)
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+/* Runs the kernel's RGB to LCH conversion on the probes, with or without
+ * contraction, and compares the results to babl's.  Returns -1 on an
+ * OpenCL error.
+ */
+static gint
+lch_probe (const Babl   *space,
+           const gfloat *rgba,
+           const gfloat *lch,
+           gboolean      contract)
+{
+  cl_int     cl_err   = 0;
+  cl_mem     cl_in    = NULL;
+  cl_mem     cl_out   = NULL;
+  size_t     n        = N_PROBES;
+  cl_float16 rgb_to_lab;
+  cl_float16 lab_to_rgb;
+  gfloat    *out      = g_new (gfloat, 4 * N_PROBES);
+  gint       result   = -1;
+  cl_kernel  kernel   = cl_data->kernel[3];
+
+  get_lab_matrices (babl_format_with_space ("RGBA float", space),
+                    rgb_to_lab.s, lab_to_rgb.s);
+  rgb_to_lab.s[9] = contract ? 1.0f : 0.0f;
+
+  cl_in = gegl_clCreateBuffer (gegl_cl_get_context (),
+                               CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                               4 * N_PROBES * sizeof (gfloat), (void *) rgba,
+                               &cl_err);
+  CL_CHECK;
+
+  cl_out = gegl_clCreateBuffer (gegl_cl_get_context (), CL_MEM_WRITE_ONLY,
+                                4 * N_PROBES * sizeof (gfloat), NULL,
+                                &cl_err);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (kernel,
+                                    sizeof (cl_mem),     &cl_in,
+                                    sizeof (cl_mem),     &cl_out,
+                                    sizeof (cl_float16), &rgb_to_lab,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        kernel, 1, NULL, &n, NULL,
+                                        0, NULL, NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueReadBuffer (gegl_cl_get_command_queue (), cl_out,
+                                     CL_TRUE, 0,
+                                     4 * N_PROBES * sizeof (gfloat), out,
+                                     0, NULL, NULL);
+  CL_CHECK;
+
+  result = lch_probes_match (out, lch);
+
+error:
+  if (cl_in)
+    gegl_clReleaseMemObject (cl_in);
+  if (cl_out)
+    gegl_clReleaseMemObject (cl_out);
+  g_free (out);
+
+  return result;
+}
+
+/* Whether the kernel's RGB to LCH conversion reproduces babl's for space,
+ * and with which contraction mode; the result is cached per space.
+ */
+static gboolean
+lch_kernel_matches_babl (const Babl *space,
+                         gboolean   *contract)
+{
+  /* 0: no match, 1: match without contraction, 2: match with contraction */
+  static GHashTable *modes = NULL;
+  G_LOCK_DEFINE_STATIC (modes);
+  gpointer           value;
+  gint               mode = 0;
+
+  G_LOCK (modes);
+
+  if (!modes)
+    modes = g_hash_table_new (NULL, NULL);
+
+  if (g_hash_table_lookup_extended (modes, space, NULL, &value))
+    {
+      mode = GPOINTER_TO_INT (value);
+    }
+  else if (get_cl_data ())
+    {
+      const Babl *rgbaf = babl_format_with_space ("RGBA float", space);
+      gfloat     *rgba  = g_new (gfloat, 4 * N_PROBES);
+      gfloat     *lch   = g_new (gfloat, 4 * N_PROBES);
+      gint        r     = -1;
+
+      make_probes (rgba);
+      babl_process (babl_fish (rgbaf,
+                               babl_format_with_space (
+                                 "CIE LCH(ab) alpha float", space)),
+                    rgba, lch, N_PROBES);
+
+      r = lch_probe (space, rgba, lch, TRUE);
+      if (r == 1)
+        mode = 2;
+      else if (r == 0)
+        mode = lch_probe (space, rgba, lch, FALSE) == 1 ? 1 : 0;
+
+      /* do not cache OpenCL errors */
+      if (r >= 0)
+        g_hash_table_insert (modes, (gpointer) space, GINT_TO_POINTER (mode));
+
+      g_free (rgba);
+      g_free (lch);
+    }
+
+  G_UNLOCK (modes);
+
+  if (contract)
+    *contract = mode != 1;
+
+  return mode != 0;
+}
+
 static gboolean
 cl_process (GeglOperation       *operation,
             cl_mem               in,
@@ -310,17 +524,19 @@ cl_process (GeglOperation       *operation,
   cl_mem          cl_lut      = NULL;
   cl_mem          cl_gray_lch = NULL;
 
-  if (!cl_data)
-    {
-      const char *kernel_name[] = { "cl_noise_cie_lch_lch",
-                                    "cl_noise_cie_lch",
-                                    "cl_noise_cie_lch_u8",
-                                    NULL };
-      cl_data = gegl_cl_compile_and_build (noise_cie_lch_cl_source,
-                                           kernel_name);
-    }
+  const Babl     *space      = babl_format_get_space (out_format);
+  gboolean        contract   = TRUE;
 
-  if (!cl_data)
+  if (!get_cl_data ())
+    return TRUE;
+
+  /* for "RGBA float" input this was already checked in prepare (); for
+   * 8-bit input only non-gray pixels are converted by the kernel, whose
+   * chroma is far above the rounding noise, so a mismatch does not matter
+   */
+  if (out_format == babl_format_with_space ("RGBA float", space) &&
+      !lch_kernel_matches_babl (space, &contract) &&
+      in_format == out_format)
     return TRUE;
 
   gegl_cl_random_get_ushort4 (o->rand, &rand);
@@ -329,6 +545,7 @@ cl_process (GeglOperation       *operation,
   CL_CHECK;
 
   get_lab_matrices (out_format, rgb_to_lab.s, lab_to_rgb.s);
+  rgb_to_lab.s[9] = contract ? 1.0f : 0.0f;
 
   if (out_format != babl_format_with_space ("RGBA float", out_format))
     {

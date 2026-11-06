@@ -17,10 +17,16 @@
 /* The CPU version gets its pixels converted to "CIE LCH(ab) alpha float"
  * by babl, which goes through "RGBA float" and "CIE Lab alpha float".  The
  * conversion to LCH is replicated here operation by operation (including
- * babl's cube root approximation and the fused multiply-adds an FP
- * contracting compiler, like clang on arm64, makes of it), so the noise is
- * applied to identical LCH values.  This matters for gray pixels, whose
- * hue is decided by rounding noise in the a and b components.
+ * babl's cube root approximation), so the noise is applied to identical
+ * LCH values.  This matters for gray pixels, whose hue is decided by
+ * rounding noise in the a and b components.
+ *
+ * Whether the compiler babl was built with contracted its multiply-adds
+ * into fused multiply-adds (clang on arm64 does, x86_64 without -mfma and
+ * armv7 do not) changes that rounding noise, so both variants are
+ * implemented and selected by rgb_to_lab.s9.  The host picks the one that
+ * reproduces babl's output for a set of probe colors (cl_noise_cie_lch_probe)
+ * and does not use the "RGBA float" kernel if neither does.
  */
 #pragma OPENCL FP_CONTRACT OFF
 
@@ -56,31 +62,49 @@ lch_cbrt (float x)
   return u;
 }
 
+/* a * b + c, with or without the rounding of the product */
 float
-lch_lab_f (float t)
+lch_mad (float a,
+         float b,
+         float c,
+         int   contract)
 {
-  return t > LAB_EPSILON ? lch_cbrt (t)
-                         : lch_div (fma (t, LAB_KAPPA, 16.0f), 116.0f);
+  return contract ? fma (a, b, c) : a * b + c;
 }
 
-/* rgb_to_lab: RGBtoXYZ matrix of the space divided by the D50 white */
+float
+lch_lab_f (float t,
+           int   contract)
+{
+  return t > LAB_EPSILON
+           ? lch_cbrt (t)
+           : lch_div (lch_mad (t, LAB_KAPPA, 16.0f, contract), 116.0f);
+}
+
+/* rgb_to_lab: RGBtoXYZ matrix of the space divided by the D50 white in
+ * s0-s8, s9 non-zero if babl's multiply-adds are contracted
+ */
 float4
 lch_rgba_to_lcha (float4  rgba,
                   float16 rgb_to_lab)
 {
-  float xr = fma (rgb_to_lab.s2, rgba.z,
-                  fma (rgb_to_lab.s0, rgba.x, rgb_to_lab.s1 * rgba.y));
-  float yr = fma (rgb_to_lab.s5, rgba.z,
-                  fma (rgb_to_lab.s3, rgba.x, rgb_to_lab.s4 * rgba.y));
-  float zr = fma (rgb_to_lab.s8, rgba.z,
-                  fma (rgb_to_lab.s6, rgba.x, rgb_to_lab.s7 * rgba.y));
-  float fx = lch_lab_f (xr);
-  float fy = lch_lab_f (yr);
-  float fz = lch_lab_f (zr);
-  float L  = fma (fy, 116.0f, -16.0f);
+  int   c  = rgb_to_lab.s9 != 0.0f;
+  float xr = lch_mad (rgb_to_lab.s2, rgba.z,
+                      lch_mad (rgb_to_lab.s0, rgba.x,
+                               rgb_to_lab.s1 * rgba.y, c), c);
+  float yr = lch_mad (rgb_to_lab.s5, rgba.z,
+                      lch_mad (rgb_to_lab.s3, rgba.x,
+                               rgb_to_lab.s4 * rgba.y, c), c);
+  float zr = lch_mad (rgb_to_lab.s8, rgba.z,
+                      lch_mad (rgb_to_lab.s6, rgba.x,
+                               rgb_to_lab.s7 * rgba.y, c), c);
+  float fx = lch_lab_f (xr, c);
+  float fy = lch_lab_f (yr, c);
+  float fz = lch_lab_f (zr, c);
+  float L  = lch_mad (fy, 116.0f, -16.0f, c);
   float A  = (fx - fy) * 500.0f;
   float B  = (fy - fz) * 200.0f;
-  float C  = sqrt (fma (A, A, B * B));
+  float C  = sqrt (lch_mad (A, A, B * B, c));
   float H  = atan2 (B, A) * DEGREES_PER_RADIAN;
 
   if (H < 0.0f)
@@ -301,4 +325,16 @@ __kernel void cl_noise_cie_lch_u8 (__global const uchar  *in,
     }
 
   out[gid] = lch_lcha_to_rgba (NOISE_CIE_LCH (lcha), lab_to_rgb);
+}
+
+/* "RGBA float" in, "CIE LCH(ab) alpha float" out, without noise; used by
+ * the host to check the conversion against babl
+ */
+__kernel void cl_noise_cie_lch_probe (__global const float4 *in,
+                                      __global       float4 *out,
+                                      float16                rgb_to_lab)
+{
+  int gid = get_global_id (0);
+
+  out[gid] = lch_rgba_to_lcha (in[gid], rgb_to_lab);
 }
