@@ -195,6 +195,55 @@ cl_get_source_rect (const GeglRectangle *needed,
   return (gdouble) src_rect->width * src_rect->height <= (1 << 26);
 }
 
+/* Splits @v into a hi/lo pair of floats. */
+static void
+cl_split (gdouble    v,
+          cl_float2 *out)
+{
+  out->s[0] = v;
+  out->s[1] = v - out->s[0];
+}
+
+/* Uploads the phase table of the kernel: for i in [0, n), the phase of
+ * (origin + i) * step + offset reduced modulo @period, as hi/lo pairs; in
+ * units of the period, plus @cycles_offset, reduced to [-1/2, 1/2] if
+ * @cycles, else in pixels, in [-period / 2, period / 2].
+ */
+static cl_mem
+cl_phase_table (gint      origin,
+                gint      n,
+                gdouble   step,
+                gdouble   offset,
+                gdouble   period,
+                gboolean  cycles,
+                gdouble   cycles_offset)
+{
+  cl_int     cl_err = 0;
+  cl_mem     tex;
+  cl_float2 *table  = g_new (cl_float2, n);
+  gint       i;
+
+  for (i = 0; i < n; i++)
+    {
+      gdouble v = remainder ((origin + i) * step + offset, period);
+
+      if (cycles)
+        v = remainder (v / period + cycles_offset, 1.0);
+
+      cl_split (v, &table[i]);
+    }
+
+  tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                             CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                             n * sizeof (cl_float2), table, &cl_err);
+  g_free (table);
+
+  if (cl_err != CL_SUCCESS)
+    return NULL;
+
+  return tex;
+}
+
 static gboolean
 cl_process (GeglOperation       *operation,
             GeglBuffer          *input,
@@ -222,22 +271,44 @@ cl_process (GeglOperation       *operation,
   cl_int                policy      = o->abyss_policy;
   cl_int                unpremultiply;
   cl_int                wave_type   = o->wave_type;
-  cl_float              f_amplitude = amplitude;
-  cl_float              f_period    = period;
-  cl_float              f_phi       = o->phi;
+  cl_mem                phase_x     = NULL;
+  cl_mem                phase_y     = NULL;
+  cl_int                phase_x0    = roi->x;
+  cl_int                phase_y0    = roi->y;
   gdouble               cos_a       = cos (angle_rad);
   gdouble               sin_a       = sin (angle_rad);
+  gdouble               offset;
+  gboolean              cycles;
+  cl_float2             f_amplitude;
+  cl_float2             f_period;
   cl_float2             cos_angle;
   cl_float2             sin_angle;
 
   if (format != babl_format_with_space ("RGBA float", space))
     return FALSE;
 
-  /* as hi/lo pairs, for the kernel to compute the phase precisely */
-  cos_angle.s[0] = cos_a;
-  cos_angle.s[1] = cos_a - cos_angle.s[0];
-  sin_angle.s[0] = sin_a;
-  sin_angle.s[1] = sin_a - sin_angle.s[0];
+  /* as hi/lo pairs, for the kernel to compute the coordinates precisely */
+  cl_split (amplitude, &f_amplitude);
+  cl_split (period,    &f_period);
+  cl_split (cos_a,     &cos_angle);
+  cl_split (sin_a,     &sin_angle);
+
+  /* the phase offset that process () adds to nx, before the remainder */
+  switch (o->wave_type)
+    {
+    case GEGL_RIPPLE_WAVE_TYPE_SAWTOOTH:
+      offset = period / 2 - o->phi * period;
+      cycles = FALSE;
+      break;
+    case GEGL_RIPPLE_WAVE_TYPE_TRIANGLE:
+      offset = period * 3 / 4 - o->phi * period;
+      cycles = FALSE;
+      break;
+    default:
+      offset = 0.0;
+      cycles = TRUE;
+      break;
+    }
 
   switch (o->sampler_type)
     {
@@ -299,6 +370,15 @@ cl_process (GeglOperation       *operation,
   if (!in_tex)
     return FALSE;
 
+  /* nx = x * cos (angle) - y * sin (angle), split into a column and a row
+   * term, each reduced on the host in double precision */
+  phase_x = cl_phase_table (roi->x, roi->width, cos_a, offset, period,
+                            cycles, o->phi);
+  phase_y = cl_phase_table (roi->y, roi->height, -sin_a, 0.0, period,
+                            cycles, 0.0);
+  if (!phase_x || !phase_y)
+    goto error_iter;
+
   i = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
 
   while (gegl_buffer_cl_iterator_next (i, &err))
@@ -321,9 +401,12 @@ cl_process (GeglOperation       *operation,
                                         sizeof (cl_int),   &i->roi[0].y,
                                         sizeof (cl_int),   &unpremultiply,
                                         sizeof (cl_int),   &wave_type,
-                                        sizeof (cl_float), &f_amplitude,
-                                        sizeof (cl_float), &f_period,
-                                        sizeof (cl_float), &f_phi,
+                                        sizeof (cl_mem),   &phase_x,
+                                        sizeof (cl_mem),   &phase_y,
+                                        sizeof (cl_int),   &phase_x0,
+                                        sizeof (cl_int),   &phase_y0,
+                                        sizeof (cl_float2), &f_amplitude,
+                                        sizeof (cl_float2), &f_period,
                                         sizeof (cl_float2), &cos_angle,
                                         sizeof (cl_float2), &sin_angle,
                                         NULL);
@@ -337,6 +420,8 @@ cl_process (GeglOperation       *operation,
     }
 
   gegl_clReleaseMemObject (in_tex);
+  gegl_clReleaseMemObject (phase_x);
+  gegl_clReleaseMemObject (phase_y);
 
   return TRUE;
 
@@ -344,6 +429,10 @@ error:
   gegl_buffer_cl_iterator_stop (i);
 error_iter:
   gegl_clReleaseMemObject (in_tex);
+  if (phase_x)
+    gegl_clReleaseMemObject (phase_x);
+  if (phase_y)
+    gegl_clReleaseMemObject (phase_y);
 
   return FALSE;
 }

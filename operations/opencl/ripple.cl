@@ -935,35 +935,132 @@ unpremultiply (float4 v)
   return (float4) (v.xyz * recip, alpha);
 }
 
-/* a / b, correctly rounded */
-static inline float
-div_cr (float a,
-        float b)
-{
-  const float q = a / b;
+/* Double-float helpers: a value is carried as an unevaluated sum hi + lo
+ * of two floats.  They are built from error-free transformations that
+ * need neither fma () nor double precision, only that every operation is
+ * rounded on its own, so FP contraction is turned off from here on.
+ */
+#pragma OPENCL FP_CONTRACT OFF
 
-  return fma (fma (-q, b, a), 1.0f / b, q);
-}
-
-
-
-/* a + (b + b_lo), rounded once */
-static inline float
-add_df (float a,
-        float b,
-        float b_lo)
+/* a + b = s.x + s.y exactly */
+static inline float2
+two_sum (float a,
+         float b)
 {
   const float s  = a + b;
   const float bb = s - a;
-  const float e  = (a - (s - bb)) + (b - bb);
 
-  return s + (e + b_lo);
+  return (float2) (s, (a - (s - bb)) + (b - bb));
+}
+
+/* a + b = s.x + s.y exactly, for |a| >= |b| */
+static inline float2
+quick_two_sum (float a,
+               float b)
+{
+  const float s = a + b;
+
+  return (float2) (s, b - (s - a));
+}
+
+/* splits a into two halves of at most 12 significant bits */
+static inline float2
+split (float a)
+{
+  const float t  = 4097.0f * a;
+  const float hi = t - (t - a);
+
+  return (float2) (hi, a - hi);
+}
+
+/* a * b = p.x + p.y exactly (Dekker) */
+static inline float2
+two_prod (float a,
+          float b)
+{
+  const float  p  = a * b;
+  const float2 as = split (a);
+  const float2 bs = split (b);
+  const float  e  = ((as.x * bs.x - p) + as.x * bs.y + as.y * bs.x) +
+                    as.y * bs.y;
+
+  return (float2) (p, e);
+}
+
+static inline float2
+df_add (float2 a,
+        float2 b)
+{
+  const float2 s = two_sum (a.x, b.x);
+
+  return quick_two_sum (s.x, s.y + (a.y + b.y));
+}
+
+static inline float2
+df_add_f (float2 a,
+          float  b)
+{
+  const float2 s = two_sum (a.x, b);
+
+  return quick_two_sum (s.x, s.y + a.y);
+}
+
+static inline float2
+df_mul (float2 a,
+        float2 b)
+{
+  const float2 p = two_prod (a.x, b.x);
+
+  return quick_two_sum (p.x, p.y + (a.x * b.y + a.y * b.x));
+}
+
+/* a / b, for a and b > 0 */
+static inline float2
+df_div (float2 a,
+        float2 b)
+{
+  const float  q = a.x / b.x;
+  const float2 p = df_mul ((float2) (q, 0.0f), b);
+  const float2 r = df_add (a, -p);
+
+  return quick_two_sum (q, r.x / b.x);
+}
+
+static inline int
+df_less (float2 a,
+         float2 b)
+{
+  return a.x < b.x || (a.x == b.x && a.y < b.y);
+}
+
+static inline int
+df_is_negative (float2 a)
+{
+  return a.x < 0.0f || (a.x == 0.0f && a.y < 0.0f);
+}
+
+/* x + d, rounded once, for an integer x */
+static inline float
+add_df (float  x,
+        float2 d)
+{
+  const float2 s = two_sum (x, d.x);
+
+  return s.x + (s.y + d.y);
 }
 
 #define WAVE_TYPE_SINE     0
 #define WAVE_TYPE_TRIANGLE 1
 #define WAVE_TYPE_SAWTOOTH 2
 
+/* The phase of the wave is nx = x * cos (angle) - y * sin (angle) reduced
+ * modulo the period.  It is computed on the host in double precision, per
+ * column (phase_x, which includes the wave's phase offset) and per row
+ * (phase_y), each reduced to [-period / 2, period / 2] and given as hi/lo
+ * pairs; for the sine wave they are in units of the period instead, and
+ * reduced to [-1/2, 1/2].  This way the kernel needs neither the large
+ * products and remainders of nx, nor fp64.
+ */
 static inline void
 ripple (__global const float4 *src,
         int4                   srect,
@@ -974,104 +1071,83 @@ ripple (__global const float4 *src,
         int                    roi_y,
         int                    unpremultiply_output,
         int                    wave_type,
-        float                  amplitude,
-        float                  period,
-        float                  phi,
+        __global const float2 *phase_x,
+        __global const float2 *phase_y,
+        int                    phase_x0,
+        int                    phase_y0,
+        float2                 amplitude,
+        float2                 period,
         float2                 cos_angle,
         float2                 sin_angle,
         const int              sampler_type)
 {
   const int   gidx = get_global_id (0);
   const int   gidy = get_global_id (1);
-  const float x    = roi_x + gidx;
-  const float y    = roi_y + gidy;
-  float       nx, nx_lo, r, lambda, q, q_lo, w, w_lo;
-  float       shift, shift_lo = 0.0f;
+  const int   ix   = roi_x + gidx;
+  const int   iy   = roi_y + gidy;
+  const float x    = ix;
+  const float y    = iy;
+  float2      phase;
+  float2      w;
+  float2      shift;
   float4      out;
 
-  /* nx = x * cos (angle) - y * sin (angle), to more than single precision
-   * (nx + nx_lo); cos_angle and sin_angle are given as hi/lo pairs */
-  {
-    const float p  = x * cos_angle.x;
-    const float pe = fma (x, cos_angle.x, -p);
-    const float q  = y * sin_angle.x;
-    const float qe = fma (y, sin_angle.x, -q);
+  phase = df_add (phase_x[ix - phase_x0], phase_y[iy - phase_y0]);
 
-    nx    = p - q;
-    nx_lo = ((p - nx) - q) + pe - qe +
-            x * cos_angle.y - y * sin_angle.y;
-  }
-
-  switch (wave_type)
+  if (wave_type == WAVE_TYPE_SINE)
     {
-    case WAVE_TYPE_SAWTOOTH:
-      r      = remainder (nx, period);
-      lambda = remainder (r + (nx_lo + (period / 2 - phi * period)), period);
-      if (lambda < 0)
-        lambda += period;
-      q     = div_cr (lambda, period);
-      q_lo  = fma (-q, period, lambda) / period;
-      w     = q * 2 - 1;
-      w_lo  = ((q * 2 - (w + 1)) + q_lo * 2);
-      shift    = amplitude * w;
-      shift_lo = fma (amplitude, w, -shift) + amplitude * w_lo;
-      break;
-    case WAVE_TYPE_TRIANGLE:
-      r      = remainder (nx, period);
-      lambda = remainder (r + (nx_lo + (period * 3 / 4 - phi * period)),
-                          period);
-      if (lambda < 0)
-        lambda += period;
-      q     = div_cr (lambda, period);
-      q_lo  = fma (-q, period, lambda) / period;
-      w     = q * 4 - 2;
-      w_lo  = ((q * 4 - (w + 2)) + q_lo * 4);
-      if (w < 0)
+      /* sin (2 pi phase), with phase reduced to [-1/4, 1/4] so that the
+       * zeros of the wave come out exactly */
+      float u;
+
+      if (phase.x > 0.5f)
+        phase = df_add_f (phase, -1.0f);
+      else if (phase.x < -0.5f)
+        phase = df_add_f (phase, 1.0f);
+
+      if (phase.x > 0.25f)
+        phase = df_add_f (-phase, 0.5f);
+      else if (phase.x < -0.25f)
+        phase = df_add_f (-phase, -0.5f);
+
+      u = phase.x + phase.y;
+
+      w = (float2) (sinpi (2.0f * u), 0.0f);
+    }
+  else
+    {
+      /* lambda = remainder (nx + offset, period), moved to [0, period) */
+      float2 lambda = phase;
+      float2 q;
+
+      if (df_is_negative (lambda))
+        lambda = df_add (lambda, period);
+      else if (! df_less (lambda, period))
+        lambda = df_add (lambda, -period);
+
+      q = df_div (lambda, period);
+
+      if (wave_type == WAVE_TYPE_SAWTOOTH)
         {
-          w    = -w;
-          w_lo = -w_lo;
+          /* q * 2 - 1 */
+          w = df_add_f (q * 2.0f, -1.0f);
         }
-      q     = w - 1;
-      w_lo  = ((w - (q + 1)) + w_lo);
-      w     = q;
-      shift    = amplitude * w;
-      shift_lo = fma (amplitude, w, -shift) + amplitude * w_lo;
-      break;
-    default:
-      {
-        /* sin (2 pi (nx / period + phi)), reduced to a small argument so
-         * that the zeros of the wave come out exactly */
-        const float half_period = period / 2;
-        float       u;
-        int         k;
-
-        r = remainder (nx, half_period);
-        k = (int) rint ((nx - r) / half_period);
-        u = div_cr (r + nx_lo, period);
-
-        if (phi != 0.0f)
-          u += phi;
-
-        shift = amplitude * sinpi (2 * u);
-        if (k & 1)
-          shift = -shift;
-      }
-      break;
+      else
+        {
+          /* fabs (q * 4 - 2) - 1 */
+          w = df_add_f (q * 4.0f, -2.0f);
+          if (df_is_negative (w))
+            w = -w;
+          w = df_add_f (w, -1.0f);
+        }
     }
 
-  {
-    /* x + shift * sin (angle) and y + shift * cos (angle), rounded once */
-    const float px = shift * sin_angle.x;
-    const float py = shift * cos_angle.x;
-    const float ex = fma (shift, sin_angle.x, -px) +
-                     shift * sin_angle.y + shift_lo * sin_angle.x;
-    const float ey = fma (shift, cos_angle.x, -py) +
-                     shift * cos_angle.y + shift_lo * cos_angle.x;
+  shift = df_mul (amplitude, w);
 
-    out = sampler_get (src, srect, abyss, policy, sampler_type,
-                       add_df (x, px, ex),
-                       add_df (y, py, ey));
-  }
+  /* x + shift * sin (angle) and y + shift * cos (angle), rounded once */
+  out = sampler_get (src, srect, abyss, policy, sampler_type,
+                     add_df (x, df_mul (shift, sin_angle)),
+                     add_df (y, df_mul (shift, cos_angle)));
 
   if (unpremultiply_output)
     out = unpremultiply (out);
@@ -1089,15 +1165,19 @@ ripple_nearest (__global const float4 *src,
                 int                    roi_y,
                 int                    unpremultiply_output,
                 int                    wave_type,
-                float                  amplitude,
-                float                  period,
-                float                  phi,
+                __global const float2 *phase_x,
+                __global const float2 *phase_y,
+                int                    phase_x0,
+                int                    phase_y0,
+                float2                 amplitude,
+                float2                 period,
                 float2                 cos_angle,
                 float2                 sin_angle)
 {
   ripple (src, srect, abyss, policy, dst, roi_x, roi_y,
-          unpremultiply_output, wave_type, amplitude, period, phi,
-          cos_angle, sin_angle, SAMPLER_NEAREST);
+          unpremultiply_output, wave_type, phase_x, phase_y,
+          phase_x0, phase_y0, amplitude, period, cos_angle, sin_angle,
+          SAMPLER_NEAREST);
 }
 
 __kernel void
@@ -1110,15 +1190,19 @@ ripple_linear (__global const float4 *src,
                int                    roi_y,
                int                    unpremultiply_output,
                int                    wave_type,
-               float                  amplitude,
-               float                  period,
-               float                  phi,
+               __global const float2 *phase_x,
+               __global const float2 *phase_y,
+               int                    phase_x0,
+               int                    phase_y0,
+               float2                 amplitude,
+               float2                 period,
                float2                 cos_angle,
                float2                 sin_angle)
 {
   ripple (src, srect, abyss, policy, dst, roi_x, roi_y,
-          unpremultiply_output, wave_type, amplitude, period, phi,
-          cos_angle, sin_angle, SAMPLER_LINEAR);
+          unpremultiply_output, wave_type, phase_x, phase_y,
+          phase_x0, phase_y0, amplitude, period, cos_angle, sin_angle,
+          SAMPLER_LINEAR);
 }
 
 __kernel void
@@ -1131,15 +1215,19 @@ ripple_cubic (__global const float4 *src,
               int                    roi_y,
               int                    unpremultiply_output,
               int                    wave_type,
-              float                  amplitude,
-              float                  period,
-              float                  phi,
+              __global const float2 *phase_x,
+              __global const float2 *phase_y,
+              int                    phase_x0,
+              int                    phase_y0,
+              float2                 amplitude,
+              float2                 period,
               float2                 cos_angle,
               float2                 sin_angle)
 {
   ripple (src, srect, abyss, policy, dst, roi_x, roi_y,
-          unpremultiply_output, wave_type, amplitude, period, phi,
-          cos_angle, sin_angle, SAMPLER_CUBIC);
+          unpremultiply_output, wave_type, phase_x, phase_y,
+          phase_x0, phase_y0, amplitude, period, cos_angle, sin_angle,
+          SAMPLER_CUBIC);
 }
 
 __kernel void
@@ -1152,13 +1240,17 @@ ripple_nohalo (__global const float4 *src,
                int                    roi_y,
                int                    unpremultiply_output,
                int                    wave_type,
-               float                  amplitude,
-               float                  period,
-               float                  phi,
+               __global const float2 *phase_x,
+               __global const float2 *phase_y,
+               int                    phase_x0,
+               int                    phase_y0,
+               float2                 amplitude,
+               float2                 period,
                float2                 cos_angle,
                float2                 sin_angle)
 {
   ripple (src, srect, abyss, policy, dst, roi_x, roi_y,
-          unpremultiply_output, wave_type, amplitude, period, phi,
-          cos_angle, sin_angle, SAMPLER_NOHALO);
+          unpremultiply_output, wave_type, phase_x, phase_y,
+          phase_x0, phase_y0, amplitude, period, cos_angle, sin_angle,
+          SAMPLER_NOHALO);
 }
