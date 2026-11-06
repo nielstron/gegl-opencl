@@ -30,8 +30,17 @@ __constant float reciprocal[10] = {
  * exact remainder sum - q * count.  A quotient of floats is never exactly
  * halfway between two floats and here stays at least ulp/18 away from such
  * a midpoint, so the rounded q + r / count is the correctly rounded
- * quotient.  This only needs correctly rounded +, - and *, and gives the
- * same result with or without FP contraction.
+ * quotient.
+ *
+ * Both parts of q are taken from its bits: ql is the difference of two
+ * bit-masked floats with the same exponent, which is exact.  Written as
+ * q - qh, a compiler that contracts across statements could turn it into
+ * fma (sum, rcp, -qh) using the unrounded product, and r would then not be
+ * the remainder for q.  For the same reason the result is formed as
+ * qh + (ql + r * rcp) rather than q + r * rcp.  The only products that may
+ * still be fused are exact (qh * cf, ql * cf) or so small (r * rcp) that
+ * the rounding difference stays far below the ulp/18 margin, so the
+ * result does not depend on FP contraction or fma.
  */
 static float4
 div_count (float4 sum,
@@ -41,10 +50,12 @@ div_count (float4 sum,
   float4 rcp = (float4) (reciprocal[count.x], reciprocal[count.y],
                          reciprocal[count.z], reciprocal[count.w]);
   float4 q   = sum * rcp;
-  float4 qh  = as_float4 (as_uint4 (q) & (uint4) 0xfffff000u);
-  float4 ql  = q - qh;
+  uint4  qb  = as_uint4 (q);
+  float4 qh  = as_float4 (qb & (uint4) 0xfffff000u);
+  float4 ql  = as_float4 (qb & (uint4) 0xff800fffu) -
+               as_float4 (qb & (uint4) 0xff800000u);
   float4 r   = (sum - qh * cf) - ql * cf;
-  float4 res = q + r * rcp;
+  float4 res = qh + (ql + r * rcp);
 
   /* inf / nan input: keep the plain product */
   return select (res, q, isnan (res));
