@@ -24,6 +24,7 @@ opencl_tests = [
   'motion-blur-zoom',
   'newsprint',
   'noise-cie-lch',
+  'noise-pick',
   'noise-reduction',
   'oilify',
   'opacity',
