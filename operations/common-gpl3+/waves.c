@@ -92,7 +92,53 @@ get_abyss_policy (GeglOperation *operation,
 
 #include "opencl/waves.cl.h"
 
-static GeglClRunData *cl_data = NULL;
+static GeglClRunData *cl_data  = NULL;
+static cl_mem         cl_table = NULL;
+
+/* must match the kernel */
+#define WAVES_TABLE_SIZE 256
+
+/* @value as an unevaluated sum of two floats */
+static cl_float2
+cl_split_double (gdouble value)
+{
+  cl_float2 v;
+
+  v.s[0] = value;
+  v.s[1] = value - (gdouble) v.s[0];
+
+  return v;
+}
+
+/* sin and cos of 2 pi k / WAVES_TABLE_SIZE, as (sin hi, sin lo, cos hi,
+ * cos lo) */
+static cl_mem
+cl_create_table (void)
+{
+  cl_float4 table[WAVES_TABLE_SIZE];
+  cl_int    cl_err = 0;
+  cl_mem    tex;
+  gint      k;
+
+  for (k = 0; k < WAVES_TABLE_SIZE; k++)
+    {
+      cl_float2 s = cl_split_double (sin (2.0 * G_PI * k / WAVES_TABLE_SIZE));
+      cl_float2 c = cl_split_double (cos (2.0 * G_PI * k / WAVES_TABLE_SIZE));
+
+      table[k].s[0] = s.s[0];
+      table[k].s[1] = s.s[1];
+      table[k].s[2] = c.s[0];
+      table[k].s[3] = c.s[1];
+    }
+
+  tex = gegl_clCreateBuffer (gegl_cl_get_context (),
+                             CL_MEM_COPY_HOST_PTR | CL_MEM_READ_ONLY,
+                             sizeof (table), table, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    return NULL;
+
+  return tex;
+}
 
 /* Copies @rect of @buffer, converted to @format, into a new OpenCL buffer. */
 static cl_mem
@@ -209,13 +255,14 @@ cl_process (GeglOperation       *operation,
   cl_int4               abyss4;
   cl_int                policy      = abyss_policy;
   cl_int                unpremultiply;
-  cl_float              center_x    = px_x;
-  cl_float              center_y    = px_y;
-  cl_float              scale_x     = scalex;
-  cl_float              scale_y     = scaley;
-  cl_float              amplitude   = o->amplitude;
-  cl_float              period      = o->period;
-  cl_float              phi         = o->phi;
+  /* the double precision parameters, as hi + lo */
+  cl_float2             center_x    = cl_split_double (px_x);
+  cl_float2             center_y    = cl_split_double (px_y);
+  cl_float2             scale_x     = cl_split_double (scalex);
+  cl_float2             scale_y     = cl_split_double (scaley);
+  cl_float2             amplitude   = cl_split_double (o->amplitude);
+  cl_float2             period      = cl_split_double (o->period);
+  cl_float2             phi         = cl_split_double (o->phi);
 
   if (format != babl_format_with_space ("RGBA float", space))
     return FALSE;
@@ -259,6 +306,12 @@ cl_process (GeglOperation       *operation,
   if (!cl_data)
     return FALSE;
 
+  if (!cl_table)
+    cl_table = cl_create_table ();
+
+  if (!cl_table)
+    return FALSE;
+
   switch (o->sampler_type)
     {
     case GEGL_SAMPLER_NEAREST: kernel = cl_data->kernel[0]; break;
@@ -300,14 +353,15 @@ cl_process (GeglOperation       *operation,
                                         sizeof (cl_mem),   &i->tex[0],
                                         sizeof (cl_int),   &i->roi[0].x,
                                         sizeof (cl_int),   &i->roi[0].y,
-                                        sizeof (cl_int),   &unpremultiply,
-                                        sizeof (cl_float), &center_x,
-                                        sizeof (cl_float), &center_y,
-                                        sizeof (cl_float), &scale_x,
-                                        sizeof (cl_float), &scale_y,
-                                        sizeof (cl_float), &amplitude,
-                                        sizeof (cl_float), &period,
-                                        sizeof (cl_float), &phi,
+                                        sizeof (cl_int),    &unpremultiply,
+                                        sizeof (cl_mem),    &cl_table,
+                                        sizeof (cl_float2), &center_x,
+                                        sizeof (cl_float2), &center_y,
+                                        sizeof (cl_float2), &scale_x,
+                                        sizeof (cl_float2), &scale_y,
+                                        sizeof (cl_float2), &amplitude,
+                                        sizeof (cl_float2), &period,
+                                        sizeof (cl_float2), &phi,
                                         NULL);
       CL_CHECK;
 

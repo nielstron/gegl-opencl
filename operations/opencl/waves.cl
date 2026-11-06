@@ -28,6 +28,114 @@
 #define ABYSS_BLACK 3
 #define ABYSS_WHITE 4
 
+/* The CPU computes the displacement in double precision.  It is
+ * emulated here with unevaluated sums of two floats (hi, lo), using
+ * only correctly rounded additions and multiplications; contraction to
+ * fma would break the error-free transformations below.
+ */
+#pragma OPENCL FP_CONTRACT OFF
+
+inline float2
+two_sum (float a,
+         float b)
+{
+  const float s  = a + b;
+  const float bb = s - a;
+
+  return (float2) (s, (a - (s - bb)) + (b - bb));
+}
+
+/* requires |a| >= |b| or a == 0 */
+inline float2
+fast_two_sum (float a,
+              float b)
+{
+  const float s = a + b;
+
+  return (float2) (s, b - (s - a));
+}
+
+inline float2
+split (float a)
+{
+  const float c  = 4097.0f * a;
+  const float hi = c - (c - a);
+
+  return (float2) (hi, a - hi);
+}
+
+inline float2
+two_prod (float a,
+          float b)
+{
+  const float  p  = a * b;
+  const float2 as = split (a);
+  const float2 bs = split (b);
+
+  return (float2) (p, ((as.x * bs.x - p) + as.x * bs.y + as.y * bs.x) +
+                      as.y * bs.y);
+}
+
+inline float2
+df_add (float2 a,
+        float2 b)
+{
+  float2 s = two_sum (a.x, b.x);
+  float2 t = two_sum (a.y, b.y);
+
+  s.y += t.x;
+  s    = fast_two_sum (s.x, s.y);
+  s.y += t.y;
+
+  return fast_two_sum (s.x, s.y);
+}
+
+inline float2
+df_mul (float2 a,
+        float2 b)
+{
+  float2 p = two_prod (a.x, b.x);
+
+  p.y += a.x * b.y + a.y * b.x;
+
+  return fast_two_sum (p.x, p.y);
+}
+
+/* does not rely on the accuracy of float division */
+inline float2
+df_div (float2 a,
+        float2 b)
+{
+  const float q1 = a.x / b.x;
+  float2      r  = df_add (a, -df_mul (b, (float2) (q1, 0.0f)));
+  const float q2 = r.x / b.x;
+  float2      q;
+
+  r = df_add (r, -df_mul (b, (float2) (q2, 0.0f)));
+  q = fast_two_sum (q1, q2);
+
+  return df_add (q, (float2) (r.x / b.x, 0.0f));
+}
+
+/* does not rely on the accuracy of float sqrt; a > 0 */
+inline float2
+df_sqrt (float2 a)
+{
+  const float  s = sqrt (a.x);
+  const float2 e = df_add (a, -two_prod (s, s));
+
+  return fast_two_sum (s, e.x / (2.0f * s));
+}
+
+/* floor () of hi + lo */
+inline int
+df_floor (float2 a)
+{
+  const float f = floor (a.x);
+
+  return (int) f - (f == a.x && a.y < 0.0f);
+}
+
 /* Fetch one pixel of the input like GeglSampler does: coordinates
  * outside the buffer's abyss rectangle are handled according to the
  * abyss policy, everything else is read from the uploaded source
@@ -565,18 +673,20 @@ nohalo_get (__global const float4 *src,
             int4                   srect,
             int4                   abyss,
             int                    policy,
-            float                  absolute_x,
-            float                  absolute_y,
+            float2                 absolute_x,
+            float2                 absolute_y,
             float                  a,
             float                  b,
             float                  c,
             float                  d)
 {
-  const int ix_0 = (int) floor (absolute_x);
-  const int iy_0 = (int) floor (absolute_y);
+  /* floor () and the offsets of the double precision coordinate, like
+   * gegl_sampler_nohalo_get () computes them */
+  const int ix_0 = df_floor (absolute_x);
+  const int iy_0 = df_floor (absolute_y);
 
-  const float x_0 = (absolute_x - 0.5f) - ix_0;
-  const float y_0 = (absolute_y - 0.5f) - iy_0;
+  const float x_0 = ((absolute_x.x - 0.5f) - ix_0) + absolute_x.y;
+  const float y_0 = ((absolute_y.x - 0.5f) - iy_0) + absolute_y.y;
 
   const int sx = x_0 >= 0.0f ? 1 : -1;
   const int sy = y_0 >= 0.0f ? 1 : -1;
@@ -805,10 +915,11 @@ nearest_get (__global const float4 *src,
              int4                   srect,
              int4                   abyss,
              int                    policy,
-             float                  absolute_x,
-             float                  absolute_y)
+             float2                 absolute_x,
+             float2                 absolute_y)
 {
-  return FETCH ((int) floor (absolute_x), (int) floor (absolute_y));
+  /* int_floorf () of the coordinate rounded to float */
+  return FETCH ((int) floor (absolute_x.x), (int) floor (absolute_y.x));
 }
 
 /* gegl_sampler_linear_interpolate () */
@@ -817,11 +928,12 @@ linear_get (__global const float4 *src,
             int4                   srect,
             int4                   abyss,
             int                    policy,
-            float                  absolute_x,
-            float                  absolute_y)
+            float2                 absolute_x,
+            float2                 absolute_y)
 {
-  const float iabsolute_x = absolute_x - 0.5f;
-  const float iabsolute_y = absolute_y - 0.5f;
+  /* the CPU rounds the coordinate to float first */
+  const float iabsolute_x = absolute_x.x - 0.5f;
+  const float iabsolute_y = absolute_y.x - 0.5f;
   const int   ix = (int) floor (iabsolute_x);
   const int   iy = (int) floor (iabsolute_y);
   const float x  = iabsolute_x - ix;
@@ -868,15 +980,16 @@ cubic_get (__global const float4 *src,
            int4                   srect,
            int4                   abyss,
            int                    policy,
-           float                  absolute_x,
-           float                  absolute_y)
+           float2                 absolute_x,
+           float2                 absolute_y)
 {
-  const float iabsolute_x = absolute_x - 0.5f;
-  const float iabsolute_y = absolute_y - 0.5f;
-  const int   ix = (int) floor (iabsolute_x);
-  const int   iy = (int) floor (iabsolute_y);
-  const float x  = iabsolute_x - ix;
-  const float y  = iabsolute_y - iy;
+  /* iabsolute is double on the CPU, its floor is taken in float */
+  const float iabsolute_x = absolute_x.x - 0.5f;
+  const float iabsolute_y = absolute_y.x - 0.5f;
+  const int   ix = (int) floor (iabsolute_x + absolute_x.y);
+  const int   iy = (int) floor (iabsolute_y + absolute_y.y);
+  const float x  = (iabsolute_x - ix) + absolute_x.y;
+  const float y  = (iabsolute_y - iy) + absolute_y.y;
   float       factor_i[4];
   float4      result = (float4) (0.0f);
   int         i, j;
@@ -904,8 +1017,8 @@ sampler_get (__global const float4 *src,
              int4                   abyss,
              int                    policy,
              int                    sampler_type,
-             float                  absolute_x,
-             float                  absolute_y)
+             float2                 absolute_x,
+             float2                 absolute_y)
 {
   switch (sampler_type)
     {
@@ -935,16 +1048,28 @@ unpremultiply (float4 v)
   return (float4) (v.xyz * recip, alpha);
 }
 
-/* a / b, correctly rounded */
-inline float
-div_cr (float a,
-        float b)
+/* sin (2 pi u) for |u| <= 2, using a table of sin and cos of
+ * 2 pi k / WAVES_TABLE_SIZE as (sin hi, sin lo, cos hi, cos lo),
+ * computed in double on the host */
+#define WAVES_TABLE_SIZE 256
+
+inline float2
+df_sin2pi (float2                 u,
+           __global const float4 *table)
 {
-  const float q = a / b;
+  const float  g     = rint (u.x * WAVES_TABLE_SIZE);
+  /* the first difference is exact */
+  const float  d     = (u.x - g * (1.0f / WAVES_TABLE_SIZE)) + u.y;
+  /* 2 pi as hi + lo */
+  const float  t     = d * 6.28318548e+00f + d * -1.74845560e-07f;
+  const float  t2    = t * t;
+  const float  sin_t = t - t * t2 * (1.0f / 6.0f) * (1.0f - t2 * (1.0f / 20.0f));
+  const float  omc_t = t2 * 0.5f * (1.0f - t2 * (1.0f / 12.0f));
+  const float4 sc    = table[(int) g & (WAVES_TABLE_SIZE - 1)];
 
-  return fma (fma (-q, b, a), 1.0f / b, q);
+  /* sin (a + t) = sin a - sin a (1 - cos t) + cos a sin t */
+  return two_sum (sc.x, sc.y + (sc.z * sin_t - sc.x * omc_t));
 }
-
 
 inline void
 waves (__global const float4 *src,
@@ -955,57 +1080,41 @@ waves (__global const float4 *src,
        int                    roi_x,
        int                    roi_y,
        int                    unpremultiply_output,
-       float                  center_x,
-       float                  center_y,
-       float                  scale_x,
-       float                  scale_y,
-       float                  amplitude,
-       float                  period,
-       float                  phi,
+       __global const float4 *table,
+       float2                 center_x,
+       float2                 center_y,
+       float2                 scale_x,
+       float2                 scale_y,
+       float2                 amplitude,
+       float2                 period,
+       float2                 phi,
        const int              sampler_type)
 {
-  const int   gidx = get_global_id (0);
-  const int   gidy = get_global_id (1);
-  const float x    = roi_x + gidx;
-  const float y    = roi_y + gidy;
-  const float dx   = (x - center_x) * scale_x;
-  const float dy   = (y - center_y) * scale_y;
-  float       radius, shift;
-  float4      out;
+  const int    gidx = get_global_id (0);
+  const int    gidy = get_global_id (1);
+  const float2 x    = (float2) (roi_x + gidx, 0.0f);
+  const float2 y    = (float2) (roi_y + gidy, 0.0f);
+  const float2 dx   = df_mul (df_add (x, -center_x), scale_x);
+  const float2 dy   = df_mul (df_add (y, -center_y), scale_y);
+  float2       radius, t, shift, ox, oy;
+  float4       out;
 
-  if (!dx && !dy)
-    {
-      radius = 0.000001f;
-      shift  = amplitude * sinpi (2 * (div_cr (radius, period) + phi));
-    }
+  if (dx.x == 0.0f && dy.x == 0.0f)
+    radius = (float2) (0.000001f, 0.0f);
   else
-    {
-      /* sin (2 pi (radius / period + phi)), with radius carried to more
-       * than single precision (radius + radius_lo), and reduced to a
-       * small argument so that the zeros of the wave come out exactly */
-      const float rr          = dx * dx + dy * dy;
-      const float half_period = period / 2;
-      float       radius_lo, r, u;
-      int         k;
+    radius = df_sqrt (df_add (df_mul (dx, dx), df_mul (dy, dy)));
 
-      radius    = sqrt (rr);
-      radius_lo = fma (-radius, radius, rr) / (2 * radius);
+  /* sin (2 pi (radius / period + phi)), with the integer part of
+   * radius / period removed first; the subtraction is exact */
+  t     = df_div (radius, period);
+  t     = fast_two_sum (t.x - rint (t.x), t.y);
+  shift = df_mul (amplitude, df_sin2pi (df_add (t, phi), table));
 
-      r = remainder (radius, half_period);
-      k = (int) rint ((radius - r) / half_period);
-      u = div_cr (r + radius_lo, period);
-
-      if (phi != 0.0f)
-        u += phi;
-
-      shift = amplitude * sinpi (2 * u);
-      if (k & 1)
-        shift = -shift;
-    }
+  ox = df_div (df_add (shift, df_div (dx, radius)), scale_x);
+  oy = df_div (df_add (shift, df_div (dy, radius)), scale_y);
 
   out = sampler_get (src, srect, abyss, policy, sampler_type,
-                     x + (shift + dx / radius) / scale_x,
-                     y + (shift + dy / radius) / scale_y);
+                     df_add (x, ox), df_add (y, oy));
 
   if (unpremultiply_output)
     out = unpremultiply (out);
@@ -1022,17 +1131,18 @@ waves_nearest (__global const float4 *src,
                int                    roi_x,
                int                    roi_y,
                int                    unpremultiply_output,
-               float                  center_x,
-               float                  center_y,
-               float                  scale_x,
-               float                  scale_y,
-               float                  amplitude,
-               float                  period,
-               float                  phi)
+               __global const float4 *table,
+               float2                 center_x,
+               float2                 center_y,
+               float2                 scale_x,
+               float2                 scale_y,
+               float2                 amplitude,
+               float2                 period,
+               float2                 phi)
 {
   waves (src, srect, abyss, policy, dst, roi_x, roi_y,
-         unpremultiply_output, center_x, center_y, scale_x, scale_y,
-         amplitude, period, phi, SAMPLER_NEAREST);
+         unpremultiply_output, table, center_x, center_y,
+         scale_x, scale_y, amplitude, period, phi, SAMPLER_NEAREST);
 }
 
 __kernel void
@@ -1044,17 +1154,18 @@ waves_linear (__global const float4 *src,
               int                    roi_x,
               int                    roi_y,
               int                    unpremultiply_output,
-              float                  center_x,
-              float                  center_y,
-              float                  scale_x,
-              float                  scale_y,
-              float                  amplitude,
-              float                  period,
-              float                  phi)
+              __global const float4 *table,
+              float2                 center_x,
+              float2                 center_y,
+              float2                 scale_x,
+              float2                 scale_y,
+              float2                 amplitude,
+              float2                 period,
+              float2                 phi)
 {
   waves (src, srect, abyss, policy, dst, roi_x, roi_y,
-         unpremultiply_output, center_x, center_y, scale_x, scale_y,
-         amplitude, period, phi, SAMPLER_LINEAR);
+         unpremultiply_output, table, center_x, center_y,
+         scale_x, scale_y, amplitude, period, phi, SAMPLER_LINEAR);
 }
 
 __kernel void
@@ -1066,17 +1177,18 @@ waves_cubic (__global const float4 *src,
              int                    roi_x,
              int                    roi_y,
              int                    unpremultiply_output,
-             float                  center_x,
-             float                  center_y,
-             float                  scale_x,
-             float                  scale_y,
-             float                  amplitude,
-             float                  period,
-             float                  phi)
+             __global const float4 *table,
+             float2                 center_x,
+             float2                 center_y,
+             float2                 scale_x,
+             float2                 scale_y,
+             float2                 amplitude,
+             float2                 period,
+             float2                 phi)
 {
   waves (src, srect, abyss, policy, dst, roi_x, roi_y,
-         unpremultiply_output, center_x, center_y, scale_x, scale_y,
-         amplitude, period, phi, SAMPLER_CUBIC);
+         unpremultiply_output, table, center_x, center_y,
+         scale_x, scale_y, amplitude, period, phi, SAMPLER_CUBIC);
 }
 
 __kernel void
@@ -1088,15 +1200,16 @@ waves_nohalo (__global const float4 *src,
               int                    roi_x,
               int                    roi_y,
               int                    unpremultiply_output,
-              float                  center_x,
-              float                  center_y,
-              float                  scale_x,
-              float                  scale_y,
-              float                  amplitude,
-              float                  period,
-              float                  phi)
+              __global const float4 *table,
+              float2                 center_x,
+              float2                 center_y,
+              float2                 scale_x,
+              float2                 scale_y,
+              float2                 amplitude,
+              float2                 period,
+              float2                 phi)
 {
   waves (src, srect, abyss, policy, dst, roi_x, roi_y,
-         unpremultiply_output, center_x, center_y, scale_x, scale_y,
-         amplitude, period, phi, SAMPLER_NOHALO);
+         unpremultiply_output, table, center_x, center_y,
+         scale_x, scale_y, amplitude, period, phi, SAMPLER_NOHALO);
 }
