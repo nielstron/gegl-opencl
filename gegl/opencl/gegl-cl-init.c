@@ -306,6 +306,10 @@ gegl_cl_has_extension (const char *extension_name)
 #define CL_LIBRARY_NAME "/System/Library/Frameworks/OpenCL.framework/Versions/Current/OpenCL"
 #elif defined(G_OS_WIN32)
 #define CL_LIBRARY_NAME "OpenCL.dll"
+#elif defined(__ANDROID__)
+#define CL_LIBRARY_NAME "libOpenCL.so"
+/* Pixel devices ship the vendor library under a different name */
+#define CL_LIBRARY_NAME_FALLBACK "libOpenCL-pixel.so"
 #else
 #define GL_LIBRARY_NAME "libGL.so.1"
 #define CL_LIBRARY_NAME "libOpenCL.so.1"
@@ -378,6 +382,10 @@ gegl_cl_init_load_functions (void)
 {
 #ifndef __APPLE__
   GModule *module = g_module_open (CL_LIBRARY_NAME, G_MODULE_BIND_LAZY);
+#ifdef CL_LIBRARY_NAME_FALLBACK
+  if (!module)
+    module = g_module_open (CL_LIBRARY_NAME_FALLBACK, G_MODULE_BIND_LAZY);
+#endif
 #else
   void *module = dlopen(CL_LIBRARY_NAME, RTLD_LAZY | RTLD_LOCAL);
 #endif
