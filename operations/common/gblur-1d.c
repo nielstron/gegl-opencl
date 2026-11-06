@@ -1307,7 +1307,11 @@ gegl_gblur_1d_process (GeglOperation       *operation,
       clen = fir_gen_convolve_matrix (std_dev, &cmatrix);
 
       /* FIXME: implement others format cases */
-      if (gegl_operation_use_opencl (operation) &&
+      /* The OpenCL path only reads and writes level 0; at a mipmap
+       * level it would blur the wrong pixels, so use the CPU path.
+       */
+      if (level == 0 &&
+          gegl_operation_use_opencl (operation) &&
           format == babl_format ("RaGaBaA float"))
         if (fir_cl_process(input, output, result, format,
                            cmatrix, clen, o->orientation, abyss_policy))
