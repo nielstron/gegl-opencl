@@ -48,6 +48,7 @@ property_seed   (seed, _("Random seed"), rand)
 #include "gegl-op.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static gfloat
 randomize_value (gfloat      now,
@@ -98,24 +99,40 @@ randomize_value (gfloat      now,
 
 static gboolean
 use_rgb_format (GeglOperation *operation,
-                const Babl    *space)
+                const Babl    *space,
+                const Babl    *source_format)
 {
+  const char *model;
+
   /* babl's HSV model is computed on sRGB-TRC encoded values, which equal
    * R'G'B' only for spaces with the sRGB TRC.  In that case the OpenCL
    * path works on R'G'B'A float, which GEGL can convert on the GPU, and
    * converts to and from HSV in the kernel.
+   *
+   * Only do so for R'G'B' and Y' sources, though.  babl converts other
+   * sources, like linear or premultiplied ones, to HSV without going
+   * through R'G'B'A float, and for nearly gray pixels the hue depends on
+   * the rounding of the path taken.
    */
-  return gegl_operation_use_opencl (operation) &&
-         (space == NULL || space == babl_space ("sRGB"));
+  if (! gegl_operation_use_opencl (operation) ||
+      ! (space == NULL || space == babl_space ("sRGB")) ||
+      ! source_format)
+    return FALSE;
+
+  model = babl_get_name (babl_format_get_model (source_format));
+
+  return ! strcmp (model, "R'G'B'A") || ! strcmp (model, "R'G'B'") ||
+         ! strcmp (model, "Y'A")     || ! strcmp (model, "Y'");
 }
 
 static void
 prepare (GeglOperation *operation)
 {
-  const Babl *space = gegl_operation_get_source_space (operation, "input");
+  const Babl *space  = gegl_operation_get_source_space (operation, "input");
+  const Babl *source = gegl_operation_get_source_format (operation, "input");
   const Babl *format;
 
-  if (use_rgb_format (operation, space))
+  if (use_rgb_format (operation, space, source))
     format = babl_format ("R'G'B'A float");
   else
     format = babl_format_with_space ("HSVA float", space);
