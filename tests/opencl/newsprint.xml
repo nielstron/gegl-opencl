@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<gegl>
+  <node operation='gegl:newsprint'>
+    <params>
+      <param name='color-model'>cmyk</param>
+      <param name='pattern'>pssquare</param>
+      <param name='pattern2'>circle</param>
+      <param name='period'>6.0</param>
+    </params>
+  </node>
+  <node operation='gegl:load'>
+    <params>
+      <param name='path'>../compositions/data/car-stack.png</param>
+    </params>
+  </node>
+</gegl>

@@ -16,6 +16,22 @@
  * Copyright 2017,2019 Øyvind Kolås <pippin@gimp.org>
  */
 
+/* Halftoning thresholds every anti-aliasing sample, so letting the
+ * compiler fuse multiply-adds (which depends on the compiler, its flags
+ * and the target's FMA support) flips samples and changes the output
+ * between platforms. Keep every operation separately rounded, as on
+ * x86-64. This comes before any include, so that it also applies to the
+ * fmodf () from gegl-math.h.
+ */
+#ifndef NEWSPRINT_NO_FP_CONTRACT /* this file is included repeatedly */
+#define NEWSPRINT_NO_FP_CONTRACT
+#if defined (__clang__)
+#pragma STDC FP_CONTRACT OFF
+#elif defined (__GNUC__)
+#pragma GCC optimize ("fp-contract=off")
+#endif
+#endif
+
 #include "config.h"
 #include <glib/gi18n-lib.h>
 
@@ -188,6 +204,20 @@ property_double (angleboost, _("Angle boost"), 0.0)
 
 #include "gegl-op.h"
 
+/* hypotf (), correctly rounded in practice. The libm hypotf () of glibc
+ * and macOS computes exactly this; others (like bionic's) are only
+ * accurate to an ulp, which flips halftone samples.
+ */
+static inline float
+newsprint_hypotf (float a,
+                  float b)
+{
+  if (isinf (a) || isinf (b))
+    return INFINITY;
+
+  return (float) sqrt ((double) a * a + (double) b * b);
+}
+
 /* for details and more liberal licensing of the following function, see
    https://pippin.gimp.org/spachrotyzer/ */
 
@@ -270,11 +300,11 @@ float spachrotyze (
           {
             ay = 1.0f - ay;
             ax = 1.0f - ax;
-            v = 2.0f - hypotf (ax, ay);
+            v = 2.0f - newsprint_hypotf (ax, ay);
           }
           else
           {
-            v = hypotf (ax, ay);
+            v = newsprint_hypotf (ax, ay);
           }
           v/=2.0f;
           if (v < part_white)
@@ -345,6 +375,8 @@ process (GeglOperation       *operation,
          gint                 level)
 {
   GeglProperties *o = GEGL_PROPERTIES (operation);
+  const Babl *out_format = gegl_operation_get_format (operation, "output");
+  glong       samples = n_pixels;
   gfloat     *in_pixel = in_buf;
   gfloat     *out_pixel = out_buf;
 
@@ -543,16 +575,20 @@ process (GeglOperation       *operation,
        break;
   }
 
+  /* prepare () selects R'G'B'A for the OpenCL path */
+  if (! babl_model_is (babl_format_get_model (out_format), "RGBA"))
+    babl_process (babl_fish (babl_format_with_space ("RGBA float", out_format),
+                             out_format),
+                  out_buf, out_buf, samples);
+
   return  TRUE;
 }
 
-#if 0
 #include "opencl/gegl-cl.h"
-#include "opencl/spachrotyze.cl.h"
+#include "opencl/newsprint.cl.h"
 
 static GeglClRunData *cl_data = NULL;
 
-/* OpenCL processing function */
 static gboolean
 cl_process (GeglOperation       *op,
             cl_mem               in_tex,
@@ -561,45 +597,92 @@ cl_process (GeglOperation       *op,
             const GeglRectangle *roi,
             int                  level)
 {
-  const size_t  gbl_size[2] = {roi->width, roi->height};
-  const size_t  gbl_offs[2] = {roi->x, roi->y};
+  GeglProperties *o          = GEGL_PROPERTIES (op);
+  const Babl     *out_format = gegl_operation_get_format (op, "output");
+  const gint      patterns[4] = { o->pattern, o->pattern2,
+                                  o->pattern3, o->pattern4 };
+  const gdouble   periods[4]  = { o->period, o->period2,
+                                  o->period3, o->period4 };
+  const gdouble   angles[4]   = { o->angle, o->angle2,
+                                  o->angle3, o->angle4 };
+  cl_int4         cl_patterns;
+  cl_float4       cl_periods, cl_vec0s, cl_vec1s;
+  cl_int          color_model = o->color_model;
+  cl_float        turbulence  = o->turbulence;
+  cl_float        blocksize   = o->blocksize;
+  cl_int          aa_samples  = o->aa_samples;
+  cl_float        pullout_hi  = o->black_pullout;
+  cl_float        pullout_lo  = o->black_pullout - pullout_hi;
+  cl_int          roi_x       = roi->x;
+  cl_int          roi_y       = roi->y;
+  cl_int          roi_width   = roi->width;
+  cl_int          to_gamma;
+  cl_int          cl_err      = 0;
+  gint            i;
 
-  GeglProperties   *o  = GEGL_PROPERTIES (op);
-  cl_int cl_err = 0;
+  /* With angle boost the pattern angles vary per pixel, and the GPU's sin
+   * and cos are not bit identical to the CPU's, which would flip
+   * halftone samples.
+   */
+  if (o->angleboost != 0.0)
+    return TRUE;
+
+  if (babl_model_is (babl_format_get_model (out_format), "RGBA"))
+    to_gamma = FALSE;
+  else if (babl_model_is (babl_format_get_model (out_format), "R'G'B'A"))
+    to_gamma = TRUE;
+  else
+    return TRUE;
 
   if (!cl_data)
     {
-      const char *kernel_name[] = {"gegl_spachrotyzer", NULL};
-      cl_data = gegl_cl_compile_and_build (spachrotyzer_cl_source, kernel_name);
+      const char *kernel_name[] = { "newsprint", NULL };
+      cl_data = gegl_cl_compile_and_build (newsprint_cl_source, kernel_name);
     }
 
   if (!cl_data)
-  {
-    g_warning ("cl fail\n");
-    CL_CHECK;
-    return 1;
-  }
+    return TRUE;
 
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 0, sizeof(cl_mem),   (void*)&in_tex);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 1, sizeof(cl_mem),   (void*)&out_tex);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 2, sizeof(cl_int),   (void*)&o->pattern);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 3, sizeof(cl_float), (void*)&o->period);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 4, sizeof(cl_float), (void*)&o->turbulence);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 5, sizeof(cl_float), (void*)&o->blocksize);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 6, sizeof(cl_float), (void*)&o->angleboost);
-  CL_CHECK;
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 7, sizeof(cl_float), (void*)&o->angle);
+  if (blocksize < 0.0)
+    blocksize = 819200.0;
+
+  /* Same float expressions as process () and spachrotyze (), the kernel
+   * relies on getting bit identical values.
+   */
+  for (i = 0; i < 4; i++)
+    {
+      gfloat angle = degrees_to_radians (angles[i]);
+      gfloat twist = 3.1415f / 2.f - angle;
+
+      cl_patterns.s[i] = patterns[i];
+      cl_periods.s[i]  = periods[i] / (1.0 * (1 << level));
+      cl_vec0s.s[i]    = cosf (twist);
+      cl_vec1s.s[i]    = sinf (twist);
+    }
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem),    &in_tex,
+                                    sizeof (cl_mem),    &out_tex,
+                                    sizeof (cl_int),    &color_model,
+                                    sizeof (cl_int4),   &cl_patterns,
+                                    sizeof (cl_float4), &cl_periods,
+                                    sizeof (cl_float4), &cl_vec0s,
+                                    sizeof (cl_float4), &cl_vec1s,
+                                    sizeof (cl_float),  &turbulence,
+                                    sizeof (cl_float),  &blocksize,
+                                    sizeof (cl_int),    &aa_samples,
+                                    sizeof (cl_float),  &pullout_hi,
+                                    sizeof (cl_float),  &pullout_lo,
+                                    sizeof (cl_int),    &roi_x,
+                                    sizeof (cl_int),    &roi_y,
+                                    sizeof (cl_int),    &roi_width,
+                                    sizeof (cl_int),    &to_gamma,
+                                    NULL);
   CL_CHECK;
 
-  cl_err = gegl_clEnqueueNDRangeKernel(gegl_cl_get_command_queue (),
-                                        cl_data->kernel[0], 2,
-                                        gbl_offs, gbl_size, NULL,
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 1,
+                                        NULL, &global_worksize, NULL,
                                         0, NULL, NULL);
   CL_CHECK;
 
@@ -608,13 +691,22 @@ cl_process (GeglOperation       *op,
 error:
   return TRUE;
 }
-#endif
 
 static void prepare (GeglOperation *operation)
 {
   const Babl *space = gegl_operation_get_source_space (operation, "input");
+
   gegl_operation_set_format (operation, "input", babl_format_with_space ("R~G~B~A float", space));
-  gegl_operation_set_format (operation, "output", babl_format_with_space ("RGBA float", space));
+
+  /* For sRGB, the OpenCL path writes R'G'B'A, which is much cheaper to
+   * convert to 8-bit on the CPU; process () handles this format too.
+   */
+  if (gegl_operation_use_opencl (operation) &&
+      babl_format_get_space (babl_format_with_space ("RGBA float", space)) ==
+      babl_space ("sRGB"))
+    gegl_operation_set_format (operation, "output", babl_format ("R'G'B'A float"));
+  else
+    gegl_operation_set_format (operation, "output", babl_format_with_space ("RGBA float", space));
 }
 
 
@@ -652,10 +744,8 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->prepare = prepare;
   point_filter_class->process = process;
   operation_class->threaded = TRUE;
-#if 0
   point_filter_class->cl_process = cl_process;
   operation_class->opencl_support = TRUE;
-#endif
 
   gegl_operation_class_set_keys (operation_class,
     "name",               "gegl:newsprint",

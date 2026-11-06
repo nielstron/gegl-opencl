@@ -22,6 +22,7 @@ opencl_tests = [
   'motion-blur',
   'motion-blur-circular',
   'motion-blur-zoom',
+  'newsprint',
   'noise-reduction',
   'oilify',
   'opacity',

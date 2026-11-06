@@ -35,6 +35,7 @@ gegl_operations_opencl_sources = [
   'motion-blur-circular.cl',
   'motion-blur-linear.cl',
   'motion-blur-zoom.cl',
+  'newsprint.cl',
   'noise-cell.cl',
   'noise-hsv.cl',
   'noise-hurl.cl',
