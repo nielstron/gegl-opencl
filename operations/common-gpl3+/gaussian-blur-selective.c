@@ -312,9 +312,6 @@ cl_process (GeglOperation       *operation,
 
   while (gegl_buffer_cl_iterator_next (i, &err))
     {
-      if (err)
-        return FALSE;
-
       err = cl_gblur_selective(i->tex[read],
                                i->tex[delta],
                                i->tex[0],
@@ -324,10 +321,14 @@ cl_process (GeglOperation       *operation,
                                o->max_delta);
 
       if (err)
-        return FALSE;
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          return FALSE;
+        }
     }
 
-  return TRUE;
+  /* the iterator also stops on errors */
+  return ! err;
 }
 
 static gboolean
