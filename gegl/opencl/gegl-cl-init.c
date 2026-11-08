@@ -665,13 +665,14 @@ gegl_cl_init_load_device_info (cl_platform_id platform,
   cl_state.compiler_v3 = FALSE;
   if (cl_state.platform_v3)
     {
-      size_t          ret_size;
+      size_t          ret_size = 0;
       guint           num_items;
       cl_name_version cl_c_versions[10];
 
-      gegl_clGetDeviceInfo (device, CL_DEVICE_OPENCL_C_ALL_VERSIONS,
-                            sizeof(cl_c_versions), cl_c_versions, &ret_size);
-      num_items = ret_size / sizeof(cl_name_version);
+      if (gegl_clGetDeviceInfo (device, CL_DEVICE_OPENCL_C_ALL_VERSIONS,
+                                sizeof(cl_c_versions), cl_c_versions, &ret_size) != CL_SUCCESS)
+        ret_size = 0;
+      num_items = MIN (ret_size / sizeof(cl_name_version), G_N_ELEMENTS (cl_c_versions));
 
       for (int i = 0; i < num_items; i++)
         {
