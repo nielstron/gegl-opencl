@@ -1,3 +1,5 @@
+#pragma OPENCL FP_CONTRACT OFF
+
 #define NEIGHBOURS 8
 #define AXES       (NEIGHBOURS/2)
 

@@ -122,6 +122,7 @@ EXPORTS
   gegl_cl_color_conv
   gegl_cl_color_supported
   gegl_cl_compile_and_build
+  gegl_cl_compile_and_build_optimized
   gegl_cl_disable
   gegl_cl_errstring
   gegl_cl_get_command_queue
