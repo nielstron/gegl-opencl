@@ -268,6 +268,7 @@ process (GeglOperation       *operation,
   const Babl *space  = gegl_operation_get_source_space (operation, "input");
   const Babl *rgb_f  = babl_format_with_space ("R'G'B' float", space);
   const Babl *rgba_f = babl_format_with_space ("R'G'B'A float", space);
+  const GeglRectangle *extent = gegl_buffer_get_extent (input);
 
   GeglBuffer  *sum;
   gint    width, height;
@@ -279,13 +280,13 @@ process (GeglOperation       *operation,
   gint   *patch_n_y;
   gint    i;
 
-  width  = gegl_buffer_get_width (input);
-  height = gegl_buffer_get_height (input);
+  width  = extent->width;
+  height = extent->height;
   patch_size = o->patch_size == GEGL_DENOISE_DCT_8X8 ? 8 : 16;
   patch_len = patch_size * patch_size;
   threshold = 3.f * (gfloat) o->sigma / 255.;
 
-  sum = gegl_buffer_new (GEGL_RECTANGLE(0, 0, width, height), rgb_f);
+  sum = gegl_buffer_new (extent, rgb_f);
 
   patch_n_x = g_new (gint, width);
   patch_n_y = g_new (gint, height);
@@ -327,8 +328,8 @@ process (GeglOperation       *operation,
                * set the gegl buffer with the sum memory buffer
                */
 
-              GeglRectangle  roi = {x * patch_size + x_offset,
-                                    0,
+              GeglRectangle  roi = {extent->x + x * patch_size + x_offset,
+                                    extent->y,
                                     patch_size,
                                     height};
               gint patch_offset  = 0;
@@ -409,7 +410,8 @@ process (GeglOperation       *operation,
         {
           for (x = roi->x; x < roi->x + roi->width; x++)
             {
-              gint   n_patches = patch_n_x[x] * patch_n_y[y];
+              gint   n_patches = patch_n_x[x - extent->x] *
+                                 patch_n_y[y - extent->y];
               gfloat n = 1.f / (gfloat) n_patches;
 
               out[0] = sum[0] * n;
