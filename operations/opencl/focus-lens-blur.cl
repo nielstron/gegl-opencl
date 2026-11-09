@@ -16,6 +16,17 @@
 
 #pragma OPENCL FP_CONTRACT OFF
 
+static float
+focus_lens_radius (float mask,
+                   float radius)
+{
+#if FOCUS_LENS_USE_FMA
+  return fma (mask, radius, 0.5f);
+#else
+  return mask * radius + 0.5f;
+#endif
+}
+
 /* Pack the pixels by column. Consecutive work items in the disc pass
  * handle consecutive rows and can read from a column together.
  */
@@ -39,7 +50,7 @@ prepare_pixel (__global const float4 *src,
   float4 p      = src[index];
   uint   alpha  = as_uint (p.w);
   uint   magnitude = alpha & 0x7fffffffU;
-  float  r      = mask[index] * radius + 0.5f;
+  float  r      = focus_lens_radius (mask[index], radius);
   float  r2     = r * r;
   float  weight = 1.0f;
 
@@ -175,13 +186,13 @@ __kernel void
 focus_lens_disc (__global const float4 *pixels,
                  __global const float2 *disc,
                  __global       float4 *delta,
-                 __global       float4 *delta_w,
                  __global       float4 *dst,
                  __constant const int  *spans,
                  int4                   source,
                  int                    width,
                  int                    iradius,
-                 int                    strip_width)
+                 int                    strip_width,
+                 __global       float4 *delta_w)
 {
   int    y         = get_global_id (0);
   int    rows      = get_global_size (0);
@@ -262,5 +273,125 @@ focus_lens_disc (__global const float4 *pixels,
       p.w   = p.w / (weight.x + weight.y);
 
       dst[y * width + x] = p;
+    }
+}
+
+/* One flag per lane checks the complete input halo of a tile. Striding
+ * by the work size lets adjacent lanes read adjacent input pixels.
+ */
+__kernel void
+focus_lens_check_opacity (__global const float4 *src,
+                          __global       uchar  *flags,
+                          int                    count)
+{
+  int lane = get_global_id (0);
+
+  for (int i = lane; i < count; i += get_global_size (0))
+    if (src[i].w != 1.0f)
+      {
+        flags[lane] = 1;
+        return;
+      }
+
+  flags[lane] = 0;
+}
+
+/* For opaque sRGB u8, one uint4 holds the weighted RGB and the weight.
+ * The Q28 sum is below 16. At Chebyshev distance k there are at most
+ * 8k samples with weight at most about 1/(pi*k*k). Including the center,
+ * the bound through distance 32 is less than 12.
+ */
+__kernel void
+focus_lens_prepare_opaque (__global const float4 *src,
+                           __global const float  *mask,
+                           __global       uint4  *pixels,
+                           __global       float  *radius2,
+                           float                  radius)
+{
+  int    x      = get_global_id (0);
+  int    y      = get_global_id (1);
+  int    index  = y * get_global_size (0) + x;
+  int    target = x * get_global_size (1) + y;
+  float  r      = focus_lens_radius (mask[index], radius);
+  float  r2     = r * r;
+  float  weight = 1.0f / (M_PI_F * r2);
+  float4 moment = (float4) (src[index].xyz * weight, weight);
+
+  pixels[target]  = convert_uint4_rte (moment * 0x1p28f);
+  radius2[target] = r2;
+}
+
+__kernel void
+focus_lens_disc_opaque (__global const uint4 *pixels,
+                        __global const float *radius2,
+                        __global       uint4 *delta,
+                        __global       float4 *dst,
+                        __constant const int *spans,
+                        int4                  source,
+                        int                   width,
+                        int                   iradius,
+                        int                   strip_width)
+{
+  int   y     = get_global_id (0);
+  int   rows  = get_global_size (0);
+  int   left  = get_global_id (1) * strip_width;
+  int   right = min (width, left + strip_width);
+  int   cy    = y + source.w;
+  int   first = max (-iradius, -cy);
+  int   last  = min (iradius, source.y - 1 - cy);
+  uint4 sum   = (uint4) (0);
+
+  for (int x = left; x < right; x++)
+    delta[x * rows + y] = (uint4) (0);
+
+  for (int r = first; r <= last; r++)
+    {
+      int   span    = spans[abs (r)];
+      int   x1      = max (left - span, -source.z);
+      int   x2      = min (right + span, source.x - source.z);
+      float r2      = r * r;
+      float min_r2  = max (r2, 1.0f);
+      int   src_row = cy + r;
+
+      for (int x = x1; x < x2; x++)
+        {
+          int    index = (x + source.z) * source.y + src_row;
+          float  d2    = radius2[index];
+          int    s, xl, xr;
+          uint4  p;
+
+          if (d2 < min_r2)
+            continue;
+
+          s  = disc_span (d2 - r2);
+          xl = max (left, x - s);
+          xr = x + s + 1;
+
+          if (xl >= xr || xl >= right)
+            continue;
+
+          p = pixels[index];
+
+          /* Endpoint differences wrap modulo 2^32. The prefix recovers
+           * the nonnegative sum within the bound above. */
+          delta[xl * rows + y] += p;
+          if (xr < right)
+            delta[xr * rows + y] -= p;
+        }
+    }
+
+  for (int x = left; x < right; x++)
+    {
+      int    self = (x + source.z) * source.y + cy;
+      uint4  p;
+      float4 v;
+
+      sum += delta[x * rows + y];
+      p    = sum;
+      if (radius2[self] < 1.0f)
+        p += pixels[self];
+
+      v = convert_float4 (p);
+      dst[y * width + x] = (float4) (v.xyz / v.w, 1.0f);
     }
 }
