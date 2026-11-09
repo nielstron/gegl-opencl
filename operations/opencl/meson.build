@@ -40,6 +40,7 @@ gegl_operations_opencl_sources = [
   'shadows-highlights-correction.cl',
   'snn-mean.cl',
   'stretch-contrast.cl',
+  'supernova.cl',
   'svg-src-over.cl',
   'texturize-canvas.cl',
   'threshold.cl',

@@ -70,6 +70,8 @@ property_seed (seed, _("Random seed"), rand)
 #define GEGL_OP_C_SOURCE supernova.c
 
 #include "gegl-op.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/supernova.cl.h"
 
 typedef struct
 {
@@ -115,6 +117,7 @@ preprocess_spokes (GeglOperation *operation)
   gr = g_rand_new_with_seed (o->seed);
 
   gegl_color_get_pixel (o->color, babl_format ("HSVA double"), &color);
+  tmp = gegl_color_duplicate (o->color);
 
   for (i = 0; i < o->spokes_count; i++)
     {
@@ -128,12 +131,12 @@ preprocess_spokes (GeglOperation *operation)
       else if (color[0] >= 1.0)
         color[0] -= 1.0;
 
-      tmp = gegl_color_duplicate (o->color);
-
       gegl_color_set_pixel (tmp, babl_format ("HSVA double"), &color);
 
       gegl_color_get_pixel (tmp, format, &(params->spokes[i].color));
     }
+
+  g_object_unref (tmp);
 
   /* store parameters used for this spokes calculation */
   params->spokes_count = o->spokes_count;
@@ -199,6 +202,9 @@ prepare (GeglOperation *operation)
   if (need_preprocess_spokes)
     preprocess_spokes (operation);
 
+  if (gegl_operation_use_opencl (operation))
+    format = babl_format_with_space ("R'G'B'A float", format);
+
   gegl_operation_set_format (operation, "input", format);
   gegl_operation_set_format (operation, "output", format);
 }
@@ -231,8 +237,12 @@ process (GeglOperation       *operation,
 {
   GeglProperties *o = GEGL_PROPERTIES (operation);
   GeglRectangle  *whole_region;
-  gdouble *input  = in_buf;
+  const Babl *format = gegl_operation_get_format (operation, "input");
+  gboolean float_format = babl_format_get_type (format, 0) == babl_type ("float");
+  const gdouble *input = in_buf;
+  const gfloat *input_float = in_buf;
   gdouble *output = out_buf;
+  gfloat *output_float = out_buf;
   SnParamsType *params;
   gdouble color[3];
   gint x, y;
@@ -282,7 +292,7 @@ process (GeglOperation       *operation,
           w = 1.0 / (l + 0.001) * 0.9;
 
           nova_alpha = CLAMP (w, 0.0, 1.0);
-          src_alpha = input[idx + 3];
+          src_alpha = float_format ? input_float[idx + 3] : input[idx + 3];
           new_alpha = src_alpha + (1.0 - src_alpha) * nova_alpha;
 
           if (new_alpha != 0.0)
@@ -303,19 +313,94 @@ process (GeglOperation       *operation,
                 }
               else
                 {
-                  color[b] = input[idx + b] * compl_ratio +
-                             spokecol * ratio;
+                  gdouble src = float_format ? input_float[idx + b] : input[idx + b];
+
+                  color[b] = src * compl_ratio + spokecol * ratio;
                 }
 
               c = CLAMP (w1 * w, 0.0, 1.0);
               color[b] += c;
-              output[idx + b] = CLAMP (color[b], 0.0, 1.0);
+              if (float_format)
+                output_float[idx + b] = CLAMP (color[b], 0.0, 1.0);
+              else
+                output[idx + b] = CLAMP (color[b], 0.0, 1.0);
             }
 
-          output[idx + 3] = new_alpha;
+          if (float_format)
+            output_float[idx + 3] = new_alpha;
+          else
+            output[idx + 3] = new_alpha;
         }
     }
 
+  return TRUE;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            cl_mem               in,
+            cl_mem               out,
+            size_t               n_pixels,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  static GeglClRunData *cl_data;
+  const gchar *kernels[] = { "gegl_supernova", NULL };
+  GeglProperties *o = GEGL_PROPERTIES (operation);
+  const SnParamsType *params = o->user_data;
+  const GeglRectangle *whole_region;
+  cl_float2 origin;
+  cl_float radius = o->radius;
+  cl_int width = roi->width;
+  cl_int count = o->spokes_count;
+  cl_float4 spokes[1024];
+  cl_int cl_err;
+  cl_mem data = NULL;
+
+  if (level != 0)
+    return TRUE;
+
+  if (!cl_data)
+    cl_data = gegl_cl_compile_and_build (supernova_cl_source, kernels);
+  if (!cl_data)
+    return TRUE;
+
+  whole_region = gegl_operation_source_get_bounding_box (operation, "input");
+  origin.s[0] = roi->x - o->center_x * whole_region->width;
+  origin.s[1] = roi->y - o->center_y * whole_region->height;
+
+  for (gint i = 0; i < count; i++)
+    {
+      const SpokeType *spoke = &params->spokes[i];
+
+      spokes[i] = (cl_float4) { .s = { spoke->color[0], spoke->color[1],
+                                       spoke->color[2], spoke->rand } };
+    }
+
+  data = gegl_clCreateBuffer (gegl_cl_get_context (),
+                             CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                             count * sizeof (spokes[0]), spokes, &cl_err);
+  CL_CHECK;
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (in), &in,
+                                    sizeof (out), &out,
+                                    sizeof (data), &data,
+                                    sizeof (origin), &origin,
+                                    sizeof (width), &width,
+                                    sizeof (radius), &radius,
+                                    sizeof (count), &count,
+                                    NULL);
+  CL_CHECK;
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                       cl_data->kernel[0], 1,
+                                       NULL, &n_pixels, NULL, 0, NULL, NULL);
+  CL_CHECK;
+  gegl_clReleaseMemObject (data);
+  return FALSE;
+
+error:
+  if (data)
+    gegl_clReleaseMemObject (data);
   return TRUE;
 }
 
@@ -333,9 +418,10 @@ gegl_op_class_init (GeglOpClass *klass)
   object_class->finalize = finalize;
 
   operation_class->prepare = prepare;
-  operation_class->opencl_support = FALSE;
+  operation_class->opencl_support = TRUE;
 
   filter_class->process    = process;
+  filter_class->cl_process = cl_process;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:supernova",
