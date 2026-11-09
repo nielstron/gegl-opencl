@@ -21,6 +21,7 @@ gegl_operations_opencl_sources = [
   'contrast-curve.cl',
   'convolution-matrix.cl',
   'deinterlace.cl',
+  'denoise-dct.cl',
   'diffraction-patterns.cl',
   'edge-laplace.cl',
   'edge-sobel.cl',
