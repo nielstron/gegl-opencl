@@ -141,8 +141,9 @@ __kernel void gblur_mem_put_4 (const global float4 *chunk,
  * before the segment begins. A segment whose warm-up would reach the
  * start of the line starts from the boundary values instead.
  *
- * The anti-causal pass reads the causal result outside its segment, so
- * it must not run in place.
+ * The segmented anti-causal pass reads the causal result outside its
+ * segment, so it must not run in place. A whole-line pass only reads
+ * each causal result before overwriting it.
  */
 __kernel void gblur_mem_iir_causal (const global float *src_buf,
                                           global float *dst_buf,

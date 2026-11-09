@@ -20,10 +20,9 @@
 #include <glib/gi18n-lib.h>
 #include <stdio.h>
 
-/* #define MANUAL_CONTROL */
+#include "variable-blur-params.h"
 
-#define MAX_LEVELS 16
-#define GAMMA      1.5
+/* #define MANUAL_CONTROL */
 
 #ifdef GEGL_PROPERTIES
 
@@ -41,9 +40,9 @@ property_boolean (linear_mask, _("Linear mask"), FALSE)
 
 property_int (levels, _("Blur levels"), 8)
     description (_("Number of blur levels"))
-    value_range (2, MAX_LEVELS)
+    value_range (2, VARIABLE_BLUR_MAX_LEVELS)
 
-property_double (gamma, _("Blur gamma"), GAMMA)
+property_double (gamma, _("Blur gamma"), VARIABLE_BLUR_GAMMA)
     description (_("Gamma factor for blur-level spacing"))
     value_range (0.0, G_MAXDOUBLE)
     ui_range    (0.1, 10.0)
@@ -69,7 +68,7 @@ typedef struct
   GeglNode *aux;
   GeglNode *output;
 
-  GeglNode *gaussian_blur[MAX_LEVELS];
+  GeglNode *gaussian_blur[VARIABLE_BLUR_MAX_LEVELS];
 
   GeglNode *piecewise_blend;
 } Nodes;
@@ -88,17 +87,8 @@ update (GeglOperation *operation)
   levels = o->levels;
   gamma  = o->gamma;
 #else
-  if (o->high_quality)
-    {
-      levels = MAX_LEVELS;
-    }
-  else
-    {
-      levels = ceil (CLAMP (log (o->radius) / G_LN2 + 3,
-                            2, MAX_LEVELS));
-    }
-
-  gamma = GAMMA;
+  levels = variable_blur_levels (o->radius, o->high_quality);
+  gamma  = VARIABLE_BLUR_GAMMA;
 #endif
 
   gegl_node_set (nodes->piecewise_blend,
@@ -112,7 +102,7 @@ update (GeglOperation *operation)
 
       gegl_node_link (nodes->input, nodes->gaussian_blur[i]);
 
-      radius = o->radius * pow ((gdouble) i / (levels - 1), gamma);
+      radius = variable_blur_sigma (o->radius, i, levels, gamma);
 
       gegl_node_set (nodes->gaussian_blur[i],
                      "std-dev-x", radius,
@@ -120,7 +110,7 @@ update (GeglOperation *operation)
                      NULL);
     }
 
-  for (; i < MAX_LEVELS; i++)
+  for (; i < VARIABLE_BLUR_MAX_LEVELS; i++)
     gegl_node_disconnect (nodes->gaussian_blur[i], "input");
 }
 
@@ -151,7 +141,7 @@ attach (GeglOperation *operation)
   gegl_node_connect (nodes->input,           "output",
                      nodes->piecewise_blend, "aux1");
 
-  for (i = 1; i < MAX_LEVELS; i++)
+  for (i = 1; i < VARIABLE_BLUR_MAX_LEVELS; i++)
     {
       gchar aux_name[32];
 

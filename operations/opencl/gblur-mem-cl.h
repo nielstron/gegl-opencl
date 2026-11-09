@@ -183,8 +183,9 @@ gblur_mem_iir_warmup (const gdouble *b)
   return n;
 }
 
-/* One gblur-1d pass from src into dst, using tmp for the IIR filter;
- * the three must differ.
+/* One gblur-1d pass from src into dst. A segmented IIR pass requires
+ * a distinct tmp buffer. A whole-line pass runs the anti-causal step
+ * in place and needs no tmp.
  */
 static gboolean
 gblur_mem_cl_pass (cl_mem   src,
@@ -195,7 +196,8 @@ gblur_mem_cl_pass (cl_mem   src,
                    gint     n_comp,
                    gfloat   std_dev,
                    gboolean horizontal,
-                   gboolean clamp_edges)
+                   gboolean clamp_edges,
+                   gboolean segment_lines)
 {
   cl_int cl_err = CL_SUCCESS;
   cl_int horizontal_i  = horizontal;
@@ -309,13 +311,26 @@ gblur_mem_cl_pass (cl_mem   src,
           line_stride = 1;
         }
 
-      /* Enough work-items to fill a GPU, with segments of at least the
-       * warm-up length
-       */
-      warmup  = gblur_mem_iir_warmup (b);
-      n_segs  = (32768 + n_lines * n_comp - 1) / (n_lines * n_comp);
-      n_segs  = CLAMP (n_segs, 1, len / MAX (warmup, 32));
-      n_segs  = MAX (n_segs, 1);
+      if (segment_lines)
+        {
+          /* Enough work-items to fill a GPU, with segments of at least
+           * the warm-up length.
+           */
+          warmup = gblur_mem_iir_warmup (b);
+          n_segs = (32768 + n_lines * n_comp - 1) / (n_lines * n_comp);
+          n_segs = CLAMP (n_segs, 1, len / MAX (warmup, 32));
+          n_segs = MAX (n_segs, 1);
+        }
+      else
+        {
+          /* A whole line preserves nonfinite values in its recursion
+           * history and reads each causal value before overwriting it.
+           */
+          warmup = 0;
+          n_segs = 1;
+          tmp = dst;
+        }
+
       seg_len = (len + n_segs - 1) / n_segs;
       n_segs  = (len + seg_len - 1) / seg_len;
 
@@ -389,7 +404,7 @@ gblur_mem_cl_pass (cl_mem   src,
  * clamp_edges, pixels outside the image are the nearest edge pixel,
  * otherwise they are zero.
  */
-static gboolean
+static gboolean G_GNUC_UNUSED
 gblur_mem_cl_blur (cl_mem   src,
                    cl_mem   dst,
                    gint     width,
@@ -424,9 +439,9 @@ gblur_mem_cl_blur (cl_mem   src,
 
   /* gblur-1d takes the std-dev as a float */
   ok = gblur_mem_cl_pass (src, tmp2, tmp1, width, height, n_comp,
-                          (gfloat) std_dev, TRUE, clamp_edges) &&
+                          (gfloat) std_dev, TRUE, clamp_edges, TRUE) &&
        gblur_mem_cl_pass (tmp2, dst, tmp1, width, height, n_comp,
-                          (gfloat) std_dev, FALSE, clamp_edges);
+                          (gfloat) std_dev, FALSE, clamp_edges, TRUE);
 
   gegl_clReleaseMemObject (tmp2);
   gegl_clReleaseMemObject (tmp1);
