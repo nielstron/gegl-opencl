@@ -92,6 +92,8 @@ property_double (saturation, _("Saturation"), 0.0)
 #define GEGL_OP_C_SOURCE color-rotate.c
 
 #include "gegl-op.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/color-rotate.cl.h"
 
 #define TWO_PI        (2 * G_PI)
 #define DEG_TO_RAD(d) (((d) * G_PI) / 180.0)
@@ -392,6 +394,80 @@ process (GeglOperation       *operation,
   return  TRUE;
 }
 
+/* Keep inclusive range tests equivalent to comparisons in double precision. */
+static gfloat
+float_at_most (gdouble value)
+{
+  gfloat rounded = value;
+
+  return rounded > value ? nextafterf (rounded, -INFINITY) : rounded;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            cl_mem               in,
+            cl_mem               out,
+            size_t               n_pixels,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  static GeglClRunData *cl_data;
+  const gchar *kernels[] = { "gegl_color_rotate", NULL };
+  GeglProperties *o = GEGL_PROPERTIES (operation);
+  cl_float4 angles;
+  cl_float2 wrapped_range;
+  cl_float4 gray;
+  cl_int gray_mode;
+  cl_int cl_err;
+
+  if (level != 0)
+    return TRUE;
+
+  angles.s[0] = left_end (o->src_from, o->src_to, o->src_clockwise);
+  angles.s[1] = right_end (o->src_from, o->src_to, o->src_clockwise);
+  angles.s[2] = left_end (o->dest_from, o->dest_to, o->dest_clockwise);
+  angles.s[3] = right_end (o->dest_from, o->dest_to, o->dest_clockwise);
+  if (angles.s[0] == angles.s[1])
+    return TRUE;
+
+  wrapped_range.s[0] = -float_at_most (TWO_PI - MIN (angles.s[0], angles.s[1]));
+  wrapped_range.s[1] =  float_at_most (MAX (angles.s[0], angles.s[1]) - TWO_PI);
+
+  gray.s[0] = float_at_most (o->threshold);
+  gray.s[1] = DEG_TO_RAD (o->hue) / TWO_PI;
+  gray.s[2] = o->saturation;
+  gray.s[3] = 0;
+
+  if (o->gray_mode == GEGL_COLOR_ROTATE_GRAY_CHANGE_TO)
+    gray_mode = 2;
+  else
+    gray_mode = angle_inside_slice (o->hue, o->src_from, o->src_to,
+                                    o->src_clockwise) <= 1;
+
+  if (!cl_data)
+    cl_data = gegl_cl_compile_and_build (color_rotate_cl_source, kernels);
+  if (!cl_data)
+    return TRUE;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (in), &in,
+                                    sizeof (out), &out,
+                                    sizeof (angles), &angles,
+                                    sizeof (wrapped_range), &wrapped_range,
+                                    sizeof (gray), &gray,
+                                    sizeof (gray_mode), &gray_mode,
+                                    NULL);
+  CL_CHECK;
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                       cl_data->kernel[0], 1,
+                                       NULL, &n_pixels, NULL, 0, NULL, NULL);
+  CL_CHECK;
+  return FALSE;
+
+error:
+  return TRUE;
+}
+
 static void
 gegl_op_class_init (GeglOpClass *klass)
 {
@@ -427,7 +503,9 @@ gegl_op_class_init (GeglOpClass *klass)
   filter_class    = GEGL_OPERATION_POINT_FILTER_CLASS (klass);
 
   operation_class->prepare = prepare;
+  operation_class->opencl_support = TRUE;
   filter_class->process    = process;
+  filter_class->cl_process = cl_process;
 
   gegl_operation_class_set_keys (operation_class,
     "categories",     "color",
