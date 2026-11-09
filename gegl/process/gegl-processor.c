@@ -749,8 +749,9 @@ static gboolean
 gegl_processor_work_is_opencl_node (GeglNode *node,
                                     gpointer  data)
 {
-  return GEGL_OPERATION_GET_CLASS (node->operation)->cl_data ||
-         GEGL_OPERATION_GET_CLASS (node->operation)->opencl_support;
+  GeglOperationClass *klass = GEGL_OPERATION_GET_CLASS (node->operation);
+
+  return g_atomic_pointer_get (&klass->cl_data) || klass->opencl_support;
 }
 
 /* Will call gegl_processor_render and when there is no more work to be done,

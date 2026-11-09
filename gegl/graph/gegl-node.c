@@ -1221,7 +1221,7 @@ gegl_node_operation_has_opencl (GeglOperation *operation)
   GeglOperationClass *klass = GEGL_OPERATION_GET_CLASS (operation);
 
   /* cl_data is built from the "cl-source" key when preparing */
-  if (klass->opencl_support || klass->cl_data)
+  if (klass->opencl_support || g_atomic_pointer_get (&klass->cl_data))
     return TRUE;
 
   if (GEGL_IS_OPERATION_POINT_FILTER (operation))

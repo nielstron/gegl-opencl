@@ -173,6 +173,7 @@ gegl_operation_point_composer_cl_process (GeglOperation       *operation,
 
   GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
   GeglOperationPointComposerClass *point_composer_class = GEGL_OPERATION_POINT_COMPOSER_GET_CLASS (operation);
+  GeglClRunData *cl_data = g_atomic_pointer_get (&operation_class->cl_data);
 
   GeglBufferClIterator *iter = NULL;
 
@@ -210,10 +211,9 @@ gegl_operation_point_composer_cl_process (GeglOperation       *operation,
               return FALSE;
             }
         }
-      else if (operation_class->cl_data)
+      else if (cl_data)
         {
           gint p = 0;
-          GeglClRunData *cl_data = operation_class->cl_data;
 
           cl_err = gegl_clSetKernelArg (cl_data->kernel[0], p++, sizeof(cl_mem), (void*)&iter->tex[1]);
           CL_CHECK;
@@ -299,7 +299,8 @@ gegl_operation_point_composer_process (GeglOperation       *operation,
 
   if ((result->width > 0) && (result->height > 0))
     {
-      if (gegl_operation_use_opencl (operation) && (operation_class->cl_data || point_composer_class->cl_process))
+      if (gegl_operation_use_opencl (operation) &&
+          (g_atomic_pointer_get (&operation_class->cl_data) || point_composer_class->cl_process))
         {
           if (gegl_operation_point_composer_cl_process (operation, input, aux, output, result, level))
               return TRUE;

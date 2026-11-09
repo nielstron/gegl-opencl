@@ -118,13 +118,14 @@ cl_process (GeglOperation       *operation,
             gint                 level)
 {
   GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
+  GeglClRunData *cl_data = g_atomic_pointer_get (&operation_class->cl_data);
   cl_int cl_err = 0;
 
   /* The kernel will have been compiled by our parent class */
-  if (!operation_class->cl_data)
+  if (!cl_data)
     return TRUE;
 
-  cl_err = gegl_cl_set_kernel_args (operation_class->cl_data->kernel[0],
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
                                     sizeof(cl_mem), &in_tex,
                                     sizeof(cl_mem), &aux_tex,
                                     sizeof(cl_mem), &out_tex,
@@ -132,7 +133,7 @@ cl_process (GeglOperation       *operation,
   CL_CHECK;
 
   cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                        operation_class->cl_data->kernel[0], 1,
+                                        cl_data->kernel[0], 1,
                                         NULL, &global_worksize, NULL,
                                         0, NULL, NULL);
   CL_CHECK;

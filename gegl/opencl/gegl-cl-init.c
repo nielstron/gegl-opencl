@@ -166,6 +166,7 @@ GeglClState;
 static cl_device_type gegl_cl_default_device_type = CL_DEVICE_TYPE_GPU;
 static GeglClState cl_state = { 0, };
 static GHashTable *cl_program_hash[2];
+static GMutex cl_program_mutex;
 
 
 gboolean
@@ -811,102 +812,113 @@ compile_and_build (const char *program_source,
                    const char *kernel_name[],
                    gboolean    optimize)
 {
-  gint errcode;
-  GeglClRunData *cl_data = NULL;
+  GeglClRunData *cached;
+  GeglClRunData *cl_data;
+  const char *sources[] = {random_cl_source, program_source};
+  size_t lengths[2];
+  gchar   options[96];
+  gchar  *msg = NULL;
+  size_t  log_size = 0;
+  cl_int  cl_err;
+  cl_int  build_errcode;
+  guint   kernel_n = 0;
+
   if (!gegl_cl_is_accelerated ())
     return NULL;
 
-  cl_data = g_hash_table_lookup (cl_program_hash[optimize], program_source);
+  g_mutex_lock (&cl_program_mutex);
+  cached = g_hash_table_lookup (cl_program_hash[optimize], program_source);
+  g_mutex_unlock (&cl_program_mutex);
+  if (cached)
+    return cached;
 
-  if (cl_data == NULL)
+  while (kernel_name[kernel_n] != NULL)
+    kernel_n++;
+
+  lengths[0] = strlen (random_cl_source);
+  lengths[1] = strlen (program_source);
+  cl_data = g_new0 (GeglClRunData, 1);
+  cl_data->program = gegl_clCreateProgramWithSource (gegl_cl_get_context (), 2, sources,
+                                                     lengths, &cl_err);
+  CL_CHECK;
+
+  g_snprintf (options, sizeof (options), "-cl-std=%s%s%s",
+              cl_state.compiler_v3 ? "CL3.0" : "CL1.2",
+              optimize ? "" : " -cl-opt-disable",
+              cl_state.fp_config & CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT ?
+                " -cl-fp32-correctly-rounded-divide-sqrt" : "");
+  build_errcode = gegl_clBuildProgram (cl_data->program, 0, NULL,
+                                       options, NULL, NULL);
+  cl_err = gegl_clGetProgramBuildInfo (cl_data->program, gegl_cl_get_device (),
+                                        CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+  CL_CHECK;
+
+  msg = g_new0 (gchar, log_size + 1);
+  if (log_size)
     {
-      const size_t lengths[] = {strlen(random_cl_source), strlen(program_source)};
-      const char *sources[] = {random_cl_source, program_source};
-
-      gint    i;
-      gchar   options[96];
-      char   *msg;
-      size_t  s = 0;
-      cl_int  build_errcode;
-      guint   kernel_n = 0;
-
-      while (kernel_name[++kernel_n] != NULL);
-
-      cl_data = (GeglClRunData *) g_new (GeglClRunData, 1);
-
-      cl_data->program = gegl_clCreateProgramWithSource (gegl_cl_get_context (), 2, sources,
-                                                         lengths, &errcode);
-      CL_CHECK_ONLY (errcode);
-
-      g_snprintf (options, sizeof (options), "-cl-std=%s%s%s",
-                  cl_state.compiler_v3 ? "CL3.0" : "CL1.2",
-                  optimize ? "" : " -cl-opt-disable",
-                  cl_state.fp_config & CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT ?
-                    " -cl-fp32-correctly-rounded-divide-sqrt" : "");
-      build_errcode = gegl_clBuildProgram (cl_data->program, 0, NULL,
-                                           options, NULL, NULL);
-      errcode = gegl_clGetProgramBuildInfo (cl_data->program,
-                                            gegl_cl_get_device (),
-                                            CL_PROGRAM_BUILD_LOG,
-                                            0, NULL, &s);
-      CL_CHECK_ONLY (errcode);
-
-      if (s)
-        {
-          msg = g_malloc (s);
-          errcode = gegl_clGetProgramBuildInfo (cl_data->program,
-                                                gegl_cl_get_device (),
-                                                CL_PROGRAM_BUILD_LOG,
-                                                s, msg, NULL);
-          CL_CHECK_ONLY (errcode);
-        }
-      else
-        {
-          msg = strdup ("");
-        }
-
-      if (build_errcode != CL_SUCCESS)
-        {
-          GEGL_NOTE (GEGL_DEBUG_OPENCL, "Build Error: %s\n%s",
-                                        gegl_cl_errstring (build_errcode),
-                                        msg);
-          g_warning ("%s\n%s\n", gegl_cl_errstring (build_errcode), msg);
-          g_free (msg);
-          return NULL;
-        }
-      else
-        {
-          g_strchug (msg);
-          if (strlen (msg))
-            GEGL_NOTE (GEGL_DEBUG_OPENCL, "Compiling successful\n%s", msg);
-          else
-            GEGL_NOTE (GEGL_DEBUG_OPENCL, "Compiling successful");
-          g_free (msg);
-        }
-
-      cl_data->kernel = g_new (cl_kernel, kernel_n);
-      cl_data->work_group_size = g_new (size_t, kernel_n);
-
-      for (i = 0; i < kernel_n; i++)
-        {
-          cl_data->kernel[i] = gegl_clCreateKernel (cl_data->program,
-                                                    kernel_name[i],
-                                                    &errcode);
-          CL_CHECK_ONLY (errcode);
-
-          errcode = gegl_clGetKernelWorkGroupInfo (cl_data->kernel[i],
-                                                   gegl_cl_get_device (),
-                                                   CL_KERNEL_WORK_GROUP_SIZE,
-                                                   sizeof(size_t),
-                                                   &cl_data->work_group_size[i],
-                                                   NULL);
-          CL_CHECK_ONLY (errcode);
-        }
-
-      g_hash_table_insert (cl_program_hash[optimize], g_strdup (program_source), cl_data);
+      cl_err = gegl_clGetProgramBuildInfo (cl_data->program, gegl_cl_get_device (),
+                                            CL_PROGRAM_BUILD_LOG, log_size, msg, NULL);
+      CL_CHECK;
     }
 
-  return cl_data;
+  if (build_errcode != CL_SUCCESS)
+    {
+      GEGL_NOTE (GEGL_DEBUG_OPENCL, "Build Error: %s\n%s",
+                                    gegl_cl_errstring (build_errcode), msg);
+      g_warning ("%s\n%s\n", gegl_cl_errstring (build_errcode), msg);
+      goto error;
+    }
+
+  g_strchug (msg);
+  if (*msg)
+    GEGL_NOTE (GEGL_DEBUG_OPENCL, "Compiling successful\n%s", msg);
+  else
+    GEGL_NOTE (GEGL_DEBUG_OPENCL, "Compiling successful");
+  g_clear_pointer (&msg, g_free);
+
+  cl_data->kernel = g_new0 (cl_kernel, kernel_n);
+  cl_data->work_group_size = g_new (size_t, kernel_n);
+
+  for (guint i = 0; i < kernel_n; i++)
+    {
+      cl_data->kernel[i] = gegl_clCreateKernel (cl_data->program,
+                                                kernel_name[i], &cl_err);
+      CL_CHECK;
+
+      cl_err = gegl_clGetKernelWorkGroupInfo (cl_data->kernel[i],
+                                              gegl_cl_get_device (),
+                                              CL_KERNEL_WORK_GROUP_SIZE,
+                                              sizeof (size_t),
+                                              &cl_data->work_group_size[i],
+                                              NULL);
+      CL_CHECK;
+    }
+
+  /* Don't hold the cache lock while compiling or reporting a driver error.
+   * A render can compile a custom kernel while graph preparation compiles
+   * a class kernel, and only the first successful build should be cached. */
+  g_mutex_lock (&cl_program_mutex);
+  cached = g_hash_table_lookup (cl_program_hash[optimize], program_source);
+  if (!cached)
+    {
+      g_hash_table_insert (cl_program_hash[optimize], g_strdup (program_source), cl_data);
+      g_mutex_unlock (&cl_program_mutex);
+      return cl_data;
+    }
+  g_mutex_unlock (&cl_program_mutex);
+
+error:
+  g_free (msg);
+  if (cl_data->kernel)
+    for (guint i = 0; i < kernel_n; i++)
+      if (cl_data->kernel[i])
+        gegl_clReleaseKernel (cl_data->kernel[i]);
+  g_free (cl_data->kernel);
+  g_free (cl_data->work_group_size);
+  if (cl_data->program)
+    gegl_clReleaseProgram (cl_data->program);
+  g_free (cl_data);
+  return cached;
 }
 
 GeglClRunData *

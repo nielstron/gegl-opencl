@@ -197,7 +197,7 @@ cl_process (GeglOperation       *operation,
             gint                 level)
 {
   GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
-  GeglClRunData *cl_data = operation_class->cl_data;
+  GeglClRunData *cl_data = g_atomic_pointer_get (&operation_class->cl_data);
   GeglProperties *o = GEGL_PROPERTIES (operation);
   const size_t gbl_size[2] = {roi->width, roi->height};
   const size_t gbl_off[2]  = {roi->x, roi->y};
