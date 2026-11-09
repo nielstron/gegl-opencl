@@ -1105,7 +1105,12 @@ process (GeglOperation       *operation,
         }
       else if (dir == TOP_TO_BOTTOM)
         {
-          if (dst_x == 0)
+          if (roi->width == 1)
+            {
+              src += src_stride;
+              dst += dst_stride;
+            }
+          else if (dst_x == 0)
             {
               dst_x++;
               src += n_components;
