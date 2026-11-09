@@ -44,6 +44,8 @@ property_double (edge_preservation, _("Edge preservation"),  0.8)
 #define GEGL_OP_C_SOURCE domain-transform.c
 
 #include "gegl-op.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/domain-transform.cl.h"
 
 /* This should be 768, since we have 2^8 possible options for each channel.
  * Since domain transform is given by:
@@ -56,6 +58,181 @@ property_double (edge_preservation, _("Edge preservation"),  0.8)
 #define SQRT2 1.4142135623f
 #define BLOCK_STRIDE 1
 #define REPORT_PROGRESS_TIME 0.5  /* time to report gegl_operation_progress */
+
+static void
+compute_rf_table (gfloat *table,
+                  gfloat  spatial_factor,
+                  gfloat  range_factor,
+                  gint    n_iterations)
+{
+  for (gint i = 0; i < n_iterations; i++)
+    {
+      gfloat sdt_dev = spatial_factor * SQRT3 *
+                       (powf (2.0f, (gfloat) (n_iterations - (i + 1))) /
+                        sqrtf (powf (4.0f, (gfloat) n_iterations) - 1));
+      gfloat a = expf (-SQRT2 / sdt_dev);
+
+      for (gint j = 0; j < RF_TABLE_SIZE; j++)
+        table[i * RF_TABLE_SIZE + j] =
+          powf (a, 1.0f + (spatial_factor / range_factor) *
+                  ((gfloat) j / 255.0f));
+    }
+}
+
+static gboolean
+cl_domain_transform (GeglOperation       *operation,
+                     GeglBuffer          *input,
+                     GeglBuffer          *output,
+                     const GeglRectangle *result,
+                     const gfloat        *rf_table,
+                     gint                 n_iterations)
+{
+  static GeglClRunData *cl_data = NULL;
+  static GMutex         cl_mutex;
+  const Babl           *format = gegl_operation_get_format (operation, "input");
+  const Babl           *space = babl_format_get_space (format);
+  const Babl           *rgba_u8 = babl_format_with_space ("R'G'B'A u8", space);
+  const Babl           *source_format;
+  cl_command_queue      queue = gegl_cl_get_command_queue ();
+  size_t                n_pixels;
+  size_t                size;
+  size_t                source_size;
+  size_t                edge_ws[] = { result->width, result->height };
+  g_autofree guchar     *staging = NULL;
+  cl_mem                pixels = NULL;
+  cl_mem                source = NULL;
+  cl_mem                edges = NULL;
+  cl_mem                weights = NULL;
+  cl_int                cl_err;
+  cl_int                source_stride;
+  gboolean              convert_on_gpu;
+  gboolean              success = FALSE;
+
+  /* The feedback passes span complete lines. Leave oversized images to the
+   * CPU, which only needs a row or column of working memory.
+   */
+  if (result->width <= 0 || result->height <= 0 ||
+      (size_t) result->width > MIN (G_MAXINT, G_MAXSIZE / sizeof (cl_float4)) /
+                              (size_t) result->height)
+    return FALSE;
+
+  convert_on_gpu = (gegl_buffer_get_format (input) == rgba_u8 &&
+                    gegl_cl_color_supported (rgba_u8, format) ==
+                    GEGL_CL_COLOR_CONVERT);
+  source_format = convert_on_gpu ? rgba_u8 :
+                  babl_format_with_space ("R'G'B' u8", space);
+  source_stride = convert_on_gpu ? 4 : 3;
+  n_pixels = (size_t) result->width * result->height;
+  size = n_pixels * sizeof (cl_float4);
+  source_size = n_pixels * source_stride;
+  staging = g_try_malloc (size);
+  if (! staging)
+    return FALSE;
+
+  g_mutex_lock (&cl_mutex);
+  if (! cl_data)
+    {
+      const gchar *kernels[] = { "domain_transform_edges",
+                                 "domain_transform_filter", NULL };
+
+      cl_data = gegl_cl_compile_and_build (domain_transform_cl_source, kernels);
+    }
+  if (! cl_data)
+    goto error;
+
+  pixels = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE, size, &cl_err);
+  CL_CHECK;
+
+  source = gegl_cl_mem_pool_get (CL_MEM_READ_ONLY, source_size, &cl_err);
+  CL_CHECK;
+
+  edges = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
+                                n_pixels * sizeof (cl_ushort2), &cl_err);
+  CL_CHECK;
+
+  weights = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                  CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                  n_iterations * RF_TABLE_SIZE * sizeof (cl_float),
+                                  (gpointer) rf_table, &cl_err);
+  CL_CHECK;
+
+  gegl_buffer_get (input, result, 1.0, source_format, staging,
+                   GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_CLAMP);
+  cl_err = gegl_clEnqueueWriteBuffer (queue, source, CL_TRUE, 0,
+                                      source_size, staging, 0, NULL, NULL);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem), &source,
+                                    sizeof (cl_mem), &edges,
+                                    sizeof (cl_int), &result->width,
+                                    sizeof (cl_int), &source_stride,
+                                    NULL);
+  CL_CHECK;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (queue, cl_data->kernel[0], 2, NULL,
+                                        edge_ws, NULL, 0, NULL, NULL);
+  CL_CHECK;
+
+  if (convert_on_gpu)
+    {
+      if (gegl_cl_color_conv (source, pixels, n_pixels, rgba_u8, format))
+        goto error;
+    }
+  else
+    {
+      gegl_buffer_get (input, result, 1.0, format, staging,
+                       GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_CLAMP);
+      cl_err = gegl_clEnqueueWriteBuffer (queue, pixels, CL_TRUE, 0,
+                                          size, staging, 0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  for (gint i = 0; i < n_iterations; i++)
+    {
+      cl_int offset = i * RF_TABLE_SIZE;
+
+      for (cl_int vertical = 0; vertical < 2; vertical++)
+        {
+          size_t work_size = vertical ? result->width : result->height;
+
+          cl_err = gegl_cl_set_kernel_args (cl_data->kernel[1],
+                                            sizeof (cl_mem), &pixels,
+                                            sizeof (cl_mem), &edges,
+                                            sizeof (cl_mem), &weights,
+                                            sizeof (cl_int), &offset,
+                                            sizeof (cl_int), &result->width,
+                                            sizeof (cl_int), &result->height,
+                                            sizeof (cl_int), &vertical,
+                                            NULL);
+          CL_CHECK;
+
+          cl_err = gegl_clEnqueueNDRangeKernel (queue, cl_data->kernel[1],
+                                                1, NULL, &work_size, NULL,
+                                                0, NULL, NULL);
+          CL_CHECK;
+        }
+    }
+
+  cl_err = gegl_clEnqueueReadBuffer (queue, pixels, CL_TRUE, 0,
+                                     size, staging, 0, NULL, NULL);
+  CL_CHECK;
+  success = TRUE;
+
+error:
+  g_mutex_unlock (&cl_mutex);
+
+  if (weights)
+    gegl_clReleaseMemObject (weights);
+  gegl_cl_mem_pool_put (edges);
+  gegl_cl_mem_pool_put (source);
+  gegl_cl_mem_pool_put (pixels);
+
+  if (success)
+    gegl_buffer_set (output, result, 0, format, staging, GEGL_AUTO_ROWSTRIDE);
+
+  return success;
+}
 
 static gint16
 absolute (gint16 x)
@@ -87,8 +264,7 @@ static gint
 domain_transform (GeglOperation       *operation,
                   const GeglRectangle *result,
                   gint                 n_chan,
-                  gfloat               spatial_factor,
-                  gfloat               range_factor,
+                  const gfloat        *rf_table,
                   gint                 n_iterations,
                   GeglBuffer          *input,
                   GeglBuffer          *output)
@@ -98,7 +274,6 @@ domain_transform (GeglOperation       *operation,
   const Babl *format   = babl_format_with_space ("R'G'B'A float", space);
   gint      width     = result->width;
   gint      height    = result->height;
-  gfloat  **rf_table;
   guint16  *transforms_buffer;
   gfloat   *buffer;
 
@@ -106,7 +281,7 @@ domain_transform (GeglOperation       *operation,
   gint16    current[3];
   gfloat    lastf[4];
   gfloat    currentf[4];
-  gfloat    sum_channels_difference, a, w, sdt_dev;
+  gfloat    sum_channels_difference, w;
   gint      i, j, k, n;
   gint      real_stride, d_x_position, d_y_position, biggest_dimension;
   guint16   d;
@@ -120,38 +295,15 @@ domain_transform (GeglOperation       *operation,
   buffer            = g_new (gfloat, BLOCK_STRIDE * biggest_dimension * n_chan);
   transforms_buffer = g_new (guint16, BLOCK_STRIDE * biggest_dimension);
 
-  rf_table = g_new (gfloat *, n_iterations);
-
-  for (i = 0; i < n_iterations; ++i)
-    rf_table[i] = g_new (gfloat, RF_TABLE_SIZE);
-
   /* ************************ */
 
   report_progress (operation, 0.0, timer);
 
-  /* Pre-calculate RF table */
-  for (i = 0; i < n_iterations; ++i)
-    {
-      /* calculating RF feedback coefficient 'a' from desired variance
-       * 'a' will change each iteration while the domain transform will
-       * remain constant
-       */
-      sdt_dev = spatial_factor * SQRT3 *
-                          (powf (2.0f, (gfloat)(n_iterations - (i + 1))) /
-                             sqrtf (powf (4.0f, (gfloat) n_iterations) - 1));
-
-      a = expf (-SQRT2 / sdt_dev);
-
-      for (j = 0; j < RF_TABLE_SIZE; ++j)
-        {
-          rf_table[i][j] = powf (a, 1.0f + (spatial_factor / range_factor) *
-                             ((gfloat)j / 255.0f));
-        }
-    }
-
   /* Filter Iterations */
   for (n = 0; n < n_iterations; ++n)
     {
+      const gfloat *weights = rf_table + n * RF_TABLE_SIZE;
+
       /* Horizontal Pass */
       for (i = 0; i < height; i += BLOCK_STRIDE)
         {
@@ -216,7 +368,7 @@ domain_transform (GeglOperation       *operation,
               for (k = 0; k < rect.width; ++k)
                 {
                   d = transforms_buffer[j * rect.width + k];
-                  w = rf_table[n][d];
+                  w = weights[d];
         
                   currentf[0] = buffer[j * rect.width * n_chan + k * n_chan];
                   currentf[1] = buffer[j * rect.width * n_chan + k * n_chan + 1];
@@ -247,7 +399,7 @@ domain_transform (GeglOperation       *operation,
                 {
                   d_x_position = (k < rect.width - 1) ? k + 1 : k;
                   d = transforms_buffer[j * rect.width + d_x_position];
-                  w = rf_table[n][d];
+                  w = weights[d];
         
                   currentf[0] = buffer[j * rect.width * n_chan + k * n_chan];
                   currentf[1] = buffer[j * rect.width * n_chan + k * n_chan + 1];
@@ -332,7 +484,7 @@ domain_transform (GeglOperation       *operation,
               for (k = 0; k < rect.height; ++k)
                 {
                   d = transforms_buffer[k * rect.width + j];
-                  w = rf_table[n][d];
+                  w = weights[d];
                   
                   currentf[0] = buffer[k * rect.width * n_chan + j * n_chan];
                   currentf[1] = buffer[k * rect.width * n_chan + j * n_chan + 1];
@@ -363,7 +515,7 @@ domain_transform (GeglOperation       *operation,
                 {
                   d_y_position = (k < rect.height - 1) ? k + 1 : k;
                   d = transforms_buffer[d_y_position * rect.width + j];
-                  w = rf_table[n][d];
+                  w = weights[d];
         
                   currentf[0] = buffer[k * rect.width * n_chan + j * n_chan];
                   currentf[1] = buffer[k * rect.width * n_chan + j * n_chan + 1];
@@ -392,10 +544,6 @@ domain_transform (GeglOperation       *operation,
   g_free (transforms_buffer);
   g_free (buffer);
 
-  for (i = 0; i < n_iterations; ++i)
-    g_free (rf_table[i]);
-
-  g_free (rf_table);
   g_timer_destroy (timer);
 
   return 0;
@@ -447,19 +595,25 @@ process (GeglOperation       *operation,
          gint                 level)
 {
   GeglProperties  *o = GEGL_PROPERTIES (operation);
-  gfloat range_factor;
+  gfloat           range_factor;
+  g_autofree gfloat *rf_table = g_new (gfloat, o->n_iterations * RF_TABLE_SIZE);
 
   if (o->edge_preservation != 0.0)
     range_factor = (1.0 / o->edge_preservation) - 1.0f;
   else
     range_factor = G_MAXFLOAT;
 
-  /* Buffer is ready for domain transform */
+  compute_rf_table (rf_table, o->spatial_factor, range_factor, o->n_iterations);
+
+  if (level == 0 && gegl_operation_use_opencl (operation) &&
+      cl_domain_transform (operation, input, output, result,
+                           rf_table, o->n_iterations))
+    return TRUE;
+
   domain_transform (operation,
                     result,
                     4,
-                    o->spatial_factor,
-                    range_factor,
+                    rf_table,
                     o->n_iterations,
                     input,
                     output);
@@ -521,7 +675,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->process                 = operation_process;
   operation_class->get_required_for_output = get_required_for_output;
   operation_class->get_cached_region       = get_cached_region;
-  operation_class->opencl_support          = FALSE;
+  operation_class->opencl_support          = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:domain-transform",

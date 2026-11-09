@@ -23,6 +23,7 @@ gegl_operations_opencl_sources = [
   'deinterlace.cl',
   'denoise-dct.cl',
   'diffraction-patterns.cl',
+  'domain-transform.cl',
   'edge-laplace.cl',
   'edge-sobel.cl',
   'edge.cl',
