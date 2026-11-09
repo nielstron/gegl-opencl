@@ -10,6 +10,7 @@ gegl_operations_opencl_sources = [
   'c2g.cl',
   'checkerboard.cl',
   'color-exchange.cl',
+  'color-rotate.cl',
   'color-temperature.cl',
   'color-to-alpha.cl',
   'colors-8bit-lut.cl',
