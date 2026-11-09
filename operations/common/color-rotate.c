@@ -154,7 +154,7 @@ rgb_to_hsv (gfloat  r,
     }
 }
 
-static void
+static gboolean
 hsv_to_rgb (gfloat  h,
             gfloat  s,
             gfloat  v,
@@ -178,6 +178,12 @@ hsv_to_rgb (gfloat  h,
 
       if (h >= 6.0)
         h -= 6.0;
+
+      /* A non-finite hue cannot select a sector. The valid sectors of a
+       * truncating conversion are also narrower than the range of int.
+       */
+      if (!(h > -1.0f && h < 6.0f))
+        return FALSE;
 
       hi = (int) h;
       frac = h - hi;
@@ -219,6 +225,8 @@ hsv_to_rgb (gfloat  h,
           break;
         }
     }
+
+  return TRUE;
 }
 
 static gfloat
@@ -365,8 +373,12 @@ color_rotate (GeglProperties *o,
       h = angle_mod_2PI (h) / TWO_PI;
     }
 
-  hsv_to_rgb (h, s, v,
-              output, output + 1, output + 2);
+  if (!hsv_to_rgb (h, s, v, output, output + 1, output + 2))
+    {
+      output[0] = input[0];
+      output[1] = input[1];
+      output[2] = input[2];
+    }
 }
 
 static gboolean
