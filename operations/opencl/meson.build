@@ -18,6 +18,7 @@ gegl_operations_opencl_sources = [
   'diffraction-patterns.cl',
   'edge-laplace.cl',
   'edge-sobel.cl',
+  'fractal-trace.cl',
   'gaussian-blur-selective.cl',
   'gblur-1d.cl',
   'hue-chroma.cl',
