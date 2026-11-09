@@ -70,6 +70,7 @@ gegl_operations_opencl_sources = [
   'softglow.cl',
   'stretch-contrast-hsv.cl',
   'stretch-contrast.cl',
+  'supernova.cl',
   'svg-src-over.cl',
   'texturize-canvas.cl',
   'threshold.cl',
