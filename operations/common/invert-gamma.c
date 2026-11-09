@@ -36,6 +36,27 @@
 #include "invert-common.h"
 
 static void
+prepare_gamma (GeglOperation *operation)
+{
+  GeglProperties *o = GEGL_PROPERTIES (operation);
+  const Babl *format = gegl_operation_get_source_format (operation, "input");
+
+  /* The nonlinear and perceptual curves agree in the default sRGB space. */
+  if (format == babl_format ("R'G'B'A u8"))
+    o->user_data = process_rgba_u8;
+  else if (format == babl_format ("R'G'B' u8"))
+    o->user_data = process_rgb_u8;
+  else
+    {
+      prepare (operation);
+      return;
+    }
+
+  gegl_operation_set_format (operation, "input", format);
+  gegl_operation_set_format (operation, "output", format);
+}
+
+static void
 gegl_op_class_init (GeglOpClass *klass)
 {
   GeglOperationClass            *operation_class;
@@ -44,7 +65,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class    = GEGL_OPERATION_CLASS (klass);
   point_filter_class = GEGL_OPERATION_POINT_FILTER_CLASS (klass);
 
-  operation_class->prepare     = prepare;
+  operation_class->prepare     = prepare_gamma;
   point_filter_class->process  = process;
 
   gegl_operation_class_set_keys (operation_class,
