@@ -56,11 +56,15 @@ gblur_mem_cl_build (void)
                                     "gblur_mem_put_4",
                                     NULL };
 
+      /* Keep the recursion and boundary arithmetic separately rounded
+       * while allowing the compiler to optimize the per-pixel loops.
+       */
       if (! source)
-        source = g_strconcat (gblur_1d_cl_source, "\n",
+        source = g_strconcat ("#pragma OPENCL FP_CONTRACT OFF\n",
+                              gblur_1d_cl_source, "\n",
                               gblur_mem_cl_source, NULL);
 
-      gblur_mem_cl_data = gegl_cl_compile_and_build (source, kernel_name);
+      gblur_mem_cl_data = gegl_cl_compile_and_build_optimized (source, kernel_name);
     }
 
   return gblur_mem_cl_data != NULL;
