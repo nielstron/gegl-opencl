@@ -43,6 +43,11 @@
 #define GEGL_OPERATION_DEFAULT_PIXELS_PER_THREAD        ( 64 *  64)
 #define GEGL_OPERATION_MAX_PIXELS_PER_THREAD            (128 * 128)
 
+/* Operations and buffer conversions share mutable OpenCL kernel objects.
+ * Serialize their argument binding and dispatch. Some operations render a
+ * subgraph on the same thread, so the lock has to be recursive. */
+static GRecMutex opencl_dispatch_mutex;
+
 
 struct _GeglOperationPrivate
 {
@@ -139,6 +144,7 @@ gegl_operation_process (GeglOperation        *operation,
   gint64              t;
   gint64              n_pixels;
   gboolean            update_pixel_time;
+  gboolean            use_opencl;
   gboolean            success;
 
   g_return_val_if_fail (GEGL_IS_OPERATION (operation), FALSE);
@@ -170,15 +176,23 @@ gegl_operation_process (GeglOperation        *operation,
   update_pixel_time = n_pixels >=
                       GEGL_OPERATION_MIN_PIXELS_PER_PIXEL_TIME_UPDATE;
 
+  use_opencl = gegl_operation_use_opencl (operation);
+  if (use_opencl)
+    g_rec_mutex_lock (&opencl_dispatch_mutex);
+
   if (update_pixel_time)
     t = g_get_monotonic_time ();
 
   success = klass->process (operation, context, output_pad, result, level);
 
   if (success && update_pixel_time)
-    {
-      t = g_get_monotonic_time () - t;
+    t = g_get_monotonic_time () - t;
 
+  if (use_opencl)
+    g_rec_mutex_unlock (&opencl_dispatch_mutex);
+
+  if (success && update_pixel_time)
+    {
       gegl_operation_update_pixel_time (operation, result,
                                         (gdouble) t / G_TIME_SPAN_SECOND);
     }
@@ -358,11 +372,12 @@ gegl_operation_prepare (GeglOperation *self)
   klass = GEGL_OPERATION_GET_CLASS (self);
 
   /* build OpenCL kernel */
-  if (!klass->cl_data)
+  if (!g_atomic_pointer_get (&klass->cl_data))
   {
     const gchar *cl_source = gegl_operation_class_get_key (klass, "cl-source");
     if (cl_source)
       {
+        GeglClRunData *cl_data;
         char *name = g_strdup (klass->name);
         const char *kernel_name[] = {name, NULL};
         char *k;
@@ -373,7 +388,9 @@ gegl_operation_prepare (GeglOperation *self)
                 *k = '_';
                 break;
             }
-        klass->cl_data = gegl_cl_compile_and_build (cl_source, kernel_name);
+        cl_data = gegl_cl_compile_and_build (cl_source, kernel_name);
+        if (cl_data)
+          g_atomic_pointer_compare_and_exchange (&klass->cl_data, NULL, cl_data);
         g_free (name);
       }
   }

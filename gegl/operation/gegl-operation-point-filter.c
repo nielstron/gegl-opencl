@@ -161,6 +161,7 @@ gegl_operation_point_filter_cl_process (GeglOperation       *operation,
   GeglOperationPointFilterClass *point_filter_class = GEGL_OPERATION_POINT_FILTER_GET_CLASS (operation);
 
   GeglBufferClIterator *iter = NULL;
+  GeglClRunData *cl_data = g_atomic_pointer_get (&operation_class->cl_data);
 
   cl_int cl_err = 0;
   gboolean err;
@@ -193,10 +194,9 @@ gegl_operation_point_filter_cl_process (GeglOperation       *operation,
               return FALSE;
             }
         }
-      else if (operation_class->cl_data)
+      else if (cl_data)
         {
           gint p = 0;
-          GeglClRunData *cl_data = operation_class->cl_data;
 
           cl_err = gegl_clSetKernelArg (cl_data->kernel[0], p++, sizeof(cl_mem), (void*)&iter->tex[1]);
           CL_CHECK;
@@ -264,7 +264,7 @@ gegl_operation_point_filter_process (GeglOperation       *operation,
 
   if ((result->width > 0) && (result->height > 0))
     {
-      if (gegl_operation_use_opencl (operation) && (operation_class->cl_data || point_filter_class->cl_process))
+      if (gegl_operation_use_opencl (operation) && (g_atomic_pointer_get (&operation_class->cl_data) || point_filter_class->cl_process))
       {
         if (gegl_operation_point_filter_cl_process (operation, input, output, result, level))
             return TRUE;
