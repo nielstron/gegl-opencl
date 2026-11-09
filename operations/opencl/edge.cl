@@ -38,6 +38,27 @@ edge_prewitt (float3 a, float3 b, float3 c,
   return m;
 }
 
+static float3
+edge_magnitude (float3 dx, float3 dy, float amount, int3 finite_zero_taps)
+{
+  const float3 x2 = dx * dx;
+  const float3 y2 = dy * dy;
+  const float3 sum = x2 * amount + y2 * amount;
+  const int3 overflow = isinf (sum);
+  float3 magnitude = sqrt (sum);
+
+  /* The CPU weights and adds the float squares in double precision.
+   * Halve each square before adding when the weighted sum overflows. */
+  if (any (overflow))
+    magnitude = select (magnitude,
+                        sqrt (x2 * 0.5f + y2 * 0.5f) * sqrt (2.0f * amount),
+                        overflow);
+
+  /* The CPU also multiplies the zero-weight taps, which yields NaN for
+   * an infinite or NaN sample. Preserve that result for omitted taps. */
+  return select ((float3) NAN, magnitude, finite_zero_taps);
+}
+
 __kernel void
 edge_detect (__global const float *in,
              __global       float *out,
@@ -75,23 +96,33 @@ edge_detect (__global const float *in,
     case GRADIENT:
       dx = 4.0f * e.xyz - 4.0f * f;
       dy = -4.0f * e.xyz + 4.0f * h;
-      result = sqrt (dx * dx * amount + dy * dy * amount);
+      result = edge_magnitude (dx, dy, amount,
+                               isfinite (a) & isfinite (b) & isfinite (c) &
+                               isfinite (d) & isfinite (f) & isfinite (g) &
+                               isfinite (h) & isfinite (i));
       break;
     case ROBERTS:
       dx = 4.0f * e.xyz - 4.0f * i;
       dy = 4.0f * f - 4.0f * h;
-      result = sqrt (dx * dx * amount + dy * dy * amount);
+      result = edge_magnitude (dx, dy, amount,
+                               isfinite (a) & isfinite (b) & isfinite (c) &
+                               isfinite (d) & isfinite (e.xyz) & isfinite (f) &
+                               isfinite (g) & isfinite (h) & isfinite (i));
       break;
     case DIFFERENTIAL:
       dx = 2.0f * e.xyz - 2.0f * f + 2.0f * h - 2.0f * i;
       dy = -2.0f * e.xyz - 2.0f * f + 2.0f * h + 2.0f * i;
-      result = sqrt (dx * dx * amount + dy * dy * amount);
+      result = edge_magnitude (dx, dy, amount,
+                               isfinite (a) & isfinite (b) & isfinite (c) &
+                               isfinite (d) & isfinite (g));
       break;
     default:
     case SOBEL:
       dx = -a + c - 2.0f * d + 2.0f * f - g + i;
       dy = -a - 2.0f * b - c + g + 2.0f * h + i;
-      result = sqrt (dx * dx * amount + dy * dy * amount);
+      result = edge_magnitude (dx, dy, amount,
+                               isfinite (b) & isfinite (d) & isfinite (e.xyz) &
+                               isfinite (f) & isfinite (h));
       break;
     }
 
