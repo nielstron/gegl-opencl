@@ -83,8 +83,7 @@ fixpix (gfloat  *pixel,
 }
 
 static void
-init_params (LfParamsType   *params,
-             GeglProperties *o)
+init_params (LfParamsType *params)
 {
   Reflect *ref1 = params->ref;
 
@@ -318,7 +317,7 @@ prepare (GeglOperation *operation)
 
   params = (LfParamsType *) o->user_data;
 
-  init_params (params, o);
+  init_params (params);
 
   gegl_operation_set_format (operation, "input", format);
   gegl_operation_set_format (operation, "output", format);
@@ -348,13 +347,14 @@ process (GeglOperation       *operation,
          gint                 level)
 {
   GeglProperties *o      = GEGL_PROPERTIES (operation);
-  LfParamsType   *params = (LfParamsType *) o->user_data;
+  LfParamsType    local_params = *(LfParamsType *) o->user_data;
+  LfParamsType   *params = &local_params;
   GeglRectangle  *whole_region;
 
   gint    x, y, b, idx, i;
   gfloat  hyp;
   gfloat  procent;
-  gfloat *pixel;
+  gfloat  pixel[3];
   gfloat *input = in_buf;
   gfloat *output = out_buf;
 
@@ -365,8 +365,6 @@ process (GeglOperation       *operation,
                  whole_region->width,
                  whole_region->height,
                  params);
-
-  pixel = g_new (gfloat, 3);
 
   for (y = 0; y < roi->height; y++)
     {
@@ -481,8 +479,6 @@ process (GeglOperation       *operation,
           output[idx + 3] = input[idx + 3];
         }
     }
-
-  g_free (pixel);
 
   return TRUE;
 }
