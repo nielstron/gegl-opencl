@@ -139,21 +139,28 @@ gegl_buffer_cl_iterator_add_2 (GeglBufferClIterator  *iterator,
       gegl_cl_color_babl (buffer_format, &i->buf_cl_format_size[self]);
       gegl_cl_color_babl (format,        &i->op_cl_format_size [self]);
 
-      /* alpha, non-alpha & GEGL_ABYSS_NONE, taking the area around
-       * the result that is read into account
-       */
-      GeglRectangle read_rect = {result->x - left,
-                                 result->y - top,
-                                 result->width  + left + right,
-                                 result->height + top  + bottom};
-
-      if (babl_format_has_alpha(buffer_format) != babl_format_has_alpha(format) &&
-          abyss_policy == GEGL_ABYSS_NONE &&
-          !gegl_rectangle_contains (gegl_buffer_get_extent (buffer), &read_rect))
+      /* Read transparent abyss pixels in the requested format. A GPU
+       * conversion from a format without alpha would make them opaque. */
+      if (flags == GEGL_CL_BUFFER_READ &&
+          babl_format_has_alpha (buffer_format) !=
+          babl_format_has_alpha (i->format[self]))
         {
-          i->conv[self] = GEGL_CL_COLOR_NOT_SUPPORTED;
-          GEGL_NOTE (GEGL_DEBUG_OPENCL, "Performance warning: not using color conversion "
-                                        "with OpenCL because abyss depends on alpha");
+          const GeglRectangle *abyss = gegl_buffer_get_abyss (buffer);
+          const GeglRectangle read_rect = {result->x - left,
+                                           result->y - top,
+                                           result->width  + left + right,
+                                           result->height + top  + bottom};
+
+          if ((abyss_policy == GEGL_ABYSS_NONE &&
+               !gegl_rectangle_contains (abyss, &read_rect)) ||
+              ((abyss_policy == GEGL_ABYSS_CLAMP ||
+                abyss_policy == GEGL_ABYSS_LOOP) &&
+               gegl_rectangle_is_empty (abyss)))
+            {
+              i->conv[self] = GEGL_CL_COLOR_NOT_SUPPORTED;
+              GEGL_NOTE (GEGL_DEBUG_OPENCL, "Performance warning: not using color conversion "
+                                            "with OpenCL because abyss depends on alpha");
+            }
         }
     }
   else /* GEGL_CL_BUFFER_AUX */
