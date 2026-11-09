@@ -225,6 +225,223 @@ get_cached_region (GeglOperation       *operation,
   return result;
 }
 
+#include "opencl/gblur-mem-cl.h"
+#include "opencl/photocopy.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+/* Does what process () does, keeping the blurred images on the GPU */
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *result)
+{
+  GeglProperties       *o      = GEGL_PROPERTIES (operation);
+  const GeglRectangle  *extent = gegl_buffer_get_extent (input);
+  const Babl           *ya     = babl_format ("YA float");
+  const Babl           *out_format;
+  GeglBufferClIterator *i;
+  cl_mem                image = NULL, blur1 = NULL, blur2 = NULL;
+  cl_mem                hist_mem = NULL;
+  cl_int                cl_err = CL_SUCCESS;
+  cl_int                stride, x0, y0, width, n_pixels, n_comp;
+  cl_float              ramp_down_f, ramp_up_f;
+  gboolean              err = FALSE;
+  gboolean              ok  = FALSE;
+  gint                  hist1[2000];
+  gint                  hist2[2000];
+  gint                  count, k;
+  gdouble               radius, std_dev1, std_dev2;
+  gdouble               ramp_down, ramp_up;
+  size_t                n, global_ws, local_ws, max_local_ws;
+
+  /* The kernels use the sRGB luminance */
+  if (babl_format_get_space (gegl_buffer_get_format (input)) !=
+      babl_space ("sRGB"))
+    return FALSE;
+
+  if (gegl_rectangle_is_empty (result) ||
+      ! gegl_rectangle_contains (extent, result))
+    return FALSE;
+
+  if (! cl_data)
+    {
+      const char *kernel_name[] = { "photocopy_hist",
+                                    "photocopy_process",
+                                    NULL };
+
+      cl_data = gegl_cl_compile_and_build (photocopy_cl_source, kernel_name);
+    }
+
+  if (! cl_data)
+    return FALSE;
+
+  /* Same as grey_blur_buffer () */
+  radius   = MAX (1.0, 10 * (1.0 - o->sharpness));
+  radius   = fabs (radius) + 1.0;
+  std_dev1 = sqrt (-(radius * radius) / (2 * log (1.0 / 255.0)));
+
+  radius   = fabs (o->mask_radius) + 1.0;
+  std_dev2 = sqrt (-(radius * radius) / (2 * log (1.0 / 255.0)));
+
+  n = (size_t) extent->width * extent->height;
+
+  image = gegl_clCreateBuffer (gegl_cl_get_context (), CL_MEM_READ_WRITE,
+                               n * 2 * sizeof (cl_float), NULL, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  blur1 = gegl_clCreateBuffer (gegl_cl_get_context (), CL_MEM_READ_WRITE,
+                               n * 2 * sizeof (cl_float), NULL, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  blur2 = gegl_clCreateBuffer (gegl_cl_get_context (), CL_MEM_READ_WRITE,
+                               n * 2 * sizeof (cl_float), NULL, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  /* gegl:gaussian-blur works on the RaGaBaA float pixels of the input,
+   * of which only the luminance is used, so blur (Y * A, A) instead.
+   */
+  if (! gblur_mem_cl_read (input, extent, ya, image, TRUE))
+    goto cleanup;
+
+  if (! gblur_mem_cl_blur (image, blur1, extent->width, extent->height, 2,
+                           std_dev1, TRUE) ||
+      ! gblur_mem_cl_blur (image, blur2, extent->width, extent->height, 2,
+                           std_dev2, TRUE))
+    goto cleanup;
+
+  /* compute_ramp (), which only fills hist2 */
+  memset (hist1, 0, sizeof (hist1));
+  memset (hist2, 0, sizeof (hist2));
+
+  hist_mem = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                  CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                  sizeof (hist2), hist2, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  stride   = extent->width;
+  x0       = result->x - extent->x;
+  y0       = result->y - extent->y;
+  width    = result->width;
+  n_pixels = result->width * result->height;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem), &blur1,
+                                    sizeof (cl_mem), &blur2,
+                                    sizeof (cl_mem), &hist_mem,
+                                    sizeof (cl_int), &stride,
+                                    sizeof (cl_int), &x0,
+                                    sizeof (cl_int), &y0,
+                                    sizeof (cl_int), &width,
+                                    sizeof (cl_int), &n_pixels,
+                                    NULL);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  /* The kernel works with any work-group size; use at most 256, within
+   * the limits of the device and the kernel.  The histogram is counted
+   * exactly, so the results do not depend on it.
+   */
+  cl_err = gegl_clGetDeviceInfo (gegl_cl_get_device (),
+                                 CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                                 sizeof (size_t), &max_local_ws, NULL);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  max_local_ws = MIN (max_local_ws, cl_data->work_group_size[0]);
+
+  local_ws = 256;
+  while (local_ws > 1 && local_ws > max_local_ws)
+    local_ws /= 2;
+
+  global_ws = local_ws * CLAMP (n_pixels / 16384, 1, 256);
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 1,
+                                        NULL, &global_ws, &local_ws,
+                                        0, NULL, NULL);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  cl_err = gegl_clEnqueueReadBuffer (gegl_cl_get_command_queue (),
+                                     hist_mem, CL_TRUE, 0, sizeof (hist2),
+                                     hist2, 0, NULL, NULL);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  /* every pixel counted is in a bin */
+  count = 0;
+  for (k = 0; k < 2000; k++)
+    count += hist2[k];
+
+  ramp_down = calculate_threshold (hist1, o->black, count, 0);
+  ramp_up   = calculate_threshold (hist2, o->white, count, 1);
+
+  ramp_down_f = ramp_down;
+  ramp_up_f   = ramp_up;
+
+  /* Y float output, or YA float that the iterator can convert on the GPU */
+  out_format = gegl_buffer_get_format (output);
+  if (out_format != babl_format ("Y float"))
+    out_format = ya;
+  n_comp = babl_format_get_n_components (out_format);
+
+  i = gegl_buffer_cl_iterator_new (output, result, out_format,
+                                   GEGL_CL_BUFFER_WRITE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && ! err)
+    {
+      const GeglRectangle *roi = &i->roi[0];
+
+      x0        = roi->x - extent->x;
+      y0        = roi->y - extent->y;
+      width     = roi->width;
+      global_ws = i->size[0];
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[1],
+                                        sizeof (cl_mem),   &blur1,
+                                        sizeof (cl_mem),   &blur2,
+                                        sizeof (cl_mem),   &i->tex[0],
+                                        sizeof (cl_int),   &stride,
+                                        sizeof (cl_int),   &x0,
+                                        sizeof (cl_int),   &y0,
+                                        sizeof (cl_int),   &width,
+                                        sizeof (cl_int),   &n_comp,
+                                        sizeof (cl_float), &ramp_down_f,
+                                        sizeof (cl_float), &ramp_up_f,
+                                        NULL);
+      if (cl_err == CL_SUCCESS)
+        cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                              cl_data->kernel[1], 1,
+                                              NULL, &global_ws, NULL,
+                                              0, NULL, NULL);
+      if (cl_err != CL_SUCCESS)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          goto cleanup;
+        }
+    }
+
+  ok = ! err;
+
+cleanup:
+  if (hist_mem)
+    gegl_clReleaseMemObject (hist_mem);
+  if (blur2)
+    gegl_clReleaseMemObject (blur2);
+  if (blur1)
+    gegl_clReleaseMemObject (blur1);
+  if (image)
+    gegl_clReleaseMemObject (image);
+
+  return ok;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -243,6 +460,10 @@ process (GeglOperation       *operation,
   gdouble ramp_down;
   gdouble ramp_up;
   gdouble mult;
+
+  if (level == 0 && gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, result))
+      return TRUE;
 
   grey_blur_buffer (input, o->sharpness, o->mask_radius, &dest1, &dest2);
 
@@ -321,6 +542,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->get_cached_region       = get_cached_region;
   operation_class->threaded                = FALSE;
   filter_class->process                    = process;
+  operation_class->opencl_support          = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",          "gegl:photocopy",

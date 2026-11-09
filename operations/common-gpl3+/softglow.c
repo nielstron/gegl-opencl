@@ -120,6 +120,142 @@ get_bounding_box (GeglOperation *operation)
     return *GEGL_RECTANGLE (0, 0, 0, 0);
 }
 
+#include "opencl/gblur-mem-cl.h"
+#include "opencl/softglow.cl.h"
+
+static GeglClRunData *cl_data = NULL;
+
+/* Does what process () does, keeping the blurred image on the GPU */
+static gboolean
+cl_process (GeglOperation       *operation,
+            GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *result,
+            const GeglRectangle *working_region)
+{
+  GeglProperties       *o    = GEGL_PROPERTIES (operation);
+  const Babl           *rgba = gegl_operation_get_format (operation, "output");
+  GeglBufferClIterator *i;
+  cl_mem                image = NULL, sigmoid = NULL;
+  cl_int                cl_err = CL_SUCCESS;
+  cl_int                stride, x0, y0, width;
+  cl_float              slope, brightness;
+  gboolean              err = FALSE;
+  gboolean              ok  = FALSE;
+  gdouble               radius, std_dev;
+  gint                  read;
+  size_t                n, global_ws;
+
+  /* The kernels use the sRGB luminance and TRC */
+  if (babl_format_get_space (rgba) != babl_space ("sRGB"))
+    return FALSE;
+
+  if (gegl_rectangle_is_empty (working_region))
+    return FALSE;
+
+  if (! cl_data)
+    {
+      const char *kernel_name[] = { "softglow_sigmoid",
+                                    "softglow_process",
+                                    NULL };
+
+      cl_data = gegl_cl_compile_and_build (softglow_cl_source, kernel_name);
+    }
+
+  if (! cl_data)
+    return FALSE;
+
+  n = (size_t) working_region->width * working_region->height;
+
+  image = gegl_clCreateBuffer (gegl_cl_get_context (), CL_MEM_READ_WRITE,
+                               n * 2 * sizeof (cl_float), NULL, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  sigmoid = gegl_clCreateBuffer (gegl_cl_get_context (), CL_MEM_READ_WRITE,
+                                 n * sizeof (cl_float), NULL, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  if (! gblur_mem_cl_read (input, working_region, babl_format ("YA float"),
+                           image, FALSE))
+    goto cleanup;
+
+  slope      = SIGMOIDAL_BASE + (o->sharpness * SIGMOIDAL_RANGE);
+  brightness = o->brightness;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (cl_mem),   &image,
+                                    sizeof (cl_mem),   &sigmoid,
+                                    sizeof (cl_float), &slope,
+                                    sizeof (cl_float), &brightness,
+                                    NULL);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                        cl_data->kernel[0], 1,
+                                        NULL, &n, NULL, 0, NULL, NULL);
+  if (cl_err != CL_SUCCESS)
+    goto cleanup;
+
+  /* Same as grey_blur_buffer (), with the "none" abyss policy */
+  radius  = fabs (o->glow_radius) + 1.0;
+  std_dev = sqrt (-(radius * radius) / (2 * log (1.0 / 255.0)));
+
+  if (! gblur_mem_cl_blur (sigmoid, sigmoid,
+                           working_region->width, working_region->height, 1,
+                           std_dev, FALSE))
+    goto cleanup;
+
+  stride = working_region->width;
+
+  i = gegl_buffer_cl_iterator_new (output, result, rgba,
+                                   GEGL_CL_BUFFER_WRITE);
+  read = gegl_buffer_cl_iterator_add (i, input, result, rgba,
+                                      GEGL_CL_BUFFER_READ, GEGL_ABYSS_NONE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && ! err)
+    {
+      const GeglRectangle *roi = &i->roi[0];
+
+      x0        = roi->x - working_region->x;
+      y0        = roi->y - working_region->y;
+      width     = roi->width;
+      global_ws = i->size[0];
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[1],
+                                        sizeof (cl_mem), &i->tex[read],
+                                        sizeof (cl_mem), &i->tex[0],
+                                        sizeof (cl_mem), &sigmoid,
+                                        sizeof (cl_int), &stride,
+                                        sizeof (cl_int), &x0,
+                                        sizeof (cl_int), &y0,
+                                        sizeof (cl_int), &width,
+                                        NULL);
+      if (cl_err == CL_SUCCESS)
+        cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                              cl_data->kernel[1], 1,
+                                              NULL, &global_ws, NULL,
+                                              0, NULL, NULL);
+      if (cl_err != CL_SUCCESS)
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          goto cleanup;
+        }
+    }
+
+  ok = ! err;
+
+cleanup:
+  if (sigmoid)
+    gegl_clReleaseMemObject (sigmoid);
+  if (image)
+    gegl_clReleaseMemObject (image);
+
+  return ok;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
@@ -146,6 +282,10 @@ process (GeglOperation       *operation,
   working_region.height = result->height + area->top + area->bottom;
 
   gegl_rectangle_intersect (&working_region, &working_region, whole_region);
+
+  if (level == 0 && gegl_operation_use_opencl (operation))
+    if (cl_process (operation, input, output, result, &working_region))
+      return TRUE;
 
   dest_tmp = gegl_buffer_new (&working_region, babl_format_with_space ("Y' float", space));
 
@@ -228,6 +368,7 @@ gegl_op_class_init (GeglOpClass *klass)
   operation_class->get_bounding_box = get_bounding_box;
   filter_class->process             = process;
   operation_class->threaded         = FALSE;
+  operation_class->opencl_support   = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:softglow",

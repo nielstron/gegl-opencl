@@ -25,11 +25,18 @@ def do_includes (source):
   return "\n".join(result)
 
 # From http://stackoverflow.com/questions/14945095/how-to-escape-string-for-generated-c
+#
+# Escape the UTF-8 encoded bytes, not the Unicode code points: escaping a
+# code point such as U+00E9 as \351 emits a lone Latin-1 byte, which is not
+# valid UTF-8. Apple's OpenCL-on-Metal compiler turns the program source into
+# an NSString and aborts in clBuildProgram ("source must not be nil") when
+# that conversion fails.
 def escape_string(s):
   result = ''
-  for c in s:
-    if not (32 <= ord(c) < 127) or c in ('\\', '"'):
-      result += '\\%03o' % ord(c)
+  for b in bytearray(s.encode("utf-8")):
+    c = chr(b)
+    if not (32 <= b < 127) or c in ('\\', '"'):
+      result += '\\%03o' % b
     else:
       result += c
   return result

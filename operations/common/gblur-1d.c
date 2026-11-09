@@ -804,6 +804,18 @@ fir_ver_blur (GeglBuffer          *src,
 
 static GeglClRunData *cl_data = NULL;
 
+static void
+gblur_1d_cl_build (void)
+{
+  if (!cl_data)
+    {
+      const char *kernel_name[] = {"fir_ver_blur", "fir_hor_blur",
+                                   "iir_young_causal", "iir_young_anticausal",
+                                   NULL};
+      cl_data = gegl_cl_compile_and_build (gblur_1d_cl_source, kernel_name);
+    }
+}
+
 
 static gboolean
 cl_gaussian_blur (cl_mem                 in_tex,
@@ -817,11 +829,7 @@ cl_gaussian_blur (cl_mem                 in_tex,
   size_t global_ws[2];
   gint   kernel_num;
 
-  if (!cl_data)
-    {
-      const char *kernel_name[] = {"fir_ver_blur", "fir_hor_blur", NULL};
-      cl_data = gegl_cl_compile_and_build (gblur_1d_cl_source, kernel_name);
-    }
+  gblur_1d_cl_build ();
 
   if (!cl_data)
     return TRUE;
@@ -932,6 +940,324 @@ error:
     gegl_clReleaseMemObject (cl_cmatrix);
 
   return FALSE;
+}
+
+typedef struct
+{
+  GeglOrientation orientation;
+  GeglRectangle   result;
+  cl_mem          state;
+  cl_float4       b_hi, b_lo, mb[3];
+  cl_int          clamp_edges;
+  cl_float4       edge;
+  cl_int          n_comp;
+} IirClParams;
+
+/* Run one of the IIR kernels on every chunk of the line segment seg
+ * (a part of p->result that is not split along the lines by the iterator).
+ */
+static gboolean
+iir_cl_run_segment (const IirClParams   *p,
+                    GeglBuffer          *src,
+                    GeglBuffer          *dst,
+                    const GeglRectangle *seg,
+                    const Babl          *format,
+                    gboolean             causal,
+                    cl_int               first,
+                    cl_int               last)
+{
+  gboolean              err = FALSE;
+  cl_int                cl_err;
+  GeglBufferClIterator *i;
+  gint                  read;
+
+  i = gegl_buffer_cl_iterator_new (dst, seg, format, GEGL_CL_BUFFER_WRITE);
+
+  /* The CPU path reads the lines with GEGL_ABYSS_NONE and applies the
+   * abyss policy only through iminus / uplus.
+   */
+  read = gegl_buffer_cl_iterator_add (i, src, seg, format,
+                                      GEGL_CL_BUFFER_READ, GEGL_ABYSS_NONE);
+
+  while (gegl_buffer_cl_iterator_next (i, &err) && !err)
+    {
+      const GeglRectangle *roi = &i->roi[0];
+      cl_kernel            kernel;
+      cl_int               len, n_lines, step, line_stride, line_offset;
+      size_t               global_ws;
+
+      if (p->orientation == GEGL_ORIENTATION_HORIZONTAL)
+        {
+          len         = roi->width;
+          n_lines     = roi->height;
+          step        = 1;
+          line_stride = roi->width;
+          line_offset = roi->y - p->result.y;
+        }
+      else
+        {
+          len         = roi->height;
+          n_lines     = roi->width;
+          step        = roi->width;
+          line_stride = 1;
+          line_offset = roi->x - p->result.x;
+        }
+
+      if (causal)
+        {
+          kernel = cl_data->kernel[2];
+          cl_err = gegl_cl_set_kernel_args (kernel,
+                                  sizeof(cl_mem),    (void*)&i->tex[read],
+                                  sizeof(cl_mem),    (void*)&i->tex[0],
+                                  sizeof(cl_mem),    (void*)&p->state,
+                                  sizeof(cl_int),    (void*)&len,
+                                  sizeof(cl_int),    (void*)&n_lines,
+                                  sizeof(cl_int),    (void*)&step,
+                                  sizeof(cl_int),    (void*)&line_stride,
+                                  sizeof(cl_int),    (void*)&line_offset,
+                                  sizeof(cl_int),    (void*)&p->n_comp,
+                                  sizeof(cl_int),    (void*)&first,
+                                  sizeof(cl_int),    (void*)&last,
+                                  sizeof(cl_float4), (void*)&p->b_hi,
+                                  sizeof(cl_float4), (void*)&p->b_lo,
+                                  sizeof(cl_float4), (void*)&p->mb[0],
+                                  sizeof(cl_float4), (void*)&p->mb[1],
+                                  sizeof(cl_float4), (void*)&p->mb[2],
+                                  sizeof(cl_int),    (void*)&p->clamp_edges,
+                                  sizeof(cl_float4), (void*)&p->edge,
+                                  NULL);
+        }
+      else
+        {
+          kernel = cl_data->kernel[3];
+          cl_err = gegl_cl_set_kernel_args (kernel,
+                                  sizeof(cl_mem),    (void*)&i->tex[read],
+                                  sizeof(cl_mem),    (void*)&i->tex[0],
+                                  sizeof(cl_mem),    (void*)&p->state,
+                                  sizeof(cl_int),    (void*)&len,
+                                  sizeof(cl_int),    (void*)&n_lines,
+                                  sizeof(cl_int),    (void*)&step,
+                                  sizeof(cl_int),    (void*)&line_stride,
+                                  sizeof(cl_int),    (void*)&line_offset,
+                                  sizeof(cl_int),    (void*)&p->n_comp,
+                                  sizeof(cl_float4), (void*)&p->b_hi,
+                                  sizeof(cl_float4), (void*)&p->b_lo,
+                                  NULL);
+        }
+      CL_CHECK;
+
+      global_ws = (size_t) n_lines * p->n_comp;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            kernel, 1,
+                                            NULL, &global_ws, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+
+      /* single segment: the anti-causal pass runs in place on the
+       * causal result of the same chunk
+       */
+      if (causal && first && last)
+        {
+          kernel = cl_data->kernel[3];
+          cl_err = gegl_cl_set_kernel_args (kernel,
+                                  sizeof(cl_mem),    (void*)&i->tex[0],
+                                  sizeof(cl_mem),    (void*)&i->tex[0],
+                                  sizeof(cl_mem),    (void*)&p->state,
+                                  sizeof(cl_int),    (void*)&len,
+                                  sizeof(cl_int),    (void*)&n_lines,
+                                  sizeof(cl_int),    (void*)&step,
+                                  sizeof(cl_int),    (void*)&line_stride,
+                                  sizeof(cl_int),    (void*)&line_offset,
+                                  sizeof(cl_int),    (void*)&p->n_comp,
+                                  sizeof(cl_float4), (void*)&p->b_hi,
+                                  sizeof(cl_float4), (void*)&p->b_lo,
+                                  NULL);
+          CL_CHECK;
+
+          cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                                kernel, 1,
+                                                NULL, &global_ws, NULL,
+                                                0, NULL, NULL);
+          CL_CHECK;
+        }
+    }
+
+  return !err;
+
+error:
+  gegl_buffer_cl_iterator_stop (i);
+  return FALSE;
+}
+
+static gboolean
+iir_cl_process (GeglBuffer            *input,
+                GeglBuffer            *output,
+                const GeglRectangle   *result,
+                const Babl            *format,
+                const gdouble         *b,
+                gdouble              (*m)[3],
+                GeglOrientation        orientation,
+                GeglAbyssPolicy        abyss)
+{
+  IirClParams  p;
+  gboolean     ok = TRUE;
+  cl_int       cl_err;
+  gdouble      bc[4], mb[3][3];
+  gint         n_lines, len, seg_len, n_segs, s, k;
+  GeglBuffer  *tmp = NULL;
+
+  gblur_1d_cl_build ();
+
+  if (!cl_data)
+    return FALSE;
+
+  /* gblur-1d works in float formats with 1 to 5 components; the
+   * boundary tables only cover up to 4.
+   */
+  p.n_comp = babl_format_get_n_components (format);
+
+  if (p.n_comp < 1 || p.n_comp > 4 ||
+      babl_format_get_bytes_per_pixel (format) != p.n_comp * sizeof (gfloat))
+    return FALSE;
+
+  p.orientation = orientation;
+  p.result      = *result;
+
+  if (orientation == GEGL_ORIENTATION_HORIZONTAL)
+    {
+      len     = result->width;
+      n_lines = result->height;
+      seg_len = gegl_cl_get_iter_width ();
+    }
+  else
+    {
+      len     = result->height;
+      n_lines = result->width;
+      seg_len = gegl_cl_get_iter_height ();
+    }
+
+  if (len <= 0 || n_lines <= 0)
+    return TRUE;
+
+  n_segs = (len + seg_len - 1) / seg_len;
+
+  /* Same boundary values as get_boundaries () */
+  p.clamp_edges = 0;
+  for (k = 0; k < 4; k++)
+    p.edge.s[k] = 0.0f;
+
+  switch (abyss)
+    {
+    case GEGL_ABYSS_CLAMP:
+    default:
+      p.clamp_edges = 1;
+      break;
+    case GEGL_ABYSS_NONE:
+      break;
+    case GEGL_ABYSS_WHITE:
+      for (k = 0; k < p.n_comp; k++)
+        p.edge.s[k] = white[k];
+      break;
+    case GEGL_ABYSS_BLACK:
+      for (k = 0; k < p.n_comp; k++)
+        p.edge.s[k] = black[(p.n_comp == 2 ? 2 : 0) + k];
+      break;
+    }
+
+  /* See the comments in gblur-1d.cl */
+  bc[0] = b[0];
+  bc[1] = b[1];
+  bc[2] = b[2] + 2.0 * b[3];
+  bc[3] = b[3];
+
+  for (k = 0; k < 4; k++)
+    {
+      p.b_hi.s[k] = bc[k];
+      p.b_lo.s[k] = bc[k] - (gdouble) p.b_hi.s[k];
+    }
+
+  for (k = 0; k < 3; k++)
+    {
+      mb[k][0] = m[k][0] + m[k][1] + m[k][2];
+      mb[k][1] = m[k][1] + 2.0 * m[k][2];
+      mb[k][2] = m[k][2];
+    }
+
+  for (k = 0; k < 3; k++)
+    {
+      gint j;
+
+      for (j = 0; j < 3; j++)
+        p.mb[k].s[j] = k == 0 ? mb[0][j] : mb[k][j] - mb[0][j];
+
+      p.mb[k].s[3] = 0.0f;
+    }
+
+  p.state = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                 CL_MEM_READ_WRITE,
+                                 (size_t) n_lines * p.n_comp * 6 *
+                                 sizeof (cl_float),
+                                 NULL, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    return FALSE;
+
+  if (n_segs == 1)
+    {
+      ok = iir_cl_run_segment (&p, input, output, result, format,
+                               TRUE, 1, 1);
+    }
+  else
+    {
+      /* Causal pass over the segments in order into tmp, then the
+       * anti-causal pass in reverse order from tmp into output.
+       */
+      tmp = gegl_buffer_new (result, format);
+
+      for (s = 0; ok && s < n_segs; s++)
+        {
+          GeglRectangle seg = *result;
+
+          if (orientation == GEGL_ORIENTATION_HORIZONTAL)
+            {
+              seg.x     = result->x + s * seg_len;
+              seg.width = MIN (seg_len, result->x + result->width - seg.x);
+            }
+          else
+            {
+              seg.y      = result->y + s * seg_len;
+              seg.height = MIN (seg_len, result->y + result->height - seg.y);
+            }
+
+          ok = iir_cl_run_segment (&p, input, tmp, &seg, format,
+                                   TRUE, s == 0, s == n_segs - 1);
+        }
+
+      for (s = n_segs - 1; ok && s >= 0; s--)
+        {
+          GeglRectangle seg = *result;
+
+          if (orientation == GEGL_ORIENTATION_HORIZONTAL)
+            {
+              seg.x     = result->x + s * seg_len;
+              seg.width = MIN (seg_len, result->x + result->width - seg.x);
+            }
+          else
+            {
+              seg.y      = result->y + s * seg_len;
+              seg.height = MIN (seg_len, result->y + result->height - seg.y);
+            }
+
+          ok = iir_cl_run_segment (&p, tmp, output, &seg, format,
+                                   FALSE, 0, 0);
+        }
+
+      g_object_unref (tmp);
+    }
+
+  gegl_clReleaseMemObject (p.state);
+
+  return ok;
 }
 
 static gfloat
@@ -1294,6 +1620,11 @@ gegl_gblur_1d_process (GeglOperation       *operation,
 
       iir_young_find_constants (std_dev, b, m);
 
+      if (gegl_operation_use_opencl (operation) && level == 0)
+        if (iir_cl_process (input, output, result, format,
+                            b, m, o->orientation, abyss_policy))
+          return TRUE;
+
       if (o->orientation == GEGL_ORIENTATION_HORIZONTAL)
         iir_young_hor_blur (real_blur_1D, input, result, output, b, m, abyss_policy, format, level);
       else
@@ -1307,7 +1638,11 @@ gegl_gblur_1d_process (GeglOperation       *operation,
       clen = fir_gen_convolve_matrix (std_dev, &cmatrix);
 
       /* FIXME: implement others format cases */
-      if (gegl_operation_use_opencl (operation) &&
+      /* The OpenCL path only reads and writes level 0; at a mipmap
+       * level it would blur the wrong pixels, so use the CPU path.
+       */
+      if (level == 0 &&
+          gegl_operation_use_opencl (operation) &&
           format == babl_format ("RaGaBaA float"))
         if (fir_cl_process(input, output, result, format,
                            cmatrix, clen, o->orientation, abyss_policy))
