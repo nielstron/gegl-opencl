@@ -84,19 +84,20 @@ report_progress (GeglOperation  *operation,
 }
 
 static gint
-domain_transform (GeglOperation  *operation,
-                  gint            width,
-                  gint            height,
-                  gint            n_chan,
-                  gfloat          spatial_factor,
-                  gfloat          range_factor,
-                  gint            n_iterations,
-                  GeglBuffer     *input,
-                  GeglBuffer     *output)
+domain_transform (GeglOperation       *operation,
+                  const GeglRectangle *result,
+                  gint                 n_chan,
+                  gfloat               spatial_factor,
+                  gfloat               range_factor,
+                  gint                 n_iterations,
+                  GeglBuffer          *input,
+                  GeglBuffer          *output)
 {
   const Babl *space    = gegl_operation_get_source_space (operation, "input");
   const Babl *formatu8 = babl_format_with_space ("R'G'B' u8", space);
   const Babl *format   = babl_format_with_space ("R'G'B'A float", space);
+  gint      width     = result->width;
+  gint      height    = result->height;
   gfloat  **rf_table;
   guint16  *transforms_buffer;
   gfloat   *buffer;
@@ -156,8 +157,8 @@ domain_transform (GeglOperation  *operation,
         {
           real_stride = (i + BLOCK_STRIDE > height) ? height - i : BLOCK_STRIDE;
     
-          rect.x = 0;
-          rect.y = i;
+          rect.x = result->x;
+          rect.y = result->y + i;
           rect.width = width;
           rect.height = real_stride;
     
@@ -276,8 +277,8 @@ domain_transform (GeglOperation  *operation,
         {
           real_stride = (i + BLOCK_STRIDE > width) ? width - i : BLOCK_STRIDE;
     
-          rect.x = i;
-          rect.y = 0;
+          rect.x = result->x + i;
+          rect.y = result->y;
           rect.width = real_stride;
           rect.height = height;
     
@@ -455,8 +456,7 @@ process (GeglOperation       *operation,
 
   /* Buffer is ready for domain transform */
   domain_transform (operation,
-                    result->width,
-                    result->height,
+                    result,
                     4,
                     o->spatial_factor,
                     range_factor,
