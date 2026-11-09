@@ -4,6 +4,7 @@ typedef struct
   float  radius;
   int    type;
   float4 color;
+  ulong  cutoff_squared;
 } Effect;
 
 __kernel void
@@ -49,10 +50,15 @@ gegl_lens_flare (__global const float4 *in,
           amount = min ((size - hyp) / (size * 0.15f), 1.0f);
           break;
         case 3:
-          amount = (size - hyp) / (size * 0.12f);
-          if (amount > 1.0f)
-            amount = 1.0f - amount * 0.12f;
-          break;
+          {
+            const long2 delta = convert_long2 (convert_float2 (xy - effect.center));
+            const ulong squared = delta.x * delta.x + delta.y * delta.y;
+
+            amount = (size - hyp) / (size * 0.12f);
+            if (squared < effect.cutoff_squared)
+              amount = 1.0f - amount * 0.12f;
+            break;
+          }
         default:
           amount = 1.0f - fabs ((hyp - size) / (size * (type == 4 ? 0.04f : 0.07f)));
           break;
