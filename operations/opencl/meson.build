@@ -30,6 +30,7 @@ gegl_operations_opencl_sources = [
   'gblur-mem.cl',
   'high-pass.cl',
   'hue-chroma.cl',
+  'image-gradient.cl',
   'invert-linear.cl',
   'lens-blur.cl',
   'lens-distortion.cl',

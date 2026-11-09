@@ -44,6 +44,85 @@ property_enum (output_mode, _("Output mode"),
 #define POW2(x) ((x)*(x))
 
 #include "gegl-op.h"
+#include "gegl-buffer-cl-iterator.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/image-gradient.cl.h"
+
+static gboolean
+cl_process (GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi,
+            const Babl          *in_format,
+            const Babl          *out_format)
+{
+  static GeglClRunData *cl_data;
+  const Babl *buffer_format = gegl_buffer_get_format (input);
+  const Babl *output_format = gegl_buffer_get_format (output);
+  const Babl *space = babl_format_get_space (in_format);
+  GeglBufferClIterator *iter;
+  cl_int byte_components = 0;
+  cl_int output_ya = FALSE;
+  gboolean err;
+  cl_int cl_err;
+  gint read;
+
+  if (!cl_data)
+    {
+      const char *kernels[] = { "image_gradient_magnitude", NULL };
+      cl_data = gegl_cl_compile_and_build (image_gradient_cl_source, kernels);
+    }
+  if (!cl_data)
+    return FALSE;
+
+  if (buffer_format == babl_format_with_space ("R'G'B'A u8", space) ||
+      buffer_format == babl_format_with_space ("R'G'B' u8", space))
+    {
+      in_format = buffer_format;
+      byte_components = babl_format_get_n_components (in_format);
+    }
+
+  /* A scalar float result is displayed as opaque linear gray. For the
+   * direct sRGB blit, let the iterator quantize gray on the device.
+   */
+  if (output_format == babl_format ("R'G'B'A u8") &&
+      gegl_cl_color_supported (babl_format ("YA float"), output_format) ==
+        GEGL_CL_COLOR_CONVERT)
+    {
+      out_format = babl_format ("YA float");
+      output_ya = TRUE;
+    }
+
+  iter = gegl_buffer_cl_iterator_new (output, roi, out_format, GEGL_CL_BUFFER_WRITE);
+  read = gegl_buffer_cl_iterator_add_2 (iter, input, roi, in_format,
+                                        GEGL_CL_BUFFER_READ,
+                                        KERNEL_SIZE, KERNEL_SIZE,
+                                        KERNEL_SIZE, KERNEL_SIZE,
+                                        GEGL_ABYSS_CLAMP);
+
+  while (gegl_buffer_cl_iterator_next (iter, &err))
+    {
+      const size_t global_ws[] = { iter->roi[0].width, iter->roi[0].height };
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem), &iter->tex[read],
+                                        sizeof (cl_mem), &iter->tex[0],
+                                        sizeof (cl_int), &byte_components,
+                                        sizeof (cl_int), &output_ya,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2, NULL,
+                                            global_ws, NULL, 0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  return !err;
+
+error:
+  gegl_buffer_cl_iterator_stop (iter);
+  return FALSE;
+}
 
 static void
 prepare (GeglOperation *operation)
@@ -102,6 +181,14 @@ process (GeglOperation       *operation,
     roi->width  + KERNEL_SIZE * 2,
     roi->height + KERNEL_SIZE * 2,
   };
+
+  /* Direction depends on the winning channel, which can change when two
+   * rounded magnitudes tie. Keep those modes on the CPU.
+   */
+  if (level == 0 && o->output_mode == GEGL_IMAGEGRADIENT_MAGNITUDE &&
+      gegl_operation_use_opencl (operation) &&
+      cl_process (input, output, roi, in_format, out_format))
+    return TRUE;
 
   GeglBufferIterator *iter = gegl_buffer_iterator_new (
       output, roi, 0, out_format, GEGL_ACCESS_WRITE, GEGL_ABYSS_NONE, 2);
@@ -172,6 +259,7 @@ gegl_op_class_init (GeglOpClass *klass)
 
   operation_class->prepare          = prepare;
   operation_class->get_bounding_box = get_bounding_box;
+  operation_class->opencl_support   = TRUE;
 
   filter_class->process = process;
 
