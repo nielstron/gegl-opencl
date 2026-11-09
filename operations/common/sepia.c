@@ -35,6 +35,8 @@ property_boolean (srgb, _("sRGB"), TRUE)
 #define GEGL_OP_C_SOURCE sepia.c
 
 #include "gegl-op.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/sepia.cl.h"
 
 static void prepare (GeglOperation *operation)
 {
@@ -51,6 +53,28 @@ static void prepare (GeglOperation *operation)
   gegl_operation_set_format (operation, "output", format);
 }
 
+static void
+get_matrix (gdouble scale,
+            gfloat  m[3][4])
+{
+  gdouble remaining = 1.0 - scale;
+
+  m[0][0] = 0.393 + 0.607 * remaining;
+  m[0][1] = 0.769 - 0.769 * remaining;
+  m[0][2] = 0.189 - 0.189 * remaining;
+  m[0][3] = 0.0f;
+
+  m[1][0] = 0.349 - 0.349 * remaining;
+  m[1][1] = 0.686 + 0.314 * remaining;
+  m[1][2] = 0.168 - 0.168 * remaining;
+  m[1][3] = 0.0f;
+
+  m[2][0] = 0.272 - 0.272 * remaining;
+  m[2][1] = 0.534 - 0.534 * remaining;
+  m[2][2] = 0.131 + 0.869 * remaining;
+  m[2][3] = 0.0f;
+}
+
 static gboolean
 process (GeglOperation       *operation,
          void                *in_buf,
@@ -60,38 +84,65 @@ process (GeglOperation       *operation,
          gint                 level)
 {
   GeglProperties *o = GEGL_PROPERTIES (operation);
-  gfloat *in = in_buf;
+  const gfloat *in = in_buf;
   gfloat *out = out_buf;
-  gfloat m[25] = { 1.0, 0.0, 0.0, 0.0, 0.0,
-                   0.0, 1.0, 0.0, 0.0, 0.0,
-                   0.0, 0.0, 1.0, 0.0, 0.0,
-                   0.0, 0.0, 0.0, 1.0, 0.0,
-                   0.0, 0.0, 0.0, 0.0, 1.0 };
-  glong i;
+  gfloat m[3][4];
 
-  m[0] = 0.393 + 0.607 * (1.0 - o->scale);
-  m[1] = 0.769 - 0.769 * (1.0 - o->scale);
-  m[2] = 0.189 - 0.189 * (1.0 - o->scale);
+  get_matrix (o->scale, m);
 
-  m[5] = 0.349 - 0.349 * (1.0 - o->scale);
-  m[6] = 0.686 + 0.314 * (1.0 - o->scale);
-  m[7] = 0.168 - 0.168 * (1.0 - o->scale);
-
-  m[10] = 0.272 - 0.272 * (1.0 - o->scale);
-  m[11] = 0.534 - 0.534 * (1.0 - o->scale);
-  m[12] = 0.131 + 0.869 * (1.0 - o->scale);
-
-  for (i = 0; i < n_pixels; i++)
+  for (glong i = 0; i < n_pixels; i++)
     {
-      out[0] = m[0] * in[0] + m[1] * in[1] + m[2] * in[2];
-      out[1] = m[5] * in[0] + m[6] * in[1] + m[7] * in[2];
-      out[2] = m[10] * in[0] + m[11] * in[1] + m[12] * in[2];
+      gfloat r = in[0], g = in[1], b = in[2];
+
+      for (gint c = 0; c < 3; c++)
+        out[c] = m[c][0] * r + m[c][1] * g + m[c][2] * b;
       out[3] = in[3];
 
       in += 4;
       out += 4;
     }
 
+  return TRUE;
+}
+
+static gboolean
+cl_process (GeglOperation       *operation,
+            cl_mem               in,
+            cl_mem               out,
+            size_t               n_pixels,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  static GeglClRunData *cl_data;
+  const gchar *kernels[] = { "gegl_sepia", NULL };
+  GeglProperties *o = GEGL_PROPERTIES (operation);
+  gfloat m[3][4];
+  cl_int cl_err;
+
+  if (level != 0)
+    return TRUE;
+
+  if (!cl_data)
+    cl_data = gegl_cl_compile_and_build (sepia_cl_source, kernels);
+  if (!cl_data)
+    return TRUE;
+
+  get_matrix (o->scale, m);
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (in), &in,
+                                    sizeof (out), &out,
+                                    sizeof (m[0]), m[0],
+                                    sizeof (m[1]), m[1],
+                                    sizeof (m[2]), m[2],
+                                    NULL);
+  CL_CHECK;
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                       cl_data->kernel[0], 1,
+                                       NULL, &n_pixels, NULL, 0, NULL, NULL);
+  CL_CHECK;
+  return FALSE;
+
+error:
   return TRUE;
 }
 
@@ -103,9 +154,10 @@ gegl_op_class_init (GeglOpClass *klass)
     GEGL_OPERATION_POINT_FILTER_CLASS (klass);
 
   operation_class->prepare = prepare;
-  operation_class->opencl_support = FALSE;
+  operation_class->opencl_support = TRUE;
 
   point_filter_class->process = process;
+  point_filter_class->cl_process = cl_process;
 
   gegl_operation_class_set_keys (operation_class,
     "name"       , "gegl:sepia",
