@@ -139,6 +139,7 @@ typedef struct
   GeglNode *replaceontop;
   GeglNode *fixbump;
   GeglNode *smoothchamfer;
+  GeglNode *smooth_bilateral;
   GeglNode *output;
 } State; 
 
@@ -147,6 +148,7 @@ static void attach (GeglOperation *operation)
 {
   GeglNode *gegl = operation->node;
   GeglProperties *o = GEGL_PROPERTIES (operation);
+  GeglNode *curvature;
 
   State *state = o->user_data = g_malloc0 (sizeof (State));
 
@@ -203,12 +205,20 @@ static void attach (GeglOperation *operation)
                                   "operation", "gegl:gegl", "string", EMBEDDEDGRAPH2, /* I prefer using median-blur radius=0 over gegl:alpha-clip*/
                                   NULL);
 
-                                    #define EMBEDDEDGRAPH3 \
-" id=1 src-atop aux=[ ref=1 bilateral-filter blur-radius=4 edge-preservation=6 mean-curvature-blur iterations=1 ] "  /* This hidden graph smooths the bevel */
-
-  state->smoothchamfer   = gegl_node_new_child (gegl,
-                                  "operation", "gegl:gegl", "string", EMBEDDEDGRAPH3, 
-                                  NULL);
+  state->smoothchamfer = gegl_node_new_child (gegl,
+                                             "operation", "gegl:src-atop",
+                                             NULL);
+  state->smooth_bilateral = gegl_node_new_child (gegl,
+                                                 "operation", "gegl:bilateral-filter",
+                                                 "blur-radius", 4.0,
+                                                 "edge-preservation", 6.0,
+                                                 NULL);
+  curvature = gegl_node_new_child (gegl,
+                                   "operation", "gegl:mean-curvature-blur",
+                                   "iterations", 1,
+                                   NULL);
+  gegl_node_link_many (state->replaceontop, state->smooth_bilateral, curvature, NULL);
+  gegl_node_connect (state->smoothchamfer, "aux", curvature, "output");
 
   state->blend      = gegl_node_new_child (gegl, "operation", "gegl:hard-light", /* This blend mode can be anything, but in default its hardlight */
                                            NULL);
@@ -244,9 +254,19 @@ static void update_graph (GeglOperation *operation)
   if (o->type == GEGL_BEVEL_CHAMFER)
   {
     int level = o->depth / 100.0 * 15;
+    gboolean use_opencl;
+    gboolean light_map = o->blendmode == CHAMFER_BLEND_GIMPBLEND;
     if (level == 0)
       level = 1;
     gegl_node_set (state->emb2, "depth", level, NULL);
+
+    /* The curvature filter can amplify rounding in the Emboss shade on
+     * light maps. Manhattan distances also expose this after bilateral blur. */
+    g_object_get (operation->node, "use-opencl", &use_opencl, NULL);
+    g_object_set (state->emb2, "use-opencl", use_opencl && !light_map, NULL);
+    g_object_set (state->smooth_bilateral, "use-opencl",
+                  use_opencl && !(light_map && o->metric == GEGL_DISTANCE_METRIC_MANHATTAN),
+                  NULL);
 
     gegl_node_link_many (state->input, state->median, state->nop, state->replaceontop, state->smoothchamfer, state->output, NULL);
     gegl_node_connect (state->replaceontop, "aux", state->blend, "output");
