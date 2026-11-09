@@ -76,8 +76,7 @@ float4 u8_to_float4 (uchar4 v);
 /* babl/base/util.h */
 float babl_epsilon_for_zero (float value)
 {
-  return (value > BABL_ALPHA_FLOOR_F || value < -BABL_ALPHA_FLOOR_F) ?
-         value : BABL_ALPHA_FLOOR_F;
+  return fabs (value) <= BABL_ALPHA_FLOOR_F ? BABL_ALPHA_FLOOR_F : value;
 }
 
 /* a / b, correctly rounded, given y, the correctly rounded 1 / b
@@ -199,12 +198,62 @@ float gamma_2_2_to_linear (float value)
   return babl_div_rn_recip (value, 12.92f, 0x1.3d0722p-4f);
 }
 
+/* Multiply by a reciprocal represented in units of the least positive
+ * binary32 value. Pack tiny results explicitly on devices that flush them. */
+static float
+multiply_tiny_reciprocal (float value, uint units, uint sign)
+{
+  const uint bits = as_uint (value) ^ sign;
+  const float scaled = as_float (bits) * ((float) units * 0x1p-23f);
+
+  if (!(fabs (scaled) < 1.0f))
+    return scaled * 0x1p-126f;
+
+  /* In these units the exact product is significand * units / 2^shift. */
+  const int shift = 150 - (int) ((bits >> 23) & 255u);
+  const uint result_sign = bits & 0x80000000u;
+  if (shift >= 48)
+    return as_float (result_sign);
+
+  const ulong product = (ulong) ((bits & 0x7fffffu) | 0x800000u) * units;
+  const ulong halfway = 1UL << (shift - 1);
+  uint rounded = product >> shift;
+  const ulong remainder = product - ((ulong) rounded << shift);
+  rounded += remainder > halfway || (remainder == halfway && (rounded & 1u));
+
+  return as_float (result_sign | rounded);
+}
+
+static float3
+unpremultiply_rgb (float3 rgb, float alpha)
+{
+  if (fabs (alpha) < 0x1p126f)
+    return rgb * babl_div_rn (1.0f, alpha);
+
+  if (!isfinite (alpha))
+    return rgb * (1.0f / alpha);
+
+  /* Babl rounds the reciprocal before multiplying. Compute it in
+   * subnormal units so the device's division cannot flush it to zero. */
+  const uint bits = as_uint (alpha);
+  const uint sign = bits & 0x80000000u;
+  const uint exponent = (bits >> 23) & 255u;
+  const uint significand = (bits & 0x7fffffu) | 0x800000u;
+  const ulong numerator = 1UL << (299u - exponent);
+  uint units = numerator / significand;
+  const uint remainder = numerator - (ulong) units * significand;
+  units += 2u * remainder > significand ||
+           (2u * remainder == significand && (units & 1u));
+
+  return (float3) (multiply_tiny_reciprocal (rgb.x, units, sign),
+                   multiply_tiny_reciprocal (rgb.y, units, sign),
+                   multiply_tiny_reciprocal (rgb.z, units, sign));
+}
+
 /* extensions/gegl-fixups.c: conv_rgbAF_rgbaF () */
 float4 unpremultiply (float4 v)
 {
-  float recip = babl_div_rn (1.0f, babl_epsilon_for_zero (v.w));
-
-  return (float4) (v.xyz * recip, v.w);
+  return (float4) (unpremultiply_rgb (v.xyz, babl_epsilon_for_zero (v.w)), v.w);
 }
 
 /* (v * alpha) / alpha, the way babl computes it when its conversion path
@@ -214,9 +263,8 @@ float4 unpremultiply (float4 v)
 float4 premultiply_roundtrip (float4 v)
 {
   float used_alpha = babl_epsilon_for_zero (v.w);
-  float recip      = babl_div_rn (1.0f, used_alpha);
 
-  return (float4) ((v.xyz * used_alpha) * recip, v.w);
+  return (float4) (unpremultiply_rgb (v.xyz * used_alpha, used_alpha), v.w);
 }
 
 /* babl/base/model-gray.c: rgba_to_graya_float () */
