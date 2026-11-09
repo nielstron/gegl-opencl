@@ -80,9 +80,10 @@ typedef struct
   cl_float  radius;
   cl_int    type;
   cl_float4 color;
+  cl_ulong  cutoff_squared;
 } ClEffect;
 
-G_STATIC_ASSERT (sizeof (ClEffect) == 2 * sizeof (cl_float4));
+G_STATIC_ASSERT (sizeof (ClEffect) == 3 * sizeof (cl_float4));
 
 static inline void
 fixpix (gfloat  *pixel,
@@ -495,6 +496,28 @@ process (GeglOperation       *operation,
   return TRUE;
 }
 
+static cl_ulong
+reflection_cutoff_squared (gfloat size)
+{
+  const gdouble divisor = size * 0.12;
+  /* The ratio rounds to 1 through the midpoint to the next float. Find
+   * the largest hypotf result that still takes the inner branch. */
+  gfloat inner = size - divisor * (1.0 + 0x1p-24);
+  const gfloat ratio = (size - inner) / divisor;
+
+  if (ratio <= 1.0f)
+    inner = nextafterf (inner, -INFINITY);
+
+  const gfloat outer = nextafterf (inner, INFINITY);
+  const gdouble midpoint = ((gdouble) inner + outer) * 0.5;
+  const gdouble squared = midpoint * midpoint;
+  const cl_ulong first_outer = (cl_ulong) ceil (squared);
+
+  /* The squared distance between integer pixel coordinates is integral.
+   * Include the midpoint only when hypotf would round it inward. */
+  return first_outer + (first_outer == squared && (gfloat) midpoint == inner);
+}
+
 static gboolean
 cl_process (GeglOperation       *operation,
             cl_mem               in,
@@ -551,7 +574,8 @@ cl_process (GeglOperation       *operation,
         .center = { .s = { r->xp, r->yp } },
         .radius = r->size,
         .type   = r->type,
-        .color  = { .s = { r->ccol[0], r->ccol[1], r->ccol[2], 0 } }
+        .color  = { .s = { r->ccol[0], r->ccol[1], r->ccol[2], 0 } },
+        .cutoff_squared = r->type == 3 ? reflection_cutoff_squared (r->size) : 0
       };
     }
 
