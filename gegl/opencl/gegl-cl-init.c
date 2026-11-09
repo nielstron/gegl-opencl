@@ -165,7 +165,7 @@ GeglClState;
 
 static cl_device_type gegl_cl_default_device_type = CL_DEVICE_TYPE_GPU;
 static GeglClState cl_state = { 0, };
-static GHashTable *cl_program_hash = NULL;
+static GHashTable *cl_program_hash[2];
 
 
 gboolean
@@ -777,7 +777,8 @@ gegl_cl_init_common (cl_device_type requested_device_type)
       cl_state.is_loaded = TRUE;
 
       /* XXX: this dict is being leaked */
-      cl_program_hash = g_hash_table_new (g_str_hash, g_str_equal);
+      cl_program_hash[FALSE] = g_hash_table_new (g_str_hash, g_str_equal);
+      cl_program_hash[TRUE] = g_hash_table_new (g_str_hash, g_str_equal);
 
       gegl_cl_color_compile_kernels ();
 
@@ -796,32 +797,17 @@ gegl_cl_init_common (cl_device_type requested_device_type)
   return TRUE;
 }
 
-/* There is one known op where there is 1 pixel difference between the
- * OpenCL version and the regular version, when we do not set
- * -cl-opt-disable. This happens for the snn_mean test. We should check the
- * speed difference caused by setting this and possibly discuss if this small
- * difference is acceptable.
- */
-static const char *command_lines[] =
-{
-  "-cl-std=CL3.0 -cl-opt-disable -cl-fp32-correctly-rounded-divide-sqrt",
-  "-cl-std=CL3.0 -cl-opt-disable",
-  "-cl-std=CL1.2 -cl-opt-disable -cl-fp32-correctly-rounded-divide-sqrt",
-  "-cl-std=CL1.2 -cl-opt-disable",
-};
-
-/* XXX: same program_source with different kernel_name[], context or device
- *      will retrieve the same key
- */
-GeglClRunData *
-gegl_cl_compile_and_build (const char *program_source, const char *kernel_name[])
+static GeglClRunData *
+compile_and_build (const char *program_source,
+                   const char *kernel_name[],
+                   gboolean    optimize)
 {
   gint errcode;
   GeglClRunData *cl_data = NULL;
   if (!gegl_cl_is_accelerated ())
     return NULL;
 
-  cl_data = (GeglClRunData *)g_hash_table_lookup (cl_program_hash, program_source);
+  cl_data = g_hash_table_lookup (cl_program_hash[optimize], program_source);
 
   if (cl_data == NULL)
     {
@@ -829,7 +815,7 @@ gegl_cl_compile_and_build (const char *program_source, const char *kernel_name[]
       const char *sources[] = {random_cl_source, program_source};
 
       gint    i;
-      gint    cmd = 0;
+      gchar   options[96];
       char   *msg;
       size_t  s = 0;
       cl_int  build_errcode;
@@ -843,14 +829,13 @@ gegl_cl_compile_and_build (const char *program_source, const char *kernel_name[]
                                                          lengths, &errcode);
       CL_CHECK_ONLY (errcode);
 
-      /* Using -cl-fp32-correctly-rounded-divide-sqrt requires flag to be set */
-      if ((cl_state.fp_config & CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT) == 0)
-        cmd = 1;
-
-      if (! cl_state.compiler_v3)
-        cmd += 2;
-
-      build_errcode = gegl_clBuildProgram(cl_data->program, 0, NULL, command_lines[cmd], NULL, NULL);
+      g_snprintf (options, sizeof (options), "-cl-std=%s%s%s",
+                  cl_state.compiler_v3 ? "CL3.0" : "CL1.2",
+                  optimize ? "" : " -cl-opt-disable",
+                  cl_state.fp_config & CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT ?
+                    " -cl-fp32-correctly-rounded-divide-sqrt" : "");
+      build_errcode = gegl_clBuildProgram (cl_data->program, 0, NULL,
+                                           options, NULL, NULL);
       errcode = gegl_clGetProgramBuildInfo (cl_data->program,
                                             gegl_cl_get_device (),
                                             CL_PROGRAM_BUILD_LOG,
@@ -909,10 +894,25 @@ gegl_cl_compile_and_build (const char *program_source, const char *kernel_name[]
           CL_CHECK_ONLY (errcode);
         }
 
-      g_hash_table_insert (cl_program_hash, g_strdup (program_source), (void*)cl_data);
+      g_hash_table_insert (cl_program_hash[optimize], g_strdup (program_source), cl_data);
     }
 
   return cl_data;
+}
+
+GeglClRunData *
+gegl_cl_compile_and_build (const char *program_source,
+                           const char *kernel_name[])
+{
+  /* SNN mean can change output with compiler optimizations enabled. */
+  return compile_and_build (program_source, kernel_name, FALSE);
+}
+
+GeglClRunData *
+gegl_cl_compile_and_build_optimized (const char *program_source,
+                                     const char *kernel_name[])
+{
+  return compile_and_build (program_source, kernel_name, TRUE);
 }
 
 /* A small pool of device buffers, so that the buffer iterators and the

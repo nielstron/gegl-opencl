@@ -153,9 +153,6 @@ static void prepare (GeglOperation *operation)
   gegl_operation_set_format (operation, "output", babl_format_with_space ("R~G~B~A float", space));
 }
 
-#define FIX_OPENCL
-
-#ifndef FIX_OPENCL
 #include "opencl/gegl-cl.h"
 #include "gegl-buffer-cl-iterator.h"
 
@@ -178,47 +175,51 @@ cl_noise_reduction (cl_mem                in_tex,
   cl_int n_src_stride  = roi->width + iterations * 2;
   cl_int cl_err = 0;
 
-  cl_mem temp_tex = NULL;
-  cl_mem tmptex   = NULL;
+  cl_mem scratch_tex = NULL;
+  cl_mem src_tex;
+  cl_mem dst_tex;
 
   gint stride = 16; /*R'G'B'A float*/
 
   if (!cl_data)
     {
       const char *kernel_name[] ={"noise_reduction_cl","transfer", NULL};
-      cl_data = gegl_cl_compile_and_build(noise_reduction_cl_source, kernel_name);
+      cl_data = gegl_cl_compile_and_build_optimized (noise_reduction_cl_source,
+                                                     kernel_name);
     }
   if (!cl_data)  return TRUE;
 
-  temp_tex = gegl_clCreateBuffer (gegl_cl_get_context(),
-                                  CL_MEM_READ_WRITE,
-                                  src_roi->width * src_roi->height * stride,
-                                  NULL, &cl_err);
-  CL_CHECK;
+  /* Ping-pong between aux_tex and a scratch buffer; the first iteration
+   * reads in_tex directly, which must not be written to.
+   */
+  if (iterations > 1)
+    {
+      scratch_tex = gegl_clCreateBuffer (gegl_cl_get_context(),
+                                         CL_MEM_READ_WRITE,
+                                         src_roi->width * src_roi->height * stride,
+                                         NULL, &cl_err);
+      CL_CHECK;
+    }
 
-  cl_err = gegl_clEnqueueCopyBuffer(gegl_cl_get_command_queue(),
-                                    in_tex , temp_tex , 0 , 0 ,
-                                    src_roi->width * src_roi->height * stride,
-                                    0, NULL, NULL);
-  CL_CHECK;
+  src_tex = in_tex;
+  dst_tex = aux_tex;
 
-  tmptex = temp_tex;
-  for (i = 0;i<iterations;i++)
+  for (i = 0; i < iterations; i++)
     {
       if (i > 0)
-      {
-        cl_mem temp = aux_tex;
-        aux_tex     = temp_tex;
-        temp_tex    = temp;
-      }
+        {
+          src_tex = dst_tex;
+          dst_tex = (dst_tex == aux_tex) ? scratch_tex : aux_tex;
+        }
+
       gbl_size_tmp[0] = roi->width  + 2 * (iterations - 1 -i);
       gbl_size_tmp[1] = roi->height + 2 * (iterations - 1 -i);
 
-      cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 0, sizeof(cl_mem), (void*)&temp_tex);
+      cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 0, sizeof(cl_mem), (void*)&src_tex);
       CL_CHECK;
       cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 1, sizeof(cl_int), (void*)&n_src_stride);
       CL_CHECK;
-      cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 2, sizeof(cl_mem), (void*)&aux_tex);
+      cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 2, sizeof(cl_mem), (void*)&dst_tex);
       CL_CHECK;
       cl_err = gegl_clSetKernelArg(cl_data->kernel[0], 3, sizeof(cl_int), (void*)&n_src_stride);
       CL_CHECK;
@@ -232,7 +233,7 @@ cl_noise_reduction (cl_mem                in_tex,
   gbl_size_tmp[0] = roi->width ;
   gbl_size_tmp[1] = roi->height;
 
-  cl_err = gegl_clSetKernelArg(cl_data->kernel[1], 0, sizeof(cl_mem), (void*)&aux_tex);
+  cl_err = gegl_clSetKernelArg(cl_data->kernel[1], 0, sizeof(cl_mem), (void*)&dst_tex);
   CL_CHECK;
   cl_err = gegl_clSetKernelArg(cl_data->kernel[1], 1, sizeof(cl_int), (void*)&n_src_stride);
   CL_CHECK;
@@ -244,20 +245,20 @@ cl_noise_reduction (cl_mem                in_tex,
                                        0, NULL, NULL);
   CL_CHECK;
 
-  cl_err = gegl_clFinish(gegl_cl_get_command_queue());
-  CL_CHECK;
-
-  if (tmptex)
+  if (scratch_tex)
     {
-      cl_err = gegl_clReleaseMemObject (tmptex);
+      /* The kernels still use it; the implementation keeps it alive until
+       * they are done.
+       */
+      cl_err = gegl_clReleaseMemObject (scratch_tex);
       CL_CHECK_ONLY (cl_err);
     }
 
   return FALSE;
 
 error:
-  if (tmptex)
-    gegl_clReleaseMemObject (tmptex);
+  if (scratch_tex)
+    gegl_clReleaseMemObject (scratch_tex);
 
   return TRUE;
 }
@@ -318,9 +319,6 @@ cl_process (GeglOperation       *operation,
 
   return !err;
 }
-#endif
-
-#define INPLACE 1
 
 static gboolean
 process (GeglOperation       *operation,
@@ -336,25 +334,18 @@ process (GeglOperation       *operation,
   int iteration;
   int stride;
   float *src_buf;
-#ifndef INPLACE
-  float *dst_buf;
-#endif
   GeglRectangle rect;
-#ifndef FIX_OPENCL
+
   if (gegl_operation_use_opencl (operation))
-    if(cl_process(operation, input, output, result))
+    if (cl_process (operation, input, output, result))
       return TRUE;
-#endif
+
   rect = *result;
 
   stride = result->width + o->iterations * 2;
 
   src_buf = g_new0 (float,
          (stride) * (result->height + o->iterations * 2) * 4);
-#ifndef INPLACE
-  dst_buf = g_new0 (float,
-         (stride) * (result->height + o->iterations * 2) * 4);
-#endif
 
   {
     rect.x      -= o->iterations;
@@ -365,38 +356,27 @@ process (GeglOperation       *operation,
                      src_buf, stride * 4 * 4, GEGL_ABYSS_NONE);
   }
 
+  /* Each iteration shrinks the valid area by one pixel on every side and
+   * writes the result for the pixel centred on (x + 1, y + 1) to (x, y).
+   * In raster order that location is never read again in the same
+   * iteration, so this can be done in place while every pixel still only
+   * sees unsmoothed neighbours.  (Writing the result back to (x + 1, y + 1)
+   * instead would feed already smoothed neighbours into later pixels and
+   * make the output depend on how it is split into chunks.)
+   */
   for (iteration = 0; iteration < o->iterations; iteration++)
     {
       noise_reduction (src_buf, stride,
-#ifdef INPLACE
-                       src_buf + (stride + 1) * 4,
-#else
-                       dst_buf,
-#endif
+                       src_buf,
                        result->width  + (o->iterations - 1 - iteration) * 2,
                        result->height + (o->iterations - 1 - iteration) * 2,
                        stride);
-#ifndef INPLACE
-      { /* swap buffers */
-        float *tmp = src_buf;
-        src_buf = dst_buf;
-        dst_buf = tmp;
-      }
-#endif
     }
 
   gegl_buffer_set (output, result, 0, out_format,
-#ifndef INPLACE
-                   src_buf,
-#else
-                   src_buf + ((stride +1) * 4) * o->iterations,
-#endif
-                   stride * 4 * 4);
+                   src_buf, stride * 4 * 4);
 
   g_free (src_buf);
-#ifndef INPLACE
-  g_free (dst_buf);
-#endif
 
   return  TRUE;
 }
@@ -451,9 +431,7 @@ gegl_op_class_init (GeglOpClass *klass)
   filter_class->process           = process;
   operation_class->process        = operation_process;
   operation_class->prepare        = prepare;
-#ifndef FIX_OPENCL
   operation_class->opencl_support = TRUE;
-#endif
 
   operation_class->get_bounding_box = get_bounding_box;
 
@@ -461,7 +439,7 @@ gegl_op_class_init (GeglOpClass *klass)
     "title",       _("Noise Reduction"),
     "name"       , "gegl:noise-reduction",
     "categories" , "enhance:noise-reduction",
-    "reference-hash", "7a09981f8d814359b4c5f52406b0b955",
+    "reference-hash", "f7def60c374043c9d2c7788313ea696a",
     "description", _("Anisotropic smoothing operation"),
     NULL);
 }
