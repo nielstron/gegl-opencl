@@ -43,6 +43,8 @@ property_double (pos_y, _("Y position"), 0.5)
 #define GEGL_OP_C_SOURCE lens-flare.c
 
 #include "gegl-op.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/lens-flare.cl.h"
 
 #define NUMREF 19
 
@@ -71,6 +73,16 @@ typedef struct
   gint center_x;
   gint center_y;
 } LfParamsType;
+
+typedef struct
+{
+  cl_int2   center;
+  cl_float  radius;
+  cl_int    type;
+  cl_float4 color;
+} ClEffect;
+
+G_STATIC_ASSERT (sizeof (ClEffect) == 2 * sizeof (cl_float4));
 
 static inline void
 fixpix (gfloat  *pixel,
@@ -483,6 +495,92 @@ process (GeglOperation       *operation,
   return TRUE;
 }
 
+static gboolean
+cl_process (GeglOperation       *operation,
+            cl_mem               in,
+            cl_mem               out,
+            size_t               n_pixels,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  static GeglClRunData *cl_data;
+  const gchar *kernels[] = { "gegl_lens_flare", NULL };
+  GeglProperties *o = GEGL_PROPERTIES (operation);
+  LfParamsType params = *(LfParamsType *) o->user_data;
+  const GeglRectangle *whole_region;
+  ClEffect effects[5 + NUMREF];
+  cl_int2 origin = { .s = { roi->x, roi->y } };
+  cl_int width = roi->width;
+  cl_int cl_err;
+  cl_mem data = NULL;
+
+  if (level != 0)
+    return TRUE;
+
+  if (!cl_data)
+    cl_data = gegl_cl_compile_and_build (lens_flare_cl_source, kernels);
+  if (!cl_data)
+    return TRUE;
+
+  whole_region = gegl_operation_source_get_bounding_box (operation, "input");
+  update_params (o->pos_x, o->pos_y, whole_region->width, whole_region->height,
+                 &params);
+
+  const gfloat sizes[] = { params.color_size, params.glow_size,
+                           params.inner_size, params.outer_size,
+                           params.halo_size };
+  const gdouble *colors[] = { params.color, params.glow, params.inner,
+                              params.outer, params.halo };
+  const gint types[] = { 1, 1, 1, 0, 5 };
+
+  for (gint i = 0; i < 5; i++)
+    {
+      effects[i] = (ClEffect) {
+        .center = { .s = { params.center_x, params.center_y } },
+        .radius = sizes[i],
+        .type   = types[i],
+        .color  = { .s = { colors[i][0], colors[i][1], colors[i][2], 0 } }
+      };
+    }
+
+  for (gint i = 0; i < NUMREF; i++)
+    {
+      const Reflect *r = &params.ref[i];
+
+      effects[5 + i] = (ClEffect) {
+        .center = { .s = { r->xp, r->yp } },
+        .radius = r->size,
+        .type   = r->type,
+        .color  = { .s = { r->ccol[0], r->ccol[1], r->ccol[2], 0 } }
+      };
+    }
+
+  data = gegl_clCreateBuffer (gegl_cl_get_context (),
+                             CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                             sizeof (effects), effects, &cl_err);
+  CL_CHECK;
+
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (in), &in,
+                                    sizeof (out), &out,
+                                    sizeof (data), &data,
+                                    sizeof (origin), &origin,
+                                    sizeof (width), &width,
+                                    NULL);
+  CL_CHECK;
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                       cl_data->kernel[0], 1,
+                                       NULL, &n_pixels, NULL, 0, NULL, NULL);
+  CL_CHECK;
+  gegl_clReleaseMemObject (data);
+  return FALSE;
+
+error:
+  if (data)
+    gegl_clReleaseMemObject (data);
+  return TRUE;
+}
+
 static void
 gegl_op_class_init (GeglOpClass *klass)
 {
@@ -497,9 +595,10 @@ gegl_op_class_init (GeglOpClass *klass)
   object_class->finalize = finalize;
 
   operation_class->prepare = prepare;
-  operation_class->opencl_support = FALSE;
+  operation_class->opencl_support = TRUE;
 
   filter_class->process    = process;
+  filter_class->cl_process = cl_process;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:lens-flare",
