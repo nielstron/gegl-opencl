@@ -77,6 +77,11 @@ GeglTile        * gegl_tile_handler_cache_get_tile           (GeglTileHandlerCac
 void              gegl_tile_handler_cache_tile_uncloned      (GeglTileHandlerCache *cache,
                                                               GeglTile             *tile);
 
+gboolean          gegl_tile_handler_cache_find_tile          (GeglTileHandlerCache *cache,
+                                                              gboolean            (*func) (GeglTile *tile,
+                                                                                           gpointer  user_data),
+                                                              gpointer              user_data);
+
 gsize             gegl_tile_handler_cache_get_total              (void);
 gsize             gegl_tile_handler_cache_get_total_max          (void);
 gsize             gegl_tile_handler_cache_get_total_uncompressed (void);

@@ -74,6 +74,7 @@ EXPORTS
   gegl_buffer_matrix2_determinant
   gegl_buffer_matrix2_is_identity
   gegl_buffer_matrix2_is_scale
+  gegl_buffer_may_share_memory
   gegl_buffer_new
   gegl_buffer_new_for_backend
   gegl_buffer_new_ram
@@ -137,6 +138,9 @@ EXPORTS
   gegl_cl_init
   gegl_cl_is_accelerated
   gegl_cl_load_random_data
+  gegl_cl_mem_pool_clear
+  gegl_cl_mem_pool_get
+  gegl_cl_mem_pool_put
   gegl_cl_random_cleanup
   gegl_cl_random_get_ushort4
   gegl_cl_set_default_device_type
@@ -329,6 +333,7 @@ EXPORTS
   gegl_downscale_2x2_get_fun_generic
   gegl_downscale_2x2_nearest_generic
   gegl_eval_manager_apply
+  gegl_eval_manager_apply_into
   gegl_eval_manager_get_bounding_box
   gegl_eval_manager_get_type
   gegl_eval_manager_new
@@ -357,6 +362,7 @@ EXPORTS
   gegl_graph_prepare
   gegl_graph_prepare_request
   gegl_graph_process
+  gegl_graph_process_into
   gegl_graph_rebuild
   gegl_has_operation
   gegl_init
@@ -856,6 +862,7 @@ EXPORTS
   gegl_tile_handler_cache_connect
   gegl_tile_handler_cache_disconnect
   gegl_tile_handler_cache_ext_flush DATA
+  gegl_tile_handler_cache_find_tile
   gegl_tile_handler_cache_get_hits
   gegl_tile_handler_cache_get_misses
   gegl_tile_handler_cache_get_tile

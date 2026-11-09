@@ -64,6 +64,10 @@ struct _GeglOperationContext
   GHashTable    *contexts;      /* to be able to look up the context of
                                    other nodes/ops in the graph we store the
                                    hashtable we will be stored in */
+  GeglBuffer    *target;        /* when set (not owned), the buffer the
+                                   output should be rendered into, used to
+                                   render directly into a caller-provided
+                                   buffer in the caller's format */
 };
 
 GeglOperationContext *gegl_operation_context_new       (GeglOperation        *operation,

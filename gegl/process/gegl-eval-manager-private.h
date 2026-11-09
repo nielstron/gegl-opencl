@@ -69,6 +69,11 @@ GeglRectangle     gegl_eval_manager_get_bounding_box (GeglEvalManager     *self)
 GeglBuffer *      gegl_eval_manager_apply    (GeglEvalManager     *self,
                                               const GeglRectangle *roi,
                                               gint                 level);
+GeglBuffer *      gegl_eval_manager_apply_into (GeglEvalManager     *self,
+                                                const GeglRectangle *roi,
+                                                gint                 level,
+                                                GeglNode            *target_node,
+                                                GeglBuffer          *target);
 GeglEvalManager * gegl_eval_manager_new      (GeglNode        *node,
                                               const gchar     *pad_name);
 

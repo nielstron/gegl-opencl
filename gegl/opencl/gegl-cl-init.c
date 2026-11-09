@@ -915,10 +915,152 @@ gegl_cl_compile_and_build (const char *program_source, const char *kernel_name[]
   return cl_data;
 }
 
+/* A small pool of device buffers, so that the buffer iterators and the
+ * operations running one after another do not create and release (and on
+ * many drivers, map and fault in) new device memory for every chunk.
+ *
+ * Buffers are matched on their flags and a size between the requested size
+ * and twice that; a buffer's content is undefined when it is handed out,
+ * as with a new one.  The pool keeps at most GEGL_CL_MEM_POOL_MAX_BUFFERS
+ * buffers and GEGL_CL_MEM_POOL_MAX_BYTES bytes, releasing the least
+ * recently returned buffers first.
+ */
+#define GEGL_CL_MEM_POOL_MAX_BUFFERS 8
+#define GEGL_CL_MEM_POOL_MAX_BYTES   ((size_t) 160 * 1024 * 1024)
+
+typedef struct
+{
+  cl_mem       mem;
+  cl_mem_flags flags;
+  size_t       size;
+} GeglClPooledMem;
+
+static GMutex  cl_mem_pool_mutex;
+static GQueue  cl_mem_pool        = G_QUEUE_INIT; /* oldest first */
+static size_t  cl_mem_pool_bytes  = 0;
+
+cl_mem
+gegl_cl_mem_pool_get (cl_mem_flags  flags,
+                      size_t        size,
+                      cl_int       *errcode_ret)
+{
+  GeglClPooledMem *best = NULL;
+
+  g_mutex_lock (&cl_mem_pool_mutex);
+
+  for (GList *iter = cl_mem_pool.head; iter; iter = iter->next)
+    {
+      GeglClPooledMem *pooled = iter->data;
+
+      if (pooled->flags == flags &&
+          pooled->size  >= size  &&
+          pooled->size / 2 <= size &&
+          (! best || pooled->size < best->size))
+        best = pooled;
+    }
+
+  if (best)
+    {
+      g_queue_remove (&cl_mem_pool, best);
+      cl_mem_pool_bytes -= best->size;
+    }
+
+  g_mutex_unlock (&cl_mem_pool_mutex);
+
+  if (best)
+    {
+      cl_mem mem = best->mem;
+
+      g_slice_free (GeglClPooledMem, best);
+
+      if (errcode_ret)
+        *errcode_ret = CL_SUCCESS;
+
+      return mem;
+    }
+
+  return gegl_clCreateBuffer (gegl_cl_get_context (), flags, size, NULL,
+                              errcode_ret);
+}
+
+void
+gegl_cl_mem_pool_put (cl_mem mem)
+{
+  GeglClPooledMem *pooled;
+  GList           *evict = NULL;
+  cl_mem_flags     flags = 0;
+  size_t           size  = 0;
+  void            *host_ptr = NULL;
+
+  if (! mem)
+    return;
+
+  /* only pool plain device buffers we can recreate from flags and size */
+  if (gegl_clGetMemObjectInfo (mem, CL_MEM_FLAGS, sizeof (flags), &flags, NULL) != CL_SUCCESS ||
+      gegl_clGetMemObjectInfo (mem, CL_MEM_SIZE, sizeof (size), &size, NULL) != CL_SUCCESS ||
+      gegl_clGetMemObjectInfo (mem, CL_MEM_HOST_PTR, sizeof (host_ptr), &host_ptr, NULL) != CL_SUCCESS ||
+      host_ptr != NULL ||
+      size > GEGL_CL_MEM_POOL_MAX_BYTES)
+    {
+      gegl_clReleaseMemObject (mem);
+      return;
+    }
+
+  pooled = g_slice_new (GeglClPooledMem);
+  pooled->mem   = mem;
+  pooled->flags = flags;
+  pooled->size  = size;
+
+  g_mutex_lock (&cl_mem_pool_mutex);
+
+  g_queue_push_tail (&cl_mem_pool, pooled);
+  cl_mem_pool_bytes += size;
+
+  while (cl_mem_pool_bytes > GEGL_CL_MEM_POOL_MAX_BYTES ||
+         cl_mem_pool.length > GEGL_CL_MEM_POOL_MAX_BUFFERS)
+    {
+      GeglClPooledMem *oldest = g_queue_pop_head (&cl_mem_pool);
+
+      cl_mem_pool_bytes -= oldest->size;
+      evict = g_list_prepend (evict, oldest);
+    }
+
+  g_mutex_unlock (&cl_mem_pool_mutex);
+
+  for (GList *iter = evict; iter; iter = iter->next)
+    {
+      GeglClPooledMem *oldest = iter->data;
+
+      gegl_clReleaseMemObject (oldest->mem);
+      g_slice_free (GeglClPooledMem, oldest);
+    }
+  g_list_free (evict);
+}
+
+void
+gegl_cl_mem_pool_clear (void)
+{
+  GeglClPooledMem *pooled;
+
+  g_mutex_lock (&cl_mem_pool_mutex);
+
+  while ((pooled = g_queue_pop_head (&cl_mem_pool)))
+    {
+      gegl_clReleaseMemObject (pooled->mem);
+      g_slice_free (GeglClPooledMem, pooled);
+    }
+  cl_mem_pool_bytes = 0;
+
+  g_mutex_unlock (&cl_mem_pool_mutex);
+}
+
 void
 gegl_cl_cleanup (void)
 {
   cl_int err;
+
+  gegl_cl_mem_pool_clear ();
+
   err = gegl_cl_random_cleanup ();
   if (err != CL_SUCCESS)
     GEGL_NOTE (GEGL_DEBUG_OPENCL, "Could not free cl_random_data: %s", gegl_cl_errstring (err));

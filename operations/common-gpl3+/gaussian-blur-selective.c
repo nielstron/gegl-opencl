@@ -98,7 +98,8 @@ get_invalidated_by_change (GeglOperation       *operation,
 }
 
 static gboolean
-gblur_selective (GeglBuffer          *input,
+gblur_selective (GeglOperation       *operation,
+                 GeglBuffer          *input,
                  const GeglRectangle *src_rect,
                  GeglBuffer          *aux,
                  GeglBuffer          *output,
@@ -106,7 +107,7 @@ gblur_selective (GeglBuffer          *input,
                  gdouble              radius,
                  gdouble              max_delta)
 {
-  const Babl *format = gegl_buffer_get_format (output);
+  const Babl *format = gegl_operation_get_format (operation, "output");
   gfloat *gauss;
   gfloat *src_buf;
   gfloat *delta_buf;
@@ -312,9 +313,6 @@ cl_process (GeglOperation       *operation,
 
   while (gegl_buffer_cl_iterator_next (i, &err))
     {
-      if (err)
-        return FALSE;
-
       err = cl_gblur_selective(i->tex[read],
                                i->tex[delta],
                                i->tex[0],
@@ -324,10 +322,14 @@ cl_process (GeglOperation       *operation,
                                o->max_delta);
 
       if (err)
-        return FALSE;
+        {
+          gegl_buffer_cl_iterator_stop (i);
+          return FALSE;
+        }
     }
 
-  return TRUE;
+  /* the iterator also stops on errors */
+  return ! err;
 }
 
 static gboolean
@@ -348,7 +350,7 @@ process (GeglOperation       *operation,
     if (cl_process (operation, input, aux, output, result))
       return TRUE;
 
-  success = gblur_selective (input, &compute,
+  success = gblur_selective (operation, input, &compute,
                              aux,
                              output, result,
                              o->blur_radius, o->max_delta);
