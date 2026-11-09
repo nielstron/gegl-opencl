@@ -22,6 +22,7 @@ gegl_operations_opencl_sources = [
   'gaussian-blur-selective.cl',
   'gblur-1d.cl',
   'hue-chroma.cl',
+  'image-gradient.cl',
   'invert-linear.cl',
   'levels.cl',
   'mono-mixer.cl',
