@@ -26,6 +26,7 @@ gegl_operations_opencl_sources = [
   'edge-sobel.cl',
   'edge.cl',
   'emboss.cl',
+  'fractal-trace.cl',
   'gaussian-blur-selective.cl',
   'gblur-1d.cl',
   'gblur-mem.cl',
