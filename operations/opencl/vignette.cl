@@ -1,3 +1,19 @@
+/* OpenCL devices may approximate division. Refine the Focus mask quotient
+ * because one ULP can change which pixels a lens disc covers.
+ */
+static inline float
+vignette_divide (float numerator,
+                 float denominator,
+                 bool  accurate)
+{
+  float quotient = numerator / denominator;
+
+  if (accurate && isfinite (quotient))
+    quotient += fma (-quotient, denominator, numerator) / denominator;
+
+  return quotient;
+}
+
 /* A small error in the circle distance can change the lens blur disc's
  * integer span. Keep the residual of x*x + y*y to approach the CPU's
  * double-precision hypot without requiring FP64 on the device.
@@ -54,16 +70,16 @@ vignette_strength (int   x,
       switch (shape)
         {
           case 0:
-          strength = accurate ? focus_blur_hypot ((u-midx) / scale, v-midy)
+          strength = accurate ? focus_blur_hypot (vignette_divide (u-midx, scale, true), v-midy)
                               : hypot ((u-midx) / scale, v-midy);
           break;
 
           case 1:
-          strength = fmax (fabs(u-midx)/scale, fabs(v-midy));
+          strength = fmax (vignette_divide (fabs (u-midx), scale, accurate), fabs (v-midy));
           break;
 
           case 2:
-          strength = fabs (u-midx) / scale + fabs(v-midy);
+          strength = vignette_divide (fabs (u-midx), scale, accurate) + fabs (v-midy);
           break;
 
           case 3:
@@ -71,11 +87,11 @@ vignette_strength (int   x,
           break;
 
           case 4:
-          strength = fabs (u-midx) / scale;
+          strength = vignette_divide (fabs (u-midx), scale, accurate);
           break;
         }
-      strength /= length;
-      strength = (strength-radius0) / rdiff;
+      strength = vignette_divide (strength, length, accurate);
+      strength = vignette_divide (strength-radius0, rdiff, accurate);
     }
 
   if (strength < 0.0f) strength = 0.0f;
