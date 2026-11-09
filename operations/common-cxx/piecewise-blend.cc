@@ -220,10 +220,27 @@ process (GeglOperation        *operation,
                                                              input,
                                                              result);
 
+  guint64 cache_size;
+  g_object_get (gegl_config (), "tile-cache-size", &cache_size, NULL);
+  /* Once the input levels exceed the tile cache, avoid fetching unused
+   * levels from swap. Smaller blends can use the iterator's tile pointers.
+   */
+  const gboolean use_sparse_reads = level == 0 && levels > 2 &&
+    ! g_object_get_data (G_OBJECT (output), "is-linear") &&
+    (guint64) result->width * result->height * levels *
+    babl_format_get_bytes_per_pixel (format) > cache_size;
+
   gegl_parallel_distribute_area (
     result, gegl_operation_get_pixels_per_thread (operation),
     [=] (const GeglRectangle *area)
     {
+      struct AuxTile
+      {
+        GeglBuffer *buffer;
+        gfloat     *pixels;
+        gint        capacity;
+      } aux_tiles[N_AUX_INPUTS] = {};
+
       GeglBuffer         *empty_buffer = NULL;
       GeglBufferIterator *iter;
       gfloat              v1           = 0.0f;
@@ -231,20 +248,14 @@ process (GeglOperation        *operation,
       gfloat              range_inv    = 0.0f;
       gint                i;
       gint                j            = 0;
+      gboolean            sparse_reads = use_sparse_reads;
 
-      iter = gegl_buffer_iterator_new (output, area, level, format,
-                                       GEGL_ACCESS_WRITE, GEGL_ABYSS_NONE,
-                                       2 + levels);
-
-      gegl_buffer_iterator_add (iter, input, area, level, input_format,
-                                GEGL_ACCESS_READ, GEGL_ABYSS_NONE);
-
-      for (i = 1; i <= levels; i++)
+      for (i = 0; i < levels; i++)
         {
           GeglBuffer *aux;
           gchar       aux_name[32];
 
-          snprintf (aux_name, sizeof(aux_name), "aux%d", i);
+          snprintf (aux_name, sizeof(aux_name), "aux%d", i + 1);
 
           aux = GEGL_BUFFER (gegl_operation_context_get_object (context,
                                                                 aux_name));
@@ -260,15 +271,32 @@ process (GeglOperation        *operation,
               aux = empty_buffer;
             }
 
-          gegl_buffer_iterator_add (iter, aux, area, level, format,
-                                    GEGL_ACCESS_READ, GEGL_ABYSS_NONE);
+          aux_tiles[i].buffer = aux;
+          /* Aliased reads must join the iterator before it opens a tile
+           * for writing, so the iterator can preserve the old contents.
+           */
+          if (sparse_reads && gegl_buffer_share_storage (output, aux))
+            sparse_reads = FALSE;
         }
+
+      iter = gegl_buffer_iterator_new (output, area, level, format,
+                                       GEGL_ACCESS_WRITE, GEGL_ABYSS_NONE,
+                                       sparse_reads ? 2 : 2 + levels);
+
+      gegl_buffer_iterator_add (iter, input, area, level, input_format,
+                                GEGL_ACCESS_READ, GEGL_ABYSS_NONE);
+
+      if (! sparse_reads)
+        for (i = 0; i < levels; i++)
+          gegl_buffer_iterator_add (iter, aux_tiles[i].buffer, area, level,
+                                    format, GEGL_ACCESS_READ, GEGL_ABYSS_NONE);
 
       while (gegl_buffer_iterator_next (iter))
         {
           gfloat       *out = (      gfloat *) iter->items[0].data;
           const gfloat *in  = (const gfloat *) iter->items[1].data;
           gint          i;
+          guint         loaded = 0;
 
           for (i = 0; i < iter->length; i++)
             {
@@ -307,8 +335,35 @@ process (GeglOperation        *operation,
 
               v = (v - v1) * range_inv;
 
-              aux1 = (const gfloat *) iter->items[2 + j    ].data + 4 * i;
-              aux2 = (const gfloat *) iter->items[2 + j + 1].data + 4 * i;
+              if (sparse_reads)
+                {
+                  const guint needed = 3u << j;
+
+                  if ((loaded & needed) != needed)
+                    for (gint k = j; k <= j + 1; k++)
+                      if (!(loaded & (1u << k)))
+                        {
+                          AuxTile *tile = &aux_tiles[k];
+
+                          if (tile->capacity < iter->length)
+                            {
+                              tile->capacity = iter->length;
+                              tile->pixels = g_renew (gfloat, tile->pixels,
+                                                      4 * (gsize) iter->length);
+                            }
+                          gegl_buffer_get (tile->buffer, &iter->items[0].roi,
+                                           1.0, format, tile->pixels,
+                                           GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_NONE);
+                          loaded |= 1u << k;
+                        }
+                  aux1 = aux_tiles[j].pixels     + 4 * i;
+                  aux2 = aux_tiles[j + 1].pixels + 4 * i;
+                }
+              else
+                {
+                  aux1 = (const gfloat *) iter->items[2 + j    ].data + 4 * i;
+                  aux2 = (const gfloat *) iter->items[2 + j + 1].data + 4 * i;
+                }
 
               for (c = 0; c < 4; c++)
                 out[c] = aux1[c] + v * (aux2[c] - aux1[c]);
@@ -318,6 +373,8 @@ process (GeglOperation        *operation,
             }
         }
 
+      for (i = 0; sparse_reads && i < levels; i++)
+        g_free (aux_tiles[i].pixels);
       g_clear_object (&empty_buffer);
     });
 
