@@ -17,6 +17,8 @@
 #ifndef __FOCUS_LENS_CL_H__
 #define __FOCUS_LENS_CL_H__
 
+#include <string.h>
+
 #include "opencl/gegl-cl.h"
 #include "gegl-buffer-cl-iterator.h"
 
@@ -33,6 +35,7 @@ focus_lens_cl_tile (GeglClRunData       *cl_data,
                     const FocusBlurMask *mask,
                     cl_mem              spans,
                     cl_mem              fallback,
+                    gboolean            try_opaque,
                     cl_int              iradius,
                     cl_float            radius,
                     const cl_float4    *luminance,
@@ -55,7 +58,9 @@ focus_lens_cl_tile (GeglClRunData       *cl_data,
   cl_mem                disc = NULL;
   cl_mem                delta = NULL;
   cl_mem                delta_w = NULL;
-  cl_kernel             prepare = cl_data->kernel[fallback ? 2 : 0];
+  cl_mem                opacity = NULL;
+  gboolean              opaque = FALSE;
+  cl_kernel             prepare, blur;
   cl_int                strip_width = CLAMP (2 * iradius, 64, 256);
   const GeglRectangle  *src_rect;
   cl_int4               source;
@@ -76,18 +81,52 @@ focus_lens_cl_tile (GeglClRunData       *cl_data,
 
   src_rect = &iter->roi[read];
 
+  if (try_opaque)
+    {
+      cl_int    count = iter->size[read];
+      size_t    checks = (count + 63) / 64;
+      guchar   *flags = g_alloca (checks);
+      cl_kernel check = cl_data->kernel[3];
+
+      opacity = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE, checks, &cl_err);
+      CL_CHECK;
+
+      cl_err = gegl_cl_set_kernel_args (check,
+                                        sizeof (cl_mem), &iter->tex[read],
+                                        sizeof (cl_mem), &opacity,
+                                        sizeof (cl_int), &count,
+                                        NULL);
+      CL_CHECK;
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            check, 1, NULL, &checks, NULL,
+                                            0, NULL, NULL);
+      CL_CHECK;
+      cl_err = gegl_clEnqueueReadBuffer (gegl_cl_get_command_queue (),
+                                         opacity, CL_TRUE, 0, checks, flags,
+                                         0, NULL, NULL);
+      CL_CHECK;
+
+      opaque = memchr (flags, 1, checks) == NULL;
+    }
+
+  prepare = cl_data->kernel[opaque ? 4 : fallback ? 2 : 0];
+  blur    = cl_data->kernel[opaque ? 5 : 1];
+
   pixels = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
                                  iter->size[read] * sizeof (cl_float4), &cl_err);
   CL_CHECK;
   disc = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
-                               iter->size[read] * sizeof (cl_float2), &cl_err);
+                               iter->size[read] * (opaque ? sizeof (cl_float) : sizeof (cl_float2)), &cl_err);
   CL_CHECK;
   delta = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
-                                2 * iter->size[0] * sizeof (cl_float4), &cl_err);
+                                (opaque ? 1 : 2) * iter->size[0] * sizeof (cl_float4), &cl_err);
   CL_CHECK;
-  delta_w = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
-                                  iter->size[0] * sizeof (cl_float4), &cl_err);
-  CL_CHECK;
+  if (!opaque)
+    {
+      delta_w = gegl_cl_mem_pool_get (CL_MEM_READ_WRITE,
+                                      iter->size[0] * sizeof (cl_float4), &cl_err);
+      CL_CHECK;
+    }
 
   if (!focus_blur_mask_enqueue (mask, src_rect, iter->tex[aux]))
     goto error;
@@ -95,18 +134,27 @@ focus_lens_cl_tile (GeglClRunData       *cl_data,
   global_ws[0] = src_rect->width;
   global_ws[1] = src_rect->height;
 
-  cl_err = gegl_cl_set_kernel_args (prepare,
-                                    sizeof (cl_mem),    &iter->tex[read],
-                                    sizeof (cl_mem),    &iter->tex[aux],
-                                    sizeof (cl_mem),    &pixels,
-                                    sizeof (cl_mem),    &disc,
-                                    sizeof (cl_float),  &radius,
-                                    sizeof (cl_float4), luminance,
-                                    sizeof (cl_float),  &threshold_low,
-                                    sizeof (cl_float),  &threshold_high,
-                                    sizeof (cl_float),  &factor,
-                                    sizeof (cl_float),  &highlight_max,
-                                    NULL);
+  if (opaque)
+    cl_err = gegl_cl_set_kernel_args (prepare,
+                                     sizeof (cl_mem),   &iter->tex[read],
+                                     sizeof (cl_mem),   &iter->tex[aux],
+                                     sizeof (cl_mem),   &pixels,
+                                     sizeof (cl_mem),   &disc,
+                                     sizeof (cl_float), &radius,
+                                     NULL);
+  else
+    cl_err = gegl_cl_set_kernel_args (prepare,
+                                      sizeof (cl_mem),    &iter->tex[read],
+                                      sizeof (cl_mem),    &iter->tex[aux],
+                                      sizeof (cl_mem),    &pixels,
+                                      sizeof (cl_mem),    &disc,
+                                      sizeof (cl_float),  &radius,
+                                      sizeof (cl_float4), luminance,
+                                      sizeof (cl_float),  &threshold_low,
+                                      sizeof (cl_float),  &threshold_high,
+                                      sizeof (cl_float),  &factor,
+                                      sizeof (cl_float),  &highlight_max,
+                                      NULL);
   CL_CHECK;
 
   if (fallback)
@@ -140,11 +188,10 @@ focus_lens_cl_tile (GeglClRunData       *cl_data,
   global_ws[0] = tile->height;
   global_ws[1] = (tile->width + strip_width - 1) / strip_width;
 
-  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[1],
+  cl_err = gegl_cl_set_kernel_args (blur,
                                     sizeof (cl_mem),  &pixels,
                                     sizeof (cl_mem),  &disc,
                                     sizeof (cl_mem),  &delta,
-                                    sizeof (cl_mem),  &delta_w,
                                     sizeof (cl_mem),  &iter->tex[0],
                                     sizeof (cl_mem),  &spans,
                                     sizeof (cl_int4), &source,
@@ -154,8 +201,14 @@ focus_lens_cl_tile (GeglClRunData       *cl_data,
                                     NULL);
   CL_CHECK;
 
+  if (!opaque)
+    {
+      cl_err = gegl_clSetKernelArg (blur, 9, sizeof (cl_mem), &delta_w);
+      CL_CHECK;
+    }
+
   cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                        cl_data->kernel[1], 2,
+                                        blur, 2,
                                         NULL, global_ws, NULL, 0, NULL, NULL);
   CL_CHECK;
 
@@ -167,6 +220,7 @@ error:
   failed = TRUE;
 
 cleanup:
+  gegl_cl_mem_pool_put (opacity);
   gegl_cl_mem_pool_put (delta_w);
   gegl_cl_mem_pool_put (delta);
   gegl_cl_mem_pool_put (disc);
@@ -207,6 +261,8 @@ focus_lens_cl_process (GeglBuffer          *input,
   cl_int                cl_err;
   const Babl           *source_format = gegl_buffer_get_format (input);
   gboolean              check = babl_format_is_palette (source_format);
+  const gboolean        try_opaque = radius <= 32.0f && factor == 0.0f &&
+    source_format == babl_format ("R'G'B'A u8");
   gboolean              success = TRUE;
   gint                  x, y, r;
 
@@ -222,10 +278,20 @@ focus_lens_cl_process (GeglBuffer          *input,
   if (!cl_data)
     {
       const char *kernels[] = { "focus_lens_prepare", "focus_lens_disc",
-                                "focus_lens_prepare_checked", NULL };
+                                "focus_lens_prepare_checked", "focus_lens_check_opacity",
+                                "focus_lens_prepare_opaque", "focus_lens_disc_opaque",
+                                NULL };
 
+#if defined (__aarch64__) || defined (__FMA__)
+      gchar *source = g_strconcat ("#define FOCUS_LENS_USE_FMA 1\n",
+                                   focus_lens_blur_cl_source, NULL);
+
+      cl_data = gegl_cl_compile_and_build_optimized (source, kernels);
+      g_free (source);
+#else
       cl_data = gegl_cl_compile_and_build_optimized (focus_lens_blur_cl_source,
                                                      kernels);
+#endif
     }
 
   if (!cl_data)
@@ -277,7 +343,7 @@ focus_lens_cl_process (GeglBuffer          *input,
                               MIN (tile_height, result->height - y)};
 
         success = focus_lens_cl_tile (cl_data, input, output, extent, &tile,
-                                      format, mask, spans_tex, fallback,
+                                      format, mask, spans_tex, fallback, try_opaque,
                                       iradius, radius, &luminance, low, high,
                                       factor, highlight_max);
       }
