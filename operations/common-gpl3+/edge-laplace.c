@@ -279,117 +279,78 @@ edge_laplace (GeglBuffer          *src,
 
 #include "opencl/edge-laplace.cl.h"
 
-static GeglClRunData *cl_data = NULL;
-
-static gboolean
-cl_edge_laplace (cl_mem                in_tex,
-                 cl_mem                aux_tex,
-                 cl_mem                out_tex,
-                 const GeglRectangle  *src_rect,
-                 const GeglRectangle  *roi,
-                 gint                  radius)
-{
-  cl_int cl_err = 0;
-  size_t global_ws_in[2];
-  size_t global_ws_aux[2];
-
-  if (!cl_data)
-    {
-      const char *kernel_name[] = {"pre_edgelaplace", "knl_edgelaplace", NULL};
-      cl_data = gegl_cl_compile_and_build (edge_laplace_cl_source, kernel_name);
-    }
-  if (!cl_data) return TRUE;
-
-  global_ws_in[0] = roi->width  + LAPLACE_RADIUS;
-  global_ws_in[1] = roi->height + LAPLACE_RADIUS;
-
-  global_ws_aux[0] = roi->width;
-  global_ws_aux[1] = roi->height;
-
-  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
-                                    sizeof (cl_mem), &in_tex,
-                                    sizeof (cl_mem), &aux_tex,
-                                    NULL);
-  CL_CHECK;
-
-  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                        cl_data->kernel[0], 2,
-                                        NULL, global_ws_in, NULL,
-                                        0, NULL, NULL);
-  CL_CHECK;
-
-
-  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[1],
-                                    sizeof (cl_mem), &aux_tex,
-                                    sizeof (cl_mem), &out_tex,
-                                    NULL);
-  CL_CHECK;
-
-  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                        cl_data->kernel[1], 2,
-                                        NULL, global_ws_aux, NULL,
-                                        0, NULL, NULL);
-  CL_CHECK;
-
-  return FALSE;
-
- error:
-  return TRUE;
-}
-
 static gboolean
 cl_process (GeglOperation       *operation,
             GeglBuffer          *input,
             GeglBuffer          *output,
             const GeglRectangle *result)
 {
+  static GeglClRunData *cl_data;
   const Babl *in_format  = gegl_operation_get_format (operation, "input");
   const Babl *out_format = gegl_operation_get_format (operation, "output");
-  gint err = 0;
-
   GeglOperationAreaFilter *op_area = GEGL_OPERATION_AREA_FILTER (operation);
+  GeglBufferClIterator *iter;
+  size_t local_ws[] = { 16, 8 };
+  size_t tile_bytes;
+  gboolean err;
+  cl_int cl_err;
+  gint read;
 
-  GeglBufferClIterator *i = gegl_buffer_cl_iterator_new (output,
-                                                         result,
-                                                         out_format,
-                                                         GEGL_CL_BUFFER_WRITE);
-
-  gint read = gegl_buffer_cl_iterator_add_2 (i,
-                                             input,
-                                             result,
-                                             in_format,
-                                             GEGL_CL_BUFFER_READ,
-                                             op_area->left,
-                                             op_area->right,
-                                             op_area->top,
-                                             op_area->bottom,
-                                             GEGL_ABYSS_CLAMP);
-
-  gint aux = gegl_buffer_cl_iterator_add_aux (i,
-                                              result,
-                                              in_format,
-                                              op_area->left   - 1,
-                                              op_area->right  - 1,
-                                              op_area->top    - 1,
-                                              op_area->bottom - 1);
-
-  while (gegl_buffer_cl_iterator_next (i, &err) && !err)
+  if (!cl_data)
     {
-      err = cl_edge_laplace (i->tex[read],
-                             i->tex[aux],
-                             i->tex[0],
-                             &i->roi[read],
-                             &i->roi[0],
-                             LAPLACE_RADIUS);
+      const char *kernels[] = { "edge_laplace", NULL };
+      cl_data = gegl_cl_compile_and_build (edge_laplace_cl_source, kernels);
+    }
+  if (!cl_data || cl_data->work_group_size[0] == 0)
+    return FALSE;
 
-      if (err)
-        {
-          gegl_buffer_cl_iterator_stop (i);
-          break;
-        }
+  while (local_ws[0] * local_ws[1] > cl_data->work_group_size[0])
+    {
+      if (local_ws[0] > local_ws[1])
+        local_ws[0] /= 2;
+      else
+        local_ws[1] /= 2;
+    }
+  tile_bytes = (local_ws[0] + 2) * (local_ws[1] + 2) * sizeof (cl_float4);
+  if (tile_bytes > gegl_cl_get_local_mem_size ())
+    return FALSE;
+
+  iter = gegl_buffer_cl_iterator_new (output, result, out_format, GEGL_CL_BUFFER_WRITE);
+  read = gegl_buffer_cl_iterator_add_2 (iter, input, result, in_format,
+                                        GEGL_CL_BUFFER_READ,
+                                        op_area->left, op_area->right,
+                                        op_area->top, op_area->bottom,
+                                        GEGL_ABYSS_CLAMP);
+
+  while (gegl_buffer_cl_iterator_next (iter, &err))
+    {
+      const cl_int width = iter->roi[0].width;
+      const cl_int height = iter->roi[0].height;
+      const size_t global_ws[] = {
+        ((size_t) width  + local_ws[0] - 1) / local_ws[0] * local_ws[0],
+        ((size_t) height + local_ws[1] - 1) / local_ws[1] * local_ws[1]
+      };
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem), &iter->tex[read],
+                                        sizeof (cl_mem), &iter->tex[0],
+                                        sizeof (cl_int), &width,
+                                        sizeof (cl_int), &height,
+                                        tile_bytes, NULL,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2, NULL,
+                                            global_ws, local_ws, 0, NULL, NULL);
+      CL_CHECK;
     }
 
   return !err;
+
+error:
+  gegl_buffer_cl_iterator_stop (iter);
+  return FALSE;
 }
 
 static void
