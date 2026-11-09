@@ -60,6 +60,7 @@ gegl_operations_opencl_sources = [
   'random.cl',
   'red-eye-removal.cl',
   'ripple.cl',
+  'saturation.cl',
   'sepia.cl',
   'shadows-highlights-correction.cl',
   'snn-mean.cl',
