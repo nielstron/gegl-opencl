@@ -37,8 +37,10 @@ divide (float a, float b, bool precise)
 static float3
 rgb_to_hsv (float3 rgb, bool precise)
 {
-  const float v = max (max (rgb.x, rgb.y), rgb.z);
-  const float delta = v - min (min (rgb.x, rgb.y), rgb.z);
+  const float max_rg = rgb.x > rgb.y ? rgb.x : rgb.y;
+  const float min_rg = rgb.x < rgb.y ? rgb.x : rgb.y;
+  const float v = max_rg > rgb.z ? max_rg : rgb.z;
+  const float delta = v - (min_rg < rgb.z ? min_rg : rgb.z);
   float h = 0.0f;
   float s = 0.0f;
 
@@ -64,7 +66,7 @@ rgb_to_hsv (float3 rgb, bool precise)
 }
 
 static float3
-hsv_to_rgb (float3 hsv)
+hsv_to_rgb (float3 hsv, float3 input)
 {
   const float s = hsv.y;
   const float v = hsv.z;
@@ -75,6 +77,9 @@ hsv_to_rgb (float3 hsv)
 
   if (h >= 6.0f)
     h -= 6.0f;
+
+  if (!(h > -1.0f && h < 6.0f))
+    return input;
 
   const int sector = (int) h;
   const float frac = h - sector;
@@ -93,16 +98,13 @@ hsv_to_rgb (float3 hsv)
     }
 }
 
-__kernel void
-gegl_color_rotate (__global const float4 *in,
-                   __global       float4 *out,
-                   float4                 angles,
-                   float2                 wrapped_range,
-                   float4                 gray,
-                   int                    gray_mode)
+static inline float4
+rotate_pixel (float4 pixel,
+              float4 angles,
+              float2 wrapped_range,
+              float4 gray,
+              int    gray_mode)
 {
-  const size_t i = get_global_id (0);
-  const float4 pixel = in[i];
   float3 hsv = rgb_to_hsv (pixel.xyz, false);
   float hue = fma (hsv.x, TWO_PI_HI, hsv.x * TWO_PI_LO);
   const float lo = min (angles.x, angles.y);
@@ -148,5 +150,46 @@ gegl_color_rotate (__global const float4 *in,
       hsv.x = hue / TWO_PI_HI;
     }
 
-  out[i] = (float4) (hsv_to_rgb (hsv), pixel.w);
+  return (float4) (hsv_to_rgb (hsv, pixel.xyz), pixel.w);
+}
+
+__kernel void
+gegl_color_rotate (__global const float4 *in,
+                   __global       float4 *out,
+                   float4                 angles,
+                   float2                 wrapped_range,
+                   float4                 gray,
+                   int                    gray_mode)
+{
+  const size_t i = get_global_id (0);
+  out[i] = rotate_pixel (in[i], angles, wrapped_range, gray, gray_mode);
+}
+
+__kernel void
+gegl_color_rotate_checked (__global const float4 *in,
+                           __global       float4 *out,
+                           float4                 angles,
+                           float2                 wrapped_range,
+                           float4                 gray,
+                           int                    gray_mode,
+                           volatile __global int *fallback)
+{
+  const size_t i = get_global_id (0);
+  const float4 pixel = in[i];
+
+  /* Keep the CPU's non-finite behavior, including its output conversion. */
+  if (!all (isfinite (pixel)))
+    {
+      atomic_or (fallback, 1);
+      return;
+    }
+
+  const float4 result = rotate_pixel (pixel, angles, wrapped_range, gray, gray_mode);
+  if (!all (isfinite (result)))
+    {
+      atomic_or (fallback, 1);
+      return;
+    }
+
+  out[i] = result;
 }
