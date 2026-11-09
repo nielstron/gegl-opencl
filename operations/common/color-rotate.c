@@ -424,12 +424,25 @@ cl_process (GeglOperation       *operation,
             gint                 level)
 {
   static GeglClRunData *cl_data;
-  const gchar *kernels[] = { "gegl_color_rotate", NULL };
+  const gchar *kernels[] = { "gegl_color_rotate", "gegl_color_rotate_checked", NULL };
   GeglProperties *o = GEGL_PROPERTIES (operation);
+  GeglNode *source = gegl_operation_get_source_node (operation, "input");
+  const Babl *format = gegl_operation_get_source_format (operation, "input");
+  /* A direct byte buffer source cannot provide non-finite pixels. Other
+   * sources can also pass through a buffer of a different format.
+   */
+  gboolean check = !source ||
+                   g_strcmp0 (gegl_node_get_operation (source), "gegl:buffer-source") ||
+                   (format != babl_format ("R'G'B'A u8") &&
+                    format != babl_format ("R'G'B' u8"));
+  cl_command_queue queue = gegl_cl_get_command_queue ();
+  cl_kernel kernel;
+  cl_mem cl_fallback = NULL;
   cl_float4 angles;
   cl_float2 wrapped_range;
   cl_float4 gray;
   cl_int gray_mode;
+  cl_int fallback = 0;
   cl_int cl_err;
 
   if (level != 0)
@@ -461,7 +474,18 @@ cl_process (GeglOperation       *operation,
   if (!cl_data)
     return TRUE;
 
-  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+  kernel = cl_data->kernel[check];
+  if (check)
+    {
+      cl_fallback = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                         CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                         sizeof (fallback), &fallback, &cl_err);
+      CL_CHECK;
+      cl_err = gegl_clSetKernelArg (kernel, 6, sizeof (cl_fallback), &cl_fallback);
+      CL_CHECK;
+    }
+
+  cl_err = gegl_cl_set_kernel_args (kernel,
                                     sizeof (in), &in,
                                     sizeof (out), &out,
                                     sizeof (angles), &angles,
@@ -470,13 +494,24 @@ cl_process (GeglOperation       *operation,
                                     sizeof (gray_mode), &gray_mode,
                                     NULL);
   CL_CHECK;
-  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
-                                       cl_data->kernel[0], 1,
+  cl_err = gegl_clEnqueueNDRangeKernel (queue, kernel, 1,
                                        NULL, &n_pixels, NULL, 0, NULL, NULL);
   CL_CHECK;
-  return FALSE;
+
+  if (check)
+    {
+      cl_err = gegl_clEnqueueReadBuffer (queue, cl_fallback, CL_TRUE, 0,
+                                         sizeof (fallback), &fallback,
+                                         0, NULL, NULL);
+      CL_CHECK;
+      gegl_clReleaseMemObject (cl_fallback);
+    }
+
+  return fallback != 0;
 
 error:
+  if (cl_fallback)
+    gegl_clReleaseMemObject (cl_fallback);
   return TRUE;
 }
 
