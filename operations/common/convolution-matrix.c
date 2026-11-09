@@ -576,7 +576,10 @@ process (GeglOperation       *operation,
     for (y = 0; y < matrix_size; y++)
       matrixsum += fabsf (matrix[x][y]);
 
+  /* Large gains can amplify rounding differences in the dot product:
+   * the CPU compiler may contract the multiply-adds and OpenCL does not. */
   if (level == 0 && o->divisor != 0.0 &&
+      matrixsum * fabsf (inv_divisor) <= 64.0f &&
       gegl_operation_use_opencl (operation) &&
       cl_process (input, output, result, format, o, matrix, matrix_size,
                   matrixsum, inv_divisor, offset))
