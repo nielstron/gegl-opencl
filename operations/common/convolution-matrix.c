@@ -76,6 +76,9 @@ property_enum (border, _("Border"),
 
 #include "gegl-op.h"
 #include <stdio.h>
+#include "gegl-buffer-cl-iterator.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/convolution-matrix.cl.h"
 
 #define MAX_MATRIX_SIZE 5
 
@@ -458,6 +461,88 @@ convolve_pixel_alpha_weight_componentwise (GeglProperties       *o,
 }
 
 static gboolean
+cl_process (GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *result,
+            const Babl          *format,
+            GeglProperties      *o,
+            gfloat               matrix[MAX_MATRIX_SIZE][MAX_MATRIX_SIZE],
+            cl_int               matrix_size,
+            cl_float             matrixsum,
+            cl_float             inv_divisor,
+            cl_float             offset)
+{
+  static GeglClRunData *cl_data;
+  GeglBufferClIterator *iter;
+  cl_float coefficients[MAX_MATRIX_SIZE * MAX_MATRIX_SIZE];
+  cl_int alpha_weight = o->alpha_weight;
+  cl_int channels = (o->red   ? 1 : 0) | (o->green ? 2 : 0) |
+                    (o->blue  ? 4 : 0) | (o->alpha ? 8 : 0);
+  gint radius = matrix_size / 2;
+  gboolean err;
+  cl_int cl_err;
+  cl_mem cl_matrix;
+  gint read;
+
+  if (!cl_data)
+    {
+      const char *kernels[] = { "convolution_matrix", NULL };
+      cl_data = gegl_cl_compile_and_build (convolution_matrix_cl_source, kernels);
+    }
+  if (!cl_data)
+    return FALSE;
+
+  /* The CPU indexes matrix[x][y] in source row order. */
+  for (gint y = 0; y < matrix_size; y++)
+    for (gint x = 0; x < matrix_size; x++)
+      coefficients[y * matrix_size + x] = matrix[x][y];
+
+  cl_matrix = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                    matrix_size * matrix_size * sizeof (cl_float),
+                                    coefficients, &cl_err);
+  if (cl_err != CL_SUCCESS)
+    return FALSE;
+
+  iter = gegl_buffer_cl_iterator_new (output, result, format, GEGL_CL_BUFFER_WRITE);
+  read = gegl_buffer_cl_iterator_add_2 (iter, input, result, format,
+                                        GEGL_CL_BUFFER_READ,
+                                        radius, radius, radius, radius,
+                                        o->border);
+
+  while (gegl_buffer_cl_iterator_next (iter, &err))
+    {
+      const size_t global_ws[] = { iter->roi[0].width, iter->roi[0].height };
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem),   &iter->tex[read],
+                                        sizeof (cl_mem),   &iter->tex[0],
+                                        sizeof (cl_mem),   &cl_matrix,
+                                        sizeof (cl_int),   &matrix_size,
+                                        sizeof (cl_float), &matrixsum,
+                                        sizeof (cl_float), &inv_divisor,
+                                        sizeof (cl_float), &offset,
+                                        sizeof (cl_int),   &alpha_weight,
+                                        sizeof (cl_int),   &channels,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2, NULL,
+                                            global_ws, NULL, 0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  gegl_clReleaseMemObject (cl_matrix);
+  return !err;
+
+error:
+  gegl_buffer_cl_iterator_stop (iter);
+  gegl_clReleaseMemObject (cl_matrix);
+  return FALSE;
+}
+
+static gboolean
 process (GeglOperation       *operation,
          GeglBuffer          *input,
          GeglBuffer          *output,
@@ -490,6 +575,12 @@ process (GeglOperation       *operation,
   for (x = 0; x < matrix_size; x++)
     for (y = 0; y < matrix_size; y++)
       matrixsum += fabsf (matrix[x][y]);
+
+  if (level == 0 && o->divisor != 0.0 &&
+      gegl_operation_use_opencl (operation) &&
+      cl_process (input, output, result, format, o, matrix, matrix_size,
+                  matrixsum, inv_divisor, offset))
+    return TRUE;
 
   rect.x      = result->x - op_area->left;
   rect.width  = result->width + op_area->left + op_area->right;
@@ -625,6 +716,7 @@ gegl_op_class_init (GeglOpClass *klass)
   filter_class->process                    = process;
   operation_class->prepare                 = prepare;
   operation_class->get_bounding_box        = get_bounding_box;
+  operation_class->opencl_support          = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "categories",  "generic",
