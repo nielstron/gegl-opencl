@@ -17,6 +17,7 @@ gegl_operations_opencl_sources = [
   'colors.cl',
   'contrast-curve.cl',
   'diffraction-patterns.cl',
+  'domain-transform.cl',
   'edge-laplace.cl',
   'edge-sobel.cl',
   'gaussian-blur-selective.cl',
