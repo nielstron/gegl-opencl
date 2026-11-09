@@ -37,6 +37,7 @@ gegl_operations_opencl_sources = [
   'invert-linear.cl',
   'lens-blur.cl',
   'lens-distortion.cl',
+  'lens-flare.cl',
   'levels.cl',
   'mean-curvature-blur.cl',
   'median-blur.cl',
