@@ -88,6 +88,17 @@ thread_process (const GeglRectangle *area,
 }
 
 static gboolean
+gegl_operation_point_composer_use_opencl (GeglOperation *operation)
+{
+  GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
+  GeglOperationPointComposerClass *point_composer_class = GEGL_OPERATION_POINT_COMPOSER_GET_CLASS (operation);
+
+  return gegl_operation_use_opencl (operation) &&
+         (g_atomic_pointer_get (&operation_class->cl_data) ||
+          point_composer_class->cl_process);
+}
+
+static gboolean
 gegl_operation_composer_process (GeglOperation        *operation,
                                  GeglOperationContext *context,
                                  const gchar          *output_prop,
@@ -123,10 +134,15 @@ gegl_operation_composer_process (GeglOperation        *operation,
   }
 
   input  = (GeglBuffer*) gegl_operation_context_dup_object (context, "input");
-  output = gegl_operation_context_get_output_maybe_in_place (operation,
-                                                             context,
-                                                             input,
-                                                             result);
+  /* The GPU iterator can publish a chunk before a later chunk fails.
+   * Preserve the input for the CPU retry of the whole result. */
+  if (gegl_operation_point_composer_use_opencl (operation))
+    output = gegl_operation_context_get_target (context, "output");
+  else
+    output = gegl_operation_context_get_output_maybe_in_place (operation,
+                                                               context,
+                                                               input,
+                                                               result);
 
   aux   = (GeglBuffer*) gegl_operation_context_dup_object (context, "aux");
 
@@ -290,7 +306,6 @@ gegl_operation_point_composer_process (GeglOperation       *operation,
                                        const GeglRectangle *result,
                                        gint                 level)
 {
-  GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
   GeglOperationPointComposerClass *point_composer_class = GEGL_OPERATION_POINT_COMPOSER_GET_CLASS (operation);
   const Babl *in_format   = gegl_operation_get_format (operation, "input");
   const Babl *aux_format  = gegl_operation_get_format (operation, "aux");
@@ -299,8 +314,7 @@ gegl_operation_point_composer_process (GeglOperation       *operation,
 
   if ((result->width > 0) && (result->height > 0))
     {
-      if (gegl_operation_use_opencl (operation) &&
-          (g_atomic_pointer_get (&operation_class->cl_data) || point_composer_class->cl_process))
+      if (gegl_operation_point_composer_use_opencl (operation))
         {
           if (gegl_operation_point_composer_cl_process (operation, input, aux, output, result, level))
               return TRUE;

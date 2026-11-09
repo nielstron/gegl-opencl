@@ -68,6 +68,18 @@ foreach _test : opencl_tests
     )
 endforeach
 
+test('point-filter-fallback',
+  executable('test-opencl-point-fallback',
+    'test-opencl-point-fallback.c',
+    include_directories: gegl_test_includes,
+    dependencies: gegl_test_deps,
+    link_with: gegl_lib,
+  ),
+  env: gegl_test_env,
+  suite: 'opencl',
+  is_parallel: gegl_test_parallel,
+)
+
 # Exercise the actual kernel with deterministic sample tables. This isolates
 # projection math from c2g's stochastic CPU/GPU sampling sequences.
 if host_machine.system() == 'darwin'
