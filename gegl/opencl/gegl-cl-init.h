@@ -84,6 +84,8 @@ typedef struct
 
 GeglClRunData *   gegl_cl_compile_and_build (const char *program_source,
                                              const char *kernel_name[]);
+GeglClRunData *   gegl_cl_compile_and_build_optimized (const char *program_source,
+                                                       const char *kernel_name[]);
 
 #define GEGL_CL_CHUNK_SIZE 1024 * 1024
 

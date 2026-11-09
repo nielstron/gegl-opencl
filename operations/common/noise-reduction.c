@@ -184,7 +184,8 @@ cl_noise_reduction (cl_mem                in_tex,
   if (!cl_data)
     {
       const char *kernel_name[] ={"noise_reduction_cl","transfer", NULL};
-      cl_data = gegl_cl_compile_and_build(noise_reduction_cl_source, kernel_name);
+      cl_data = gegl_cl_compile_and_build_optimized (noise_reduction_cl_source,
+                                                     kernel_name);
     }
   if (!cl_data)  return TRUE;
 
