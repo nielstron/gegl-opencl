@@ -45,6 +45,8 @@ property_enum (colorspace, _("Interpolation Color Space"),
 #define GEGL_OP_C_SOURCE saturation.c
 
 #include "gegl-op.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/saturation.cl.h"
 
 typedef void (*ProcessFunc) (GeglOperation       *operation,
                              void                *in_buf,
@@ -182,6 +184,19 @@ process_cie_yuv_alpha (GeglOperation       *operation,
 }
 
 static void
+get_rgb_luminance (GeglOperation *operation,
+                   gfloat        *coefficients)
+{
+  const Babl *space = gegl_operation_get_source_space (operation, "input");
+  gdouble luminance[3];
+
+  babl_space_get_rgb_luminance (space,
+                              &luminance[0], &luminance[1], &luminance[2]);
+  for (gint c = 0; c < 3; c++)
+    coefficients[c] = luminance[c];
+}
+
+static void
 process_rgb_alpha (GeglOperation       *operation,
                    void                *in_buf,
                    void                *out_buf,
@@ -190,19 +205,14 @@ process_rgb_alpha (GeglOperation       *operation,
                    gint                 level)
 {
   GeglProperties *o = GEGL_PROPERTIES (operation);
-  const Babl *space = gegl_operation_get_source_space (operation, "input");
   gfloat *in = in_buf;
   gfloat *out = out_buf;
   glong i;
   float scale = o->scale;
   float rscale = 1.0f - o->scale;
-  double luminance[3];
   float luminance_f[3];
 
-  babl_space_get_rgb_luminance (space,
-    &luminance[0], &luminance[1], &luminance[2]);
-  for (int c = 0; c < 3; c ++)
-    luminance_f[c] = luminance[c];
+  get_rgb_luminance (operation, luminance_f);
 
   for (i = 0; i < n_pixels; i++)
     {
@@ -366,6 +376,49 @@ process (GeglOperation       *operation,
   return TRUE;
 }
 
+static gboolean
+cl_process (GeglOperation       *operation,
+            cl_mem               in,
+            cl_mem               out,
+            size_t               n_pixels,
+            const GeglRectangle *roi,
+            gint                 level)
+{
+  static GeglClRunData *cl_data;
+  const gchar *kernels[] = { "gegl_saturation", NULL };
+  GeglProperties *o = GEGL_PROPERTIES (operation);
+  gfloat luminance[4] = { 0 };
+  cl_float scale = o->scale;
+  cl_float rscale = 1.0 - o->scale;
+  cl_int cl_err;
+
+  if (level != 0 || (ProcessFunc) o->user_data != process_rgb_alpha)
+    return TRUE;
+
+  if (!cl_data)
+    cl_data = gegl_cl_compile_and_build (saturation_cl_source, kernels);
+  if (!cl_data)
+    return TRUE;
+
+  get_rgb_luminance (operation, luminance);
+  cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                    sizeof (in), &in,
+                                    sizeof (out), &out,
+                                    sizeof (luminance), luminance,
+                                    sizeof (scale), &scale,
+                                    sizeof (rscale), &rscale,
+                                    NULL);
+  CL_CHECK;
+  cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                       cl_data->kernel[0], 1,
+                                       NULL, &n_pixels, NULL, 0, NULL, NULL);
+  CL_CHECK;
+  return FALSE;
+
+error:
+  return TRUE;
+}
+
 static void
 gegl_op_class_init (GeglOpClass *klass)
 {
@@ -395,9 +448,10 @@ gegl_op_class_init (GeglOpClass *klass)
   point_filter_class = GEGL_OPERATION_POINT_FILTER_CLASS (klass);
 
   operation_class->prepare = prepare;
-  operation_class->opencl_support = FALSE;
+  operation_class->opencl_support = TRUE;
 
   point_filter_class->process = process;
+  point_filter_class->cl_process = cl_process;
 
   gegl_operation_class_set_keys (operation_class,
     "name"       , "gegl:saturation",
