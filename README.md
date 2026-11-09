@@ -29,6 +29,8 @@ Most branches sit directly on GNOME master. These sit on other branches:
 - `perf/edge-sobel-opencl` sits on `fix/edge-sobel-opencl`.
 - `perf/high-pass-opencl` sits on a merge of `perf/opencl-transfer` and
   `opencl/gblur-1d-iir`.
+- `opencl/focus-blur` sits on a merge of `fix/opencl-concurrent-dispatch`,
+  `perf/high-pass-opencl`, and `perf/piecewise-blend-swap`.
 
 `fix/contrast-curve-opencl` is published but not merged. Its kernel was already
 correct, and it is not faster.
@@ -148,6 +150,49 @@ and larger images gain more.
 | `hue-chroma` | upstream | 156 ms | 173 ms | 0.9× | 0 / 0.0 |
 | `color-to-alpha` | upstream | 75 ms | 106 ms | 0.7× | 0 / 0.0 |
 
+### Additional ports and fixes at 6 MP
+
+These native GEGL runs used 3000×2000 images in `R'G'B'A u8` on the same
+Pixel, with two CPU threads. Times include GEGL's pixel transfers and
+exclude Brushkin's copies. Speedups use the current CPU implementation,
+including the 8-bit CPU fast path for `invert-gamma`.
+
+| Filter | Branch | CPU | OpenCL | Speedup |
+|---|---|---:|---:|---:|
+| Lens Flare | `opencl/lens-flare` | 1054 ms | 43 ms | 24.3× |
+| Image Gradient | `opencl/image-gradient` | 496 ms | 20 ms | 24.7× |
+| Color Rotate | `opencl/color-rotate` | 667 ms | 36 ms | 18.4× |
+| Sepia | `opencl/sepia` | 653 ms | 37 ms | 17.7× |
+| Noise Reduction, 4 iterations | `perf/noise-reduction-opencl` | 1919 ms | 141 ms | 13.6× |
+| Convolution Matrix, sharpen | `opencl/convolution-matrix` | 525 ms | 45 ms | 11.8× |
+| Edge | `opencl/edge` | 335 ms | 40 ms | 8.4× |
+| Saturation, 1.5 | `opencl/saturation` | 334 ms | 40 ms | 8.3× |
+| Supernova, seed 42 | `opencl/supernova` | 287 ms | 47 ms | 6.1× |
+| Edge Laplace | `perf/edge-laplace-opencl` | 224 ms | 47 ms | 4.8× |
+| Fractal Trace | `opencl/fractal-trace` | 22304 ms | 4813 ms | 4.6× |
+| Denoise DCT | `opencl/denoise-dct` | 15104 ms | 3483 ms | 4.3× |
+| Invert Gamma | `opencl/invert-gamma` | 46 ms | 14 ms | 3.3× |
+| Focus Blur, Gaussian | `opencl/focus-blur` | 4476 ms | 1496 ms | 3.0× |
+| Bevel | `fix/bevel-opencl-light-map` | 5457 ms | 2027 ms | 2.7× |
+| Domain Transform | `opencl/domain-transform` | 924 ms | 642 ms | 1.4× |
+| Focus Blur, Lens | `opencl/focus-blur` | 2197 ms | 2746 ms | 0.8× |
+
+Focus Blur generates the mask and finishes either blur mode on the GPU at
+full resolution. Gaussian blends each level as soon as it finishes, reusing
+the device buffers and avoiding the CPU graph's large stack of intermediate
+images. Lens accumulates each source pixel's variable-radius disc and applies
+highlight weights on the device. On the M3 Max, both paths were faster than
+CPU at 6 MP. On the Pixel, Lens took about 25% longer than CPU at its default
+radius and ran at about the same speed at radius 11 with highlights enabled.
+
+The 6 MP Gaussian alpha fixture differed by at most one code per stored
+8-bit channel. Four channels reached 1.007843 codes after weighting the
+rounded RGB and alpha values. The premultiplied float render differed by
+less than 0.00032 on the 0–255 scale. Mipmap renders, infinite sources,
+unsupported formats and failed GPU renders use the CPU graph. Gaussian's
+full-resolution working buffers use about 481 MiB of device memory at 6 MP,
+plus transfer buffers.
+
 ## Core changes
 
 | Branch | What |
@@ -156,6 +201,10 @@ and larger images gain more.
 | `fix/opencl-threading-gate` | GEGL disabled CPU threading for every OpenCL-capable operation once OpenCL was initialised, even on nodes with `use-opencl=false`. Now only nodes that actually use OpenCL are serialised. |
 | `fix/cl-color-babl-parity` | GEGL's GPU colour conversions now match babl bit-exactly on normal inputs. Before, the last-bit differences flipped threshold- and table-based filters by up to 255. The tables are built lazily, so startup memory stays at master's level. |
 | `fix/cl-iterator-abyss-alpha` | Area filters on sources without alpha got opaque black instead of transparent at image edges on the GPU, by up to 150/255. Upstream's guard checked the wrong rectangle. |
+| `fix/cl-iterator-abyss-region` | Preserves the exact abyss in converting OpenCL reads of cropped buffers. |
+| `fix/cl-unpremultiply-extreme-alpha` | Matches babl's unpremultiplication for tiny and nonfinite alpha. |
+| `fix/opencl-concurrent-dispatch` | Serializes OpenCL renders that share mutable kernel arguments and publishes fully built kernel programs. |
+| `fix/opencl-point-operation-fallback` | Reruns point operations on the CPU after an iterator or kernel failure, including failures after earlier chunks have completed. |
 | `fix/sampler-context-rect` | The sampler cache could miss NoHalo's context, which made CPU output depend on thread count. |
 | `fix/opacity-opencl-components` | gegl:opacity's kernels assumed 4 channels and produced garbage on Y/YA input. |
 | `fix/android-opencl-library` | Loads OpenCL on Android (`libOpenCL.so`, `libOpenCL-pixel.so`). |
@@ -173,6 +222,12 @@ These commits change CPU output where the CPU result was itself wrong:
 - **`opencl/color-enhance`:** achromatic input is now left unchanged instead of
   amplifying rounding noise.
 - **`fix/lens-blur-cpu-precision`:** accumulates in double precision.
+- **`fix/denoise-dct-origin` and `fix/domain-transform-origin`** preserve the
+  image origin when processing translated inputs.
+- **`fix/color-rotate-invalid-hsv`** handles invalid hue values in the CPU
+  conversion.
+- **`fix/median-blur-single-column`** preserves the correct borders on
+  one-column inputs.
 
 ## Known limits
 
@@ -182,10 +237,7 @@ These commits change CPU output where the CPU result was itself wrong:
   FMA, rare boundary pixels can differ.
 - **polar-coordinates:** one unexplained single-pixel difference appeared under
   heavy concurrent load on the desktop. It did not reproduce in repeated runs.
-- **Concurrency:** blitting OpenCL graphs from several threads at once is racy,
-  as it is upstream, because kernels are shared. Serialise renders.
-- **Not ported:** mosaic, cubism, distance-transform, dither, lens-flare and
-  rgb-clip are sequential, order-dependent or too cheap to gain from the GPU.
+- Mosaic, cubism, distance-transform, dither and rgb-clip still run on the CPU.
 
 ## Building
 
