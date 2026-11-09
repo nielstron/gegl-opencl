@@ -31,6 +31,8 @@ Most branches sit directly on GNOME master. These sit on other branches:
   `opencl/gblur-1d-iir`.
 - `opencl/focus-blur` sits on a merge of `fix/opencl-concurrent-dispatch`,
   `perf/high-pass-opencl`, and `perf/piecewise-blend-swap`.
+- `fix/focus-lens-mask-opencl` sits on `opencl/focus-blur`.
+- `perf/focus-lens-fixed` sits on `fix/focus-lens-mask-opencl`.
 
 `fix/contrast-curve-opencl` is published but not merged. Its kernel was already
 correct, and it is not faster.
@@ -175,15 +177,23 @@ including the 8-bit CPU fast path for `invert-gamma`.
 | Focus Blur, Gaussian | `opencl/focus-blur` | 4476 ms | 1496 ms | 3.0× |
 | Bevel | `fix/bevel-opencl-light-map` | 5457 ms | 2027 ms | 2.7× |
 | Domain Transform | `opencl/domain-transform` | 924 ms | 642 ms | 1.4× |
-| Focus Blur, Lens | `opencl/focus-blur` | 2197 ms | 2746 ms | 0.8× |
+| Focus Blur, Lens, opaque defaults | `perf/focus-lens-fixed` | 2004 ms | 1143 ms | 1.8× |
 
 Focus Blur generates the mask and finishes either blur mode on the GPU at
 full resolution. Gaussian blends each level as soon as it finishes, reusing
 the device buffers and avoiding the CPU graph's large stack of intermediate
 images. Lens accumulates each source pixel's variable-radius disc and applies
-highlight weights on the device. On the M3 Max, both paths were faster than
-CPU at 6 MP. On the Pixel, Lens took about 25% longer than CPU at its default
-radius and ran at about the same speed at radius 11 with highlights enabled.
+highlight weights on the device. For straight sRGB 8-bit input, blur radii
+up to 32, and highlights disabled, the Lens kernel checks the entire input
+tile and halo for opacity. Opaque tiles use packed integer endpoint sums.
+Other tiles use compensated floating-point sums. The opaque kernel ran in
+151 ms versus 224 ms on CPU at 1024×768 on the Pixel. The standard opaque
+and alpha-weighted comparisons stayed within one 8-bit code.
+
+`fix/focus-lens-mask-opencl` refines the device's division in the Focus mask.
+On the Pixel's 1080×1920 portrait fixture it eliminated the disc-span changes
+caused by approximate division. The full Lens result went from a four-code
+maximum error to one code.
 
 The 6 MP Gaussian alpha fixture differed by at most one code per stored
 8-bit channel. Four channels reached 1.007843 codes after weighting the
