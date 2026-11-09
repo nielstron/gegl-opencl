@@ -1,3 +1,5 @@
+#pragma OPENCL FP_CONTRACT OFF
+
 #define LAPLACE_RADIUS 2
 #define EPSILON        1e-5f
 
@@ -47,9 +49,10 @@ kernel void pre_edgelaplace (const global float4 *in,
         pix_mm, &minval, &maxval);
     float4 gradient = fmax((maxval - pix_mm), (pix_mm - minval))
         * select((float4)0.5f, (float4)-0.5f,
+        /* Match CPU addition order and its comparison to double 1e-5. */
         (pix_fl + pix_fm + pix_fr +
-         pix_bm - 8.0f * pix_mm + pix_br +
-         pix_ml + pix_mr + pix_bl) < EPSILON);
+         pix_ml - 8.0f * pix_mm + pix_mr +
+         pix_bl + pix_bm + pix_br) <= EPSILON);
     gradient.w = pix_mm.w;
 
     out[gidx + gidy * get_global_size(0)] =  gradient;
