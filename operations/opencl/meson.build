@@ -13,6 +13,7 @@ gegl_operations_opencl_sources = [
   'color-temperature.cl',
   'color-to-alpha.cl',
   'colors-8bit-lut.cl',
+  'colors-8bit-quant.cl',
   'colors.cl',
   'contrast-curve.cl',
   'diffraction-patterns.cl',

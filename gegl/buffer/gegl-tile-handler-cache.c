@@ -969,6 +969,28 @@ gegl_tile_handler_cache_disconnect (GeglTileHandlerCache *cache)
     }
 }
 
+/* Calls @func on the tiles held by @cache until it returns TRUE, and
+ * returns whether it did.  The tile storage of @cache must be locked.
+ */
+gboolean
+gegl_tile_handler_cache_find_tile (GeglTileHandlerCache *cache,
+                                   gboolean            (*func) (GeglTile *tile,
+                                                                gpointer  user_data),
+                                   gpointer              user_data)
+{
+  GList *link;
+
+  for (link = g_queue_peek_head_link (&cache->queue); link; link = link->next)
+    {
+      CacheItem *item = LINK_GET_ITEM (link);
+
+      if (func (item->tile, user_data))
+        return TRUE;
+    }
+
+  return FALSE;
+}
+
 gsize
 gegl_tile_handler_cache_get_total (void)
 {

@@ -31,8 +31,19 @@
 
 #include "operations/opencl/colors.cl.h"
 #include "operations/opencl/colors-8bit-lut.cl.h"
+#include "operations/opencl/colors-8bit-quant.cl.h"
+
+#include <string.h>
 
 static GHashTable  *color_kernels_hash = NULL;
+
+typedef enum
+{
+  TABLE_NONE,    /* not a table conversion */
+  TABLE_PENDING, /* table not computed yet */
+  TABLE_READY,
+  TABLE_FAILED   /* the table conversion does not match babl */
+} TableState;
 
 typedef struct
 {
@@ -40,7 +51,11 @@ typedef struct
   const Babl *to_fmt;
   const char *kernel_name;
   cl_kernel   kernel;
+  gint        table_state; /* TableState, accessed atomically */
+  gint        table_kind;
 } ColorConversionInfo;
+
+static GMutex table_mutex;
 
 static guint
 color_kernels_hash_hashfunc (gconstpointer key)
@@ -62,6 +77,405 @@ color_kernels_hash_equalfunc (gconstpointer a,
       return TRUE;
     }
   return FALSE;
+}
+
+/* Maps floats to unsigned integers with the same ordering */
+static guint32
+float_to_ordered (gfloat value)
+{
+  guint32 bits;
+
+  memcpy (&bits, &value, sizeof (bits));
+
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+static gfloat
+ordered_to_float (guint32 key)
+{
+  guint32 bits = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+  gfloat  value;
+
+  memcpy (&value, &bits, sizeof (value));
+
+  return value;
+}
+
+/* Conversions done with tables computed from babl, see
+ * colors-8bit-quant.cl.  They only work for conversions that treat each
+ * channel separately, which check_table_conversion() verifies against
+ * babl before a conversion is used.
+ */
+typedef enum
+{
+  TABLE_QUANTIZE_RGBA,   /* 4 float channels -> RGBA u8 */
+  TABLE_QUANTIZE_RAGABA, /* premultiplied 4 float channels -> RGBA u8 */
+  TABLE_QUANTIZE_YA,     /* 2 float channels -> RGBA u8 */
+  TABLE_EXPAND_RGBA      /* RGBA u8 -> 4 float channels */
+} TableKind;
+
+typedef struct
+{
+  const gchar *from;
+  const gchar *to;
+  TableKind    kind;
+} TableConversion;
+
+static const TableConversion table_conversions[] = {
+  { "RGBA float",    "R'G'B'A u8",    TABLE_QUANTIZE_RGBA   },
+  { "R'G'B'A float", "R'G'B'A u8",    TABLE_QUANTIZE_RGBA   },
+  { "R~G~B~A float", "R'G'B'A u8",    TABLE_QUANTIZE_RGBA   },
+  { "RaGaBaA float", "R'G'B'A u8",    TABLE_QUANTIZE_RAGABA },
+  { "YA float",      "R'G'B'A u8",    TABLE_QUANTIZE_YA     },
+  { "Y'A float",     "R'G'B'A u8",    TABLE_QUANTIZE_YA     },
+  { "R'G'B'A u8",    "R~G~B~A float", TABLE_EXPAND_RGBA     },
+};
+
+static const gchar *
+table_kernel_name (TableKind kind)
+{
+  switch (kind)
+    {
+    case TABLE_QUANTIZE_RGBA:   return "quantize_rgbaf_to_u8";
+    case TABLE_QUANTIZE_RAGABA: return "quantize_ragabaf_to_u8";
+    case TABLE_QUANTIZE_YA:     return "quantize_yaf_to_u8";
+    case TABLE_EXPAND_RGBA:     return "expand_rgbau8_to_f";
+    }
+
+  g_return_val_if_reached (NULL);
+}
+
+/* Fills lut[1..255] with the smallest float that babl converts to an 8-bit
+ * value of at least k, for one channel of a conversion from a float format
+ * to an 8-bit format (both with alpha as the last component).  With
+ * alpha == TRUE the thresholds are for the alpha channel, otherwise for
+ * the color channels (the alpha is then 1.0).
+ */
+static void
+make_quantization_lut (const Babl *in_format,
+                       const Babl *out_format,
+                       gboolean    alpha,
+                       gfloat     *lut)
+{
+  const Babl *fish   = babl_fish (in_format, out_format);
+  const gint  n_in   = babl_format_get_n_components (in_format);
+  const gint  n_out  = babl_format_get_n_components (out_format);
+  const gint  out_ch = alpha ? n_out - 1 : 0;
+  gfloat     *src    = g_new (gfloat, 255 * n_in);
+  guint8     *dst    = g_new (guint8, 255 * n_out);
+  guint32     lo[256];
+  guint32     hi[256];
+  gboolean    done   = FALSE;
+
+  /* invariant: babl (lo[k]) < k <= babl (hi[k]) */
+  for (gint k = 1; k < 256; k++)
+    {
+      lo[k] = float_to_ordered (-1.0f);
+      hi[k] = float_to_ordered (2.0f);
+    }
+
+  while (! done)
+    {
+      done = TRUE;
+
+      for (gint k = 1; k < 256; k++)
+        {
+          gfloat value = ordered_to_float (lo[k] + (hi[k] - lo[k]) / 2);
+          gfloat *pixel = src + (k - 1) * n_in;
+
+          for (gint c = 0; c < n_in - 1; c++)
+            pixel[c] = alpha ? 0.0f : value;
+          pixel[n_in - 1] = alpha ? value : 1.0f;
+        }
+
+      babl_process (fish, src, dst, 255);
+
+      for (gint k = 1; k < 256; k++)
+        {
+          guint32 mid = lo[k] + (hi[k] - lo[k]) / 2;
+
+          if (hi[k] - lo[k] <= 1)
+            continue;
+
+          if (dst[(k - 1) * n_out + out_ch] >= k)
+            hi[k] = mid;
+          else
+            lo[k] = mid;
+
+          if (hi[k] - lo[k] > 1)
+            done = FALSE;
+        }
+    }
+
+  lut[0] = -G_MAXFLOAT; /* never read */
+  for (gint k = 1; k < 256; k++)
+    lut[k] = ordered_to_float (hi[k]);
+
+  g_free (src);
+  g_free (dst);
+}
+
+/* Fills lut[0..255] with babl's float values for the 8-bit values of the
+ * color channels, and lut[256..511] for those of the alpha channel.
+ */
+static void
+make_expansion_lut (const Babl *in_format,
+                    const Babl *out_format,
+                    gfloat     *lut)
+{
+  guint8 src[256 * 4];
+  gfloat dst[256 * 4];
+
+  for (gint k = 0; k < 256; k++)
+    {
+      src[4 * k + 0] = src[4 * k + 1] = src[4 * k + 2] = k;
+      src[4 * k + 3] = 255;
+    }
+  babl_process (babl_fish (in_format, out_format), src, dst, 256);
+  for (gint k = 0; k < 256; k++)
+    lut[k] = dst[4 * k];
+
+  for (gint k = 0; k < 256; k++)
+    {
+      src[4 * k + 0] = src[4 * k + 1] = src[4 * k + 2] = 0;
+      src[4 * k + 3] = k;
+    }
+  babl_process (babl_fish (in_format, out_format), src, dst, 256);
+  for (gint k = 0; k < 256; k++)
+    lut[256 + k] = dst[4 * k + 3];
+}
+
+/* Host versions of the kernels, to check the tables against babl */
+static guint8
+quantize_host (gfloat        value,
+               const gfloat *lut)
+{
+  gint i = 0;
+
+  for (gint step = 128; step > 0; step /= 2)
+    if (lut[i + step] <= value)
+      i += step;
+
+  return i;
+}
+
+static void
+table_convert_host (TableKind     kind,
+                    const gfloat *lut,
+                    const void   *in,
+                    void         *out)
+{
+  const gfloat *src_f = in;
+  const guint8 *src_u = in;
+  guint8       *dst_u = out;
+  gfloat       *dst_f = out;
+  gfloat        alpha;
+
+  switch (kind)
+    {
+    case TABLE_QUANTIZE_RGBA:
+      for (gint c = 0; c < 3; c++)
+        dst_u[c] = quantize_host (src_f[c], lut);
+      dst_u[3] = quantize_host (src_f[3], lut + 256);
+      break;
+
+    case TABLE_QUANTIZE_RAGABA:
+      alpha = src_f[3];
+      if (alpha < 1.0f / 65536.0f)
+        {
+          if (alpha >= 0.0f)
+            alpha = 1.0f / 65536.0f;
+          else if (alpha >= -1.0f / 65536.0f)
+            alpha = -1.0f / 65536.0f;
+        }
+      alpha = 1.0f / alpha;
+      for (gint c = 0; c < 3; c++)
+        dst_u[c] = quantize_host (src_f[c] * alpha, lut);
+      dst_u[3] = quantize_host (src_f[3], lut + 256);
+      break;
+
+    case TABLE_QUANTIZE_YA:
+      dst_u[0] = dst_u[1] = dst_u[2] = quantize_host (src_f[0], lut);
+      dst_u[3] = quantize_host (src_f[1], lut + 256);
+      break;
+
+    case TABLE_EXPAND_RGBA:
+      for (gint c = 0; c < 3; c++)
+        dst_f[c] = lut[src_u[c]];
+      dst_f[3] = lut[256 + src_u[3]];
+      break;
+    }
+}
+
+/* Compares the table conversion with babl on a set of pixels.  Converting
+ * to 8-bit may be off by one at ties, as babl's own result can depend on
+ * the conversion path it picked (for example when it goes through a
+ * premultiplied format), anything else rejects the conversion.
+ */
+static gboolean
+check_table_conversion (const Babl   *in_format,
+                        const Babl   *out_format,
+                        TableKind     kind,
+                        const gfloat *lut)
+{
+  const gint   n          = 8192;
+  const gint   in_bpp     = babl_format_get_bytes_per_pixel (in_format);
+  const gint   out_bpp    = babl_format_get_bytes_per_pixel (out_format);
+  const gint   n_in       = babl_format_get_n_components (in_format);
+  guint8      *src        = g_malloc (n * in_bpp);
+  guint8      *ref        = g_malloc (n * out_bpp);
+  guint8       out[16];
+  guint32      seed       = 1;
+  gboolean     ok         = TRUE;
+
+  for (gint i = 0; i < n; i++)
+    {
+      for (gint c = 0; c < n_in; c++)
+        {
+          seed = seed * 1664525u + 1013904223u;
+
+          if (kind == TABLE_EXPAND_RGBA)
+            {
+              src[i * in_bpp + c] = seed >> 24;
+            }
+          else
+            {
+              gfloat *pixel = (gfloat *) (src + i * in_bpp);
+              gfloat  value = (seed >> 8) / (gfloat) (1 << 24) * 1.1f - 0.05f;
+
+              if (c == n_in - 1)
+                value = (i % 2) ? 1.0f : CLAMP (value, 0.0f, 1.0f);
+
+              pixel[c] = value;
+            }
+        }
+
+      if (kind == TABLE_QUANTIZE_RAGABA)
+        {
+          gfloat *pixel = (gfloat *) (src + i * in_bpp);
+
+          for (gint c = 0; c < 3; c++)
+            pixel[c] *= pixel[3];
+        }
+    }
+
+  babl_process (babl_fish (in_format, out_format), src, ref, n);
+
+  for (gint i = 0; i < n && ok; i++)
+    {
+      table_convert_host (kind, lut, src + i * in_bpp, out);
+
+      for (gint c = 0; c < 4 && ok; c++)
+        {
+          if (kind == TABLE_EXPAND_RGBA)
+            ok = ((gfloat *) out)[c] == ((gfloat *) (ref + i * out_bpp))[c];
+          else
+            ok = ABS (out[c] - ref[i * out_bpp + c]) <= 1;
+        }
+    }
+
+  g_free (src);
+  g_free (ref);
+
+  return ok;
+}
+
+/* Computes the table of a table conversion and binds it to the kernel.
+ * This is done on first use, as building babl's fish can take a while.
+ */
+static gboolean
+setup_table_conversion (ColorConversionInfo *info)
+{
+  TableKind kind = info->table_kind;
+  gfloat    lut[512];
+  cl_mem    lut_mem;
+  cl_int    cl_err = 0;
+
+  g_mutex_lock (&table_mutex);
+
+  if (info->table_state != TABLE_PENDING)
+    {
+      g_mutex_unlock (&table_mutex);
+      return info->table_state == TABLE_READY;
+    }
+
+  if (kind == TABLE_EXPAND_RGBA)
+    {
+      make_expansion_lut (info->from_fmt, info->to_fmt, lut);
+    }
+  else
+    {
+      make_quantization_lut (info->from_fmt, info->to_fmt, FALSE, lut);
+      make_quantization_lut (info->from_fmt, info->to_fmt, TRUE, lut + 256);
+    }
+
+  if (! check_table_conversion (info->from_fmt, info->to_fmt, kind, lut))
+    {
+      GEGL_NOTE (GEGL_DEBUG_OPENCL,
+                 "Not using OpenCL table conversion %s -> %s, "
+                 "it does not match babl",
+                 babl_get_name (info->from_fmt),
+                 babl_get_name (info->to_fmt));
+      g_atomic_int_set (&info->table_state, TABLE_FAILED);
+      g_mutex_unlock (&table_mutex);
+      return FALSE;
+    }
+
+  lut_mem = gegl_clCreateBuffer (gegl_cl_get_context (),
+                                 CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                 sizeof (lut), lut, &cl_err);
+  if (cl_err == CL_SUCCESS)
+    {
+      /* the table stays bound to the kernel, which is only used for this
+       * conversion
+       */
+      cl_err = gegl_clSetKernelArg (info->kernel, 2, sizeof (cl_mem), &lut_mem);
+
+      if (cl_err != CL_SUCCESS)
+        gegl_clReleaseMemObject (lut_mem);
+    }
+
+  g_atomic_int_set (&info->table_state,
+                    cl_err == CL_SUCCESS ? TABLE_READY : TABLE_FAILED);
+
+  g_mutex_unlock (&table_mutex);
+
+  return cl_err == CL_SUCCESS;
+}
+
+static gboolean
+gegl_cl_color_load_table_conversions (GeglClRunData **kernels,
+                                      const gchar    *source)
+{
+  const gint    n_conversions = G_N_ELEMENTS (table_conversions);
+  const char  **kernel_names  = g_newa (const char *, n_conversions + 1);
+
+  for (gint i = 0; i < n_conversions; i++)
+    kernel_names[i] = table_kernel_name (table_conversions[i].kind);
+
+  kernel_names[n_conversions] = NULL;
+
+  /* every conversion gets its own kernel object, holding its own table */
+  *kernels = gegl_cl_compile_and_build (source, kernel_names);
+
+  if (!(*kernels))
+    return FALSE;
+
+  for (gint i = 0; i < n_conversions; i++)
+    {
+      ColorConversionInfo *info = g_new0 (ColorConversionInfo, 1);
+
+      info->from_fmt    = babl_format (table_conversions[i].from);
+      info->to_fmt      = babl_format (table_conversions[i].to);
+      info->kernel_name = kernel_names[i];
+      info->kernel      = (*kernels)->kernel[i];
+      info->table_state = TABLE_PENDING;
+      info->table_kind  = table_conversions[i].kind;
+
+      g_hash_table_insert (color_kernels_hash, info, info);
+    }
+
+  return TRUE;
 }
 
 static gboolean
@@ -104,6 +518,7 @@ gegl_cl_color_compile_kernels (void)
 {
   static GeglClRunData *float_kernels = NULL;
   static GeglClRunData *lut8_kernels = NULL;
+  static GeglClRunData *table_kernels = NULL;
   gboolean result = TRUE;
 
   ColorConversionInfo float_conversions[] = {
@@ -136,13 +551,10 @@ gegl_cl_color_compile_kernels (void)
     { babl_format ("YA float"), babl_format("RGBA u8"), "yaf_to_rgbau8", NULL },
     { babl_format ("RaGaBaA float"), babl_format("YA float"), "ragabaf_to_yaf", NULL },
 
-    { babl_format ("RGBA float"), babl_format("R'G'B'A u8"), "rgbaf_to_rgba_gamma_u8", NULL },
     { babl_format ("RGBA float"), babl_format("R'G'B' u8"), "rgbaf_to_rgb_gamma_u8", NULL },
 
-    { babl_format ("RaGaBaA float"), babl_format("R'G'B'A u8"), "ragabaf_to_rgba_gamma_u8", NULL },
     { babl_format ("RaGaBaA float"), babl_format("R'G'B' u8"), "ragabaf_to_rgb_gamma_u8", NULL },
 
-    { babl_format ("YA float"), babl_format("R'G'B'A u8"), "yaf_to_rgba_gamma_u8", NULL },
     { babl_format ("YA float"), babl_format("R'G'B' u8"), "yaf_to_rgb_gamma_u8", NULL },
 
     { babl_format ("YA float"), babl_format ("RaGaBaA float"), "yaf_to_ragabaf", NULL },
@@ -200,6 +612,15 @@ gegl_cl_color_compile_kernels (void)
       result = FALSE;
     }
 
+  gegl_cl_color_load_table_conversions (&table_kernels,
+                                        colors_8bit_quant_cl_source);
+
+  if (!table_kernels)
+    {
+      g_warning ("OpenCL Failed to compile color conversions (table_kernels)");
+      result = FALSE;
+    }
+
   return result;
 }
 
@@ -210,9 +631,13 @@ find_color_kernel (const Babl *in_format,
   ColorConversionInfo *info;
   ColorConversionInfo search = { in_format, out_format, NULL, NULL };
   info = g_hash_table_lookup (color_kernels_hash, &search);
-  if (info)
-    return info->kernel;
-  return NULL;
+  if (! info)
+    return NULL;
+  if (g_atomic_int_get (&info->table_state) != TABLE_NONE &&
+      g_atomic_int_get (&info->table_state) != TABLE_READY &&
+      ! setup_table_conversion (info))
+    return NULL;
+  return info->kernel;
 }
 
 gboolean

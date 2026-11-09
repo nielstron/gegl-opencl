@@ -108,6 +108,16 @@ gegl_eval_manager_apply (GeglEvalManager     *self,
                          const GeglRectangle *roi,
                          gint                 level)
 {
+  return gegl_eval_manager_apply_into (self, roi, level, NULL, NULL);
+}
+
+GeglBuffer *
+gegl_eval_manager_apply_into (GeglEvalManager     *self,
+                              const GeglRectangle *roi,
+                              gint                 level,
+                              GeglNode            *target_node,
+                              GeglBuffer          *target)
+{
   GeglBuffer  *object;
 
   g_return_val_if_fail (GEGL_IS_EVAL_MANAGER (self), NULL);
@@ -125,7 +135,7 @@ gegl_eval_manager_apply (GeglEvalManager     *self,
   GEGL_INSTRUMENT_END ("gegl", "prepare-request");
 
   GEGL_INSTRUMENT_START();
-  object = gegl_graph_process (self->traversal, level);
+  object = gegl_graph_process_into (self->traversal, level, target_node, target);
   GEGL_INSTRUMENT_END ("gegl", "process");
 
   return object;

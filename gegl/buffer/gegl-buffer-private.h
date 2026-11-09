@@ -97,6 +97,9 @@ GeglTileBackend * gegl_buffer_backend2    (GeglBuffer *buffer); /* non-cached */
 
 gboolean          gegl_buffer_is_shared   (GeglBuffer *buffer);
 
+gboolean          gegl_buffer_may_share_memory (GeglBuffer *buffer,
+                                                GeglBuffer *other);
+
 #define GEGL_BUFFER_DISABLE_LOCKS 1
 
 #ifdef GEGL_BUFFER_DISABLE_LOCKS

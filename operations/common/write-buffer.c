@@ -69,7 +69,7 @@ process (GeglOperation       *operation,
           && gegl_cl_color_supported (in_format, out_format) == GEGL_CL_COLOR_CONVERT)
         {
           size_t size;
-          gboolean err;
+          gboolean err = FALSE;
           cl_int cl_err = 0;
 
           GeglBufferClIterator *i = gegl_buffer_cl_iterator_new (output,
@@ -100,8 +100,6 @@ process (GeglOperation       *operation,
 
           while (gegl_buffer_cl_iterator_next (i, &err))
             {
-              if (err) break;
-
               cl_err = gegl_clEnqueueCopyBuffer (gegl_cl_get_command_queue (),
                                                  i->tex[read],
                                                  i->tex[0],
@@ -115,6 +113,7 @@ process (GeglOperation       *operation,
               if (cl_err != CL_SUCCESS)
                 {
                   GEGL_NOTE (GEGL_DEBUG_OPENCL, "Error: %s", gegl_cl_errstring (cl_err));
+                  gegl_buffer_cl_iterator_stop (i);
                   break;
                 }
             }
