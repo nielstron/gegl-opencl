@@ -76,6 +76,17 @@ thread_process (const GeglRectangle *area,
 }
 
 static gboolean
+gegl_operation_point_filter_use_opencl (GeglOperation *operation)
+{
+  GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
+  GeglOperationPointFilterClass *point_filter_class = GEGL_OPERATION_POINT_FILTER_GET_CLASS (operation);
+
+  return gegl_operation_use_opencl (operation) &&
+         (g_atomic_pointer_get (&operation_class->cl_data) ||
+          point_filter_class->cl_process);
+}
+
+static gboolean
 gegl_operation_filter_process (GeglOperation        *operation,
                                  GeglOperationContext *context,
                                  const gchar          *output_prop,
@@ -110,10 +121,15 @@ gegl_operation_filter_process (GeglOperation        *operation,
   }
 
   input  = (GeglBuffer*)gegl_operation_context_dup_object (context, "input");
-  output = gegl_operation_context_get_output_maybe_in_place (operation,
-                                                             context,
-                                                             input,
-                                                             result);
+  /* The GPU iterator can publish a chunk before a later chunk fails.
+   * Preserve the input for the CPU retry of the whole result. */
+  if (gegl_operation_point_filter_use_opencl (operation))
+    output = gegl_operation_context_get_target (context, "output");
+  else
+    output = gegl_operation_context_get_output_maybe_in_place (operation,
+                                                               context,
+                                                               input,
+                                                               result);
 
   if (input != NULL)
     {
@@ -159,9 +175,9 @@ gegl_operation_point_filter_cl_process (GeglOperation       *operation,
 
   GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
   GeglOperationPointFilterClass *point_filter_class = GEGL_OPERATION_POINT_FILTER_GET_CLASS (operation);
+  GeglClRunData *cl_data = g_atomic_pointer_get (&operation_class->cl_data);
 
   GeglBufferClIterator *iter = NULL;
-  GeglClRunData *cl_data = g_atomic_pointer_get (&operation_class->cl_data);
 
   cl_int cl_err = 0;
   gboolean err;
@@ -256,7 +272,6 @@ gegl_operation_point_filter_process (GeglOperation       *operation,
                                        const GeglRectangle *result,
                                        gint                 level)
 {
-  GeglOperationClass *operation_class = GEGL_OPERATION_GET_CLASS (operation);
   GeglOperationPointFilterClass *point_filter_class = GEGL_OPERATION_POINT_FILTER_GET_CLASS (operation);
   const Babl *in_format   = gegl_operation_get_format (operation, "input");
   const Babl *out_format  = gegl_operation_get_format (operation, "output");
@@ -264,7 +279,7 @@ gegl_operation_point_filter_process (GeglOperation       *operation,
 
   if ((result->width > 0) && (result->height > 0))
     {
-      if (gegl_operation_use_opencl (operation) && (g_atomic_pointer_get (&operation_class->cl_data) || point_filter_class->cl_process))
+      if (gegl_operation_point_filter_use_opencl (operation))
       {
         if (gegl_operation_point_filter_cl_process (operation, input, output, result, level))
             return TRUE;
