@@ -56,6 +56,64 @@ property_enum (border_behavior, _("Border behavior"),
 #define GEGL_OP_C_SOURCE    edge.c
 
 #include "gegl-op.h"
+#include "gegl-buffer-cl-iterator.h"
+#include "opencl/gegl-cl.h"
+#include "opencl/edge.cl.h"
+
+static gboolean
+cl_process (GeglBuffer          *input,
+            GeglBuffer          *output,
+            const GeglRectangle *roi,
+            const Babl          *format,
+            GeglProperties      *o)
+{
+  static GeglClRunData *cl_data;
+  GeglBufferClIterator *iter;
+  cl_int algorithm = o->algorithm;
+  cl_float amount = o->amount;
+  cl_int has_alpha = babl_format_has_alpha (format);
+  gboolean err;
+  cl_int cl_err;
+  gint read;
+
+  if (!cl_data)
+    {
+      const char *kernels[] = { "edge_detect", NULL };
+      cl_data = gegl_cl_compile_and_build (edge_cl_source, kernels);
+    }
+  if (!cl_data)
+    return FALSE;
+
+  iter = gegl_buffer_cl_iterator_new (output, roi, format, GEGL_CL_BUFFER_WRITE);
+  read = gegl_buffer_cl_iterator_add_2 (iter, input, roi, format,
+                                        GEGL_CL_BUFFER_READ, 1, 1, 1, 1,
+                                        o->border_behavior);
+
+  while (gegl_buffer_cl_iterator_next (iter, &err))
+    {
+      const size_t global_ws[] = { iter->roi[0].width, iter->roi[0].height };
+
+      cl_err = gegl_cl_set_kernel_args (cl_data->kernel[0],
+                                        sizeof (cl_mem),   &iter->tex[read],
+                                        sizeof (cl_mem),   &iter->tex[0],
+                                        sizeof (cl_int),   &algorithm,
+                                        sizeof (cl_float), &amount,
+                                        sizeof (cl_int),   &has_alpha,
+                                        NULL);
+      CL_CHECK;
+
+      cl_err = gegl_clEnqueueNDRangeKernel (gegl_cl_get_command_queue (),
+                                            cl_data->kernel[0], 2, NULL,
+                                            global_ws, NULL, 0, NULL, NULL);
+      CL_CHECK;
+    }
+
+  return !err;
+
+error:
+  gegl_buffer_cl_iterator_stop (iter);
+  return FALSE;
+}
 
 static inline gfloat
 edge_sobel (gfloat *pixels, gdouble amount)
@@ -265,6 +323,10 @@ process (GeglOperation       *operation,
   GeglRectangle rect;
   gint x, y, ix, iy, b, idx;
 
+  if (level == 0 && gegl_operation_use_opencl (operation) &&
+      cl_process (input, output, roi, format, o))
+    return TRUE;
+
   rect = *roi;
   rect.x -= 1;
   rect.y -= 1;
@@ -359,7 +421,7 @@ gegl_op_class_init (GeglOpClass *klass)
   filter_class->process             = process;
   operation_class->prepare          = prepare;
   operation_class->get_bounding_box = get_bounding_box;
-  operation_class->opencl_support   = FALSE;
+  operation_class->opencl_support   = TRUE;
 
   gegl_operation_class_set_keys (operation_class,
     "name",        "gegl:edge",
