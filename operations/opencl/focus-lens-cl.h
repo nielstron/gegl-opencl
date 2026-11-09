@@ -56,7 +56,7 @@ focus_lens_cl_tile (GeglClRunData       *cl_data,
   cl_mem                delta = NULL;
   cl_mem                delta_w = NULL;
   cl_kernel             prepare = cl_data->kernel[fallback ? 2 : 0];
-  cl_int                strip_width = CLAMP (2 * iradius, 64, 256);
+  cl_int                strip_width = CLAMP (iradius, 32, 128);
   const GeglRectangle  *src_rect;
   cl_int4               source;
   size_t                global_ws[2];
