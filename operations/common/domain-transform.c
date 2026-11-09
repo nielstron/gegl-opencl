@@ -595,6 +595,8 @@ process (GeglOperation       *operation,
          gint                 level)
 {
   GeglProperties  *o = GEGL_PROPERTIES (operation);
+  const Babl       *format = gegl_operation_get_format (operation, "output");
+  GeglBuffer       *working = output;
   gfloat           range_factor;
   g_autofree gfloat *rf_table = g_new (gfloat, o->n_iterations * RF_TABLE_SIZE);
 
@@ -610,13 +612,24 @@ process (GeglOperation       *operation,
                            rf_table, o->n_iterations))
     return TRUE;
 
+  /* A direct blit can supply a target in the caller's format even after
+   * OpenCL fails. Preserve the float intermediates across CPU passes. */
+  if (gegl_buffer_get_format (output) != format)
+    working = gegl_buffer_new (result, format);
+
   domain_transform (operation,
                     result,
                     4,
                     rf_table,
                     o->n_iterations,
                     input,
-                    output);
+                    working);
+
+  if (working != output)
+    {
+      gegl_buffer_copy (working, result, GEGL_ABYSS_NONE, output, result);
+      g_object_unref (working);
+    }
 
   return TRUE;
 }
